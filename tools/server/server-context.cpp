@@ -973,6 +973,15 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // add an encoded mtmd chunk to the batch of the text tokens, instead of decoding it on its own like process_mtmd_chunk()
 // embd is the output of the encoder for this chunk
 // returns false if the batch is full
+// LLAMA_PROMPT_PIPE_TAIL=0: no checkpoint one chunk before the end of a piped prompt
+static bool pipe_tail_checkpoint() {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_PROMPT_PIPE_TAIL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on;
+}
+
 static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * chunk, const float * embd, server_batch & batch) {
     // positions are the ones of mtmd_helper_decode_image_chunk()
     const auto * image    = mtmd_input_chunk_get_tokens_image(chunk);
@@ -4513,7 +4522,10 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // LLAMA_PROMPT_PIPE: one chunk of the prompt's plan instead of n_ubatch, as the tail is read alone
+                            // (no pipelining over the checkpoint); LLAMA_PROMPT_PIPE_TAIL=0 drops that checkpoint
+                            const int n_tail = (int) llama_prompt_chunk(ctx_tgt, slot.task->n_tokens());
+                            const int checkpoint_offsets[] = {n_tail == n_ubatch || pipe_tail_checkpoint() ? 4 + n_tail : 4, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

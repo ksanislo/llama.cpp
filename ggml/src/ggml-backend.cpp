@@ -987,7 +987,32 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    // GGML_SCHED_WAIT_LOG=1: the host time each graph spends blocked in the scheduler, by cause; with pipeline
+    // parallelism any of it holds the graphs behind it, as one thread queues the work of every device
+    int     wait_log;
+    int64_t wait_us[5];
+    int     wait_n[5];
 };
+
+enum ggml_sched_wait {
+    GGML_SCHED_WAIT_PREV_SPLIT, // a split without inputs waits for the previous split
+    GGML_SCHED_WAIT_INPUT,      // a split waits before overwriting an input copy
+    GGML_SCHED_WAIT_SYNC_COPY,  // an input copied synchronously (no async copy between the backends)
+    GGML_SCHED_WAIT_CALLBACK,   // the copy callback (e.g. reading MUL_MAT_ID ids back)
+    GGML_SCHED_WAIT_HOST_SPLIT, // a split computed by a host backend
+};
+
+static inline int64_t ggml_sched_wait_begin(const ggml_backend_sched * sched) {
+    return sched->wait_log ? ggml_time_us() : 0;
+}
+
+static inline void ggml_sched_wait_end(ggml_backend_sched * sched, enum ggml_sched_wait w, int64_t t0) {
+    if (sched->wait_log) {
+        sched->wait_us[w] += ggml_time_us() - t0;
+        sched->wait_n[w]++;
+    }
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1864,21 +1889,31 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // without events, the copy callback runs before the split backend is synchronized
     // a copy done by the callback must then be ordered after the work queued on the split backend, e.g. an async copy on it
     const bool has_event = sched->events[split_backend_id][sched->cur_copy] != NULL;
-    if (!has_event && sched->callback_copy != NULL &&
-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
-        return;
+    if (!has_event && sched->callback_copy != NULL) {
+        const int64_t t0 = ggml_sched_wait_begin(sched);
+        const bool done = sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data);
+        ggml_sched_wait_end(sched, GGML_SCHED_WAIT_CALLBACK, t0);
+        if (done) {
+            return;
+        }
     }
 
     // wait for the split backend to finish using the input before overwriting it
     if (has_event) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
+        const int64_t t0 = ggml_sched_wait_begin(sched);
         ggml_backend_synchronize(split_backend);
+        ggml_sched_wait_end(sched, GGML_SCHED_WAIT_INPUT, t0);
     }
 
-    if (has_event && sched->callback_copy != NULL &&
-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
-        return;
+    if (has_event && sched->callback_copy != NULL) {
+        const int64_t t0 = ggml_sched_wait_begin(sched);
+        const bool done = sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data);
+        ggml_sched_wait_end(sched, GGML_SCHED_WAIT_CALLBACK, t0);
+        if (done) {
+            return;
+        }
     }
 
     if (sched->n_copies > 1 && ggml_backend_sched_is_host_weight(input)) {
@@ -1890,6 +1925,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        const int64_t t0 = ggml_sched_wait_begin(sched);
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1897,6 +1933,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
+        ggml_sched_wait_end(sched, GGML_SCHED_WAIT_SYNC_COPY, t0);
     }
 }
 
@@ -1939,8 +1976,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    if (sched->wait_log) {
+        memset(sched->wait_us, 0, sizeof(sched->wait_us));
+        memset(sched->wait_n,  0, sizeof(sched->wait_n));
+    }
+    const int64_t t_graph_us = ggml_sched_wait_begin(sched);
+
     if (sched->n_copies > 1) {
+        const int64_t t0 = ggml_sched_wait_begin(sched);
         ggml_backend_sched_upload_user_inputs(sched);
+        ggml_sched_wait_end(sched, GGML_SCHED_WAIT_INPUT, t0);
     }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1951,11 +1996,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            const int64_t t0 = ggml_sched_wait_begin(sched);
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            ggml_sched_wait_end(sched, GGML_SCHED_WAIT_PREV_SPLIT, t0);
         }
 
         // copy the input tensors to the split backend
@@ -1972,7 +2019,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const bool    host_split = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            const int64_t t0 = host_split ? ggml_sched_wait_begin(sched) : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (host_split) {
+                ggml_sched_wait_end(sched, GGML_SCHED_WAIT_HOST_SPLIT, t0);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2018,6 +2070,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (sched->wait_log) {
+        const int64_t * u = sched->wait_us;
+        const int     * n = sched->wait_n;
+        GGML_LOG_INFO("%s: %d splits queued in %.1f ms; host blocked: prev split %d x %.1f ms, inputs %d x %.1f ms, "
+                "sync copies %d x %.1f ms, copy callbacks %d x %.1f ms, host splits %d x %.1f ms\n", __func__, sched->n_splits,
+                (ggml_time_us() - t_graph_us)/1000.0,
+                n[GGML_SCHED_WAIT_PREV_SPLIT], u[GGML_SCHED_WAIT_PREV_SPLIT]/1000.0, n[GGML_SCHED_WAIT_INPUT],     u[GGML_SCHED_WAIT_INPUT]/1000.0,
+                n[GGML_SCHED_WAIT_SYNC_COPY],  u[GGML_SCHED_WAIT_SYNC_COPY]/1000.0,  n[GGML_SCHED_WAIT_CALLBACK],  u[GGML_SCHED_WAIT_CALLBACK]/1000.0,
+                n[GGML_SCHED_WAIT_HOST_SPLIT], u[GGML_SCHED_WAIT_HOST_SPLIT]/1000.0);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2043,6 +2106,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    const char * GGML_SCHED_WAIT_LOG = getenv("GGML_SCHED_WAIT_LOG");
+    sched->wait_log = GGML_SCHED_WAIT_LOG ? atoi(GGML_SCHED_WAIT_LOG) : 0;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
