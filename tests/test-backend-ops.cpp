@@ -5706,6 +5706,112 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// ggml_mul_mat_id_mapped (an expert cache): the experts of non-negative ids are read from a bank holding copies of some of the
+// experts, the others (-1 - e) from all the experts. Its output is compared with plain MUL_MAT_ID on all the experts in the same
+// graph: a hit and a miss must compute identically (same kernel, same bytes, only the pointer differs), so the halves must match
+// bit for bit on the tested backend, and both are compared with the CPU as usual.
+struct test_mul_mat_id_mapped : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_slots;
+    const int n_used;
+    const bool b;      // broadcast b matrix (gate/up: one activation row per token)
+    const int64_t m;
+    const int64_t n;   // tokens
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, n_mats, n_slots, n_used, b, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_MAPPED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t h = n/2;
+        const bool exact_a = memcmp(a, a + h, h*sizeof(float)) == 0;
+        const bool exact_b = memcmp(b, b + h, h*sizeof(float)) == 0;
+        if (!exact_a && exact_b) {
+            printf("[mapped != plain on the tested backend] ");
+            return INFINITY;
+        }
+        return nmse(a, b, n);
+    }
+
+    test_mul_mat_id_mapped(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 16, int n_slots = 6, int n_used = 4, bool b = false,
+            int64_t m = 64, int64_t n = 1, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_slots(n_slots), n_used(n_used), b(b), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats && n_slots <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as_alt = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as_alt, "as_alt");
+        ggml_tensor * bank = ggml_new_tensor_3d(ctx, type_a, k, m, n_slots);
+        ggml_set_name(bank, "bank");
+
+        ggml_tensor * ids_mapped = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids_mapped, "ids_mapped");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * bt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(bt, "b");
+
+        ggml_tensor * mapped = ggml_mul_mat_id_mapped(ctx, bank, as_alt, bt, ids_mapped);
+        ggml_set_name(mapped, "mapped");
+        ggml_tensor * plain = ggml_mul_mat_id(ctx, as_alt, bt, ids);
+        ggml_set_name(plain, "plain");
+
+        ggml_tensor * out = ggml_concat(ctx, mapped, plain, 2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321 + n);
+        ggml_tensor * as_alt     = ggml_get_tensor(ctx, "as_alt");
+        ggml_tensor * bank       = ggml_get_tensor(ctx, "bank");
+        ggml_tensor * ids_mapped = ggml_get_tensor(ctx, "ids_mapped");
+        ggml_tensor * ids        = ggml_get_tensor(ctx, "ids");
+        init_tensor_uniform(as_alt);
+        init_tensor_uniform(ggml_get_tensor(ctx, "b"));
+
+        // the bank holds copies of n_slots of the experts, in random slots
+        std::vector<int32_t> perm(n_mats);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        std::vector<int32_t> slot_of(n_mats, -1);
+        std::vector<uint8_t> expert(as_alt->nb[2]);
+        for (int s = 0; s < n_slots; ++s) {
+            slot_of[perm[s]] = s;
+            ggml_backend_tensor_get(as_alt, expert.data(), perm[s]*as_alt->nb[2], expert.size());
+            ggml_backend_tensor_set(bank, expert.data(), s*bank->nb[2], expert.size());
+        }
+
+        // distinct experts per token, hits read their slot, misses -1 - e
+        std::vector<int32_t> all(n_mats);
+        std::iota(all.begin(), all.end(), 0);
+        for (int64_t t = 0; t < n; ++t) {
+            std::shuffle(all.begin(), all.end(), rng);
+            std::vector<int32_t> row_mapped(n_used);
+            for (int i = 0; i < n_used; ++i) {
+                row_mapped[i] = slot_of[all[i]] >= 0 ? slot_of[all[i]] : -1 - all[i];
+            }
+            ggml_backend_tensor_set(ids, all.data(), t*ids->nb[1], n_used*sizeof(int32_t));
+            ggml_backend_tensor_set(ids_mapped, row_mapped.data(), t*ids_mapped->nb[1], n_used*sizeof(int32_t));
+        }
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11447,6 +11553,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 #endif
+
+    // MoE cache device hits: expert types of Flash-Next UD-Q4_K_XL and DeepSeek-V4.1 IQ2_XS, decode-sized batches
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q6_K,
+                         GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 2, 3, 4, 8}) {
+            for (bool bc : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_mapped(ta, 16, 6, 4, bc, 64, n, 512));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_mapped(ta, 64, 20, 10, true, 128, 1, 1024));
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
