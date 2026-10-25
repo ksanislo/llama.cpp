@@ -183,7 +183,8 @@ static bool ggml_cuda_fusion_disabled() {
 // gdnstate (the gated delta net reads its state from the cache rows, no gather), gdngate (the gated delta net computes
 // its gate and beta from the raw projections: ADD -> SOFTPLUS -> MUL and SIGMOID skipped), expglu (expert up + gate + GLU
 // in one MMVQ when the expert cache's bank views sit between them), gdnl2 (the q/k l2 norms done by the gated delta net),
-// convstate (the conv state gather, concat and tail copy done by SSM_CONV). All keep the unfused values.
+// convstate (the conv state gather, concat and tail copy done by SSM_CONV), views (the fusion matchers also look past
+// no-op nodes: views, reshapes, permutes, transposes). All keep the unfused values.
 enum ggml_cuda_decode_fusion_bit {
     GGML_CUDA_DF_Q8       = 1 << 0,
     GGML_CUDA_DF_SILU     = 1 << 1,
@@ -194,6 +195,7 @@ enum ggml_cuda_decode_fusion_bit {
     GGML_CUDA_DF_EXPGLU   = 1 << 6,
     GGML_CUDA_DF_GDNL2    = 1 << 7,
     GGML_CUDA_DF_CONVSTATE = 1 << 8,
+    GGML_CUDA_DF_VIEWS    = 1 << 9,
 };
 
 static int ggml_cuda_decode_fusion() {
@@ -206,11 +208,12 @@ static int ggml_cuda_decode_fusion() {
             { "q8", GGML_CUDA_DF_Q8 }, { "silu", GGML_CUDA_DF_SILU }, { "shgate", GGML_CUDA_DF_SHGATE },
             { "hcnorm", GGML_CUDA_DF_HCNORM }, { "gdnstate", GGML_CUDA_DF_GDNSTATE }, { "gdngate", GGML_CUDA_DF_GDNGATE },
             { "expglu", GGML_CUDA_DF_EXPGLU }, { "gdnl2", GGML_CUDA_DF_GDNL2 }, { "convstate", GGML_CUDA_DF_CONVSTATE },
+            { "views", GGML_CUDA_DF_VIEWS },
         };
         int m = 0;
         std::string list = env;
         if (list == "1" || list == "all") {
-            list = "q8,silu,shgate,hcnorm,gdnstate,gdngate,expglu,gdnl2,convstate";
+            list = "q8,silu,shgate,hcnorm,gdnstate,gdngate,expglu,gdnl2,convstate,views";
         }
         size_t pos = 0;
         while (pos <= list.size()) {
@@ -228,11 +231,12 @@ static int ggml_cuda_decode_fusion() {
             }
             pos = end + 1;
         }
-        GGML_LOG_INFO("%s: GGML_CUDA_DECODE_FUSION =%s%s%s%s%s%s%s%s%s\n", __func__,
+        GGML_LOG_INFO("%s: GGML_CUDA_DECODE_FUSION =%s%s%s%s%s%s%s%s%s%s\n", __func__,
             m & GGML_CUDA_DF_Q8 ? " q8" : "", m & GGML_CUDA_DF_SILU ? " silu" : "", m & GGML_CUDA_DF_SHGATE ? " shgate" : "",
             m & GGML_CUDA_DF_HCNORM ? " hcnorm" : "", m & GGML_CUDA_DF_GDNSTATE ? " gdnstate" : "",
             m & GGML_CUDA_DF_GDNGATE ? " gdngate" : "", m & GGML_CUDA_DF_EXPGLU ? " expglu" : "",
-            m & GGML_CUDA_DF_GDNL2 ? " gdnl2" : "", m & GGML_CUDA_DF_CONVSTATE ? " convstate" : "");
+            m & GGML_CUDA_DF_GDNL2 ? " gdnl2" : "", m & GGML_CUDA_DF_CONVSTATE ? " convstate" : "",
+            m & GGML_CUDA_DF_VIEWS ? " views" : "");
         return m;
     }();
     return ggml_cuda_fusion_disabled() ? 0 : mask;
@@ -3109,6 +3113,58 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// GGML_CUDA_DECODE_FUSION=views: the matchers see the graph from node i with the no-op nodes of the next HEAD nodes left
+// out, so a view between two ops of a pattern no longer hides it. Only adjacency changes: a skipped node launches
+// nothing, and the matchers' use-count checks (a view of an intermediate is one of its uses) still reject a pattern
+// whose intermediate is read through a view elsewhere. The window is the graph's node array with the compacted head
+// written just before the unchanged tail, so matchers that scan to the end of the graph still see every node after i.
+struct ggml_cuda_view_window {
+    static constexpr int HEAD = 16;
+
+    std::vector<ggml_tensor *> buf; // the graph's nodes; a head is written over it and restored by close()
+    int        map[HEAD];           // window index -> graph index, for the head
+    ggml_cgraph g;
+    int i = 0, n_head = 0, m = 0, start = 0;
+
+    void reset(const ggml_cgraph * cgraph) {
+        buf.assign(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
+    }
+
+    // false: no no-op node among the next HEAD nodes, the window would be the graph itself
+    bool open(const ggml_cgraph * cgraph, int i_) {
+        i      = i_;
+        n_head = std::min(HEAD, cgraph->n_nodes - i);
+        m      = 0;
+        for (int k = i; k < i + n_head; ++k) {
+            if (k == i || !ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                map[m++] = k;
+            }
+        }
+        if (m == n_head) {
+            return false;
+        }
+        start = i + n_head - m;
+        for (int t = 0; t < m; ++t) {
+            buf[start + t] = cgraph->nodes[map[t]];
+        }
+        g         = *cgraph;
+        g.nodes   = buf.data() + start;
+        g.n_nodes = cgraph->n_nodes - start;
+        return true;
+    }
+
+    // graph index of window node k
+    int orig(int k) const {
+        return k < m ? map[k] : i + n_head + (k - m);
+    }
+
+    void close(const ggml_cgraph * cgraph) {
+        for (int k = start; k < i + n_head; ++k) {
+            buf[k] = cgraph->nodes[k];
+        }
+    }
+};
+
 // GGML_CUDA_GRAPH_STATS=1: per device, how graphs are run (CUDA graph replays, captures, direct evaluations and why)
 // and, for the first captures, the kernels per graph (counted in the captured CUDA graph) and the ops left unfused
 struct ggml_cuda_graph_stats {
@@ -3116,12 +3172,12 @@ struct ggml_cuda_graph_stats {
     uint64_t n_reports = 0;
 
     // the evaluation in progress
-    int    n_single = 0, n_fused_groups = 0, n_fused_nodes = 0, n_skipped = 0;
+    int    n_single = 0, n_fused_groups = 0, n_fused_nodes = 0, n_skipped = 0, n_view_groups = 0;
     size_t cg_nodes = 0, cg_kernels = 0, cg_copies = 0, cg_chunks = 0;
     std::map<std::string, int> ops;
 
     void begin_eval() {
-        n_single = n_fused_groups = n_fused_nodes = n_skipped = 0;
+        n_single = n_fused_groups = n_fused_nodes = n_skipped = n_view_groups = 0;
         cg_nodes = cg_kernels = cg_copies = cg_chunks = 0;
         ops.clear();
     }
@@ -3156,14 +3212,14 @@ struct ggml_cuda_graph_stats {
         }
         if (captured) {
             GGML_LOG_INFO("ggml_cuda_graph_stats: CUDA%d capture: %d ggml nodes -> %d launches (%d single, %d fused groups of %d nodes, "
-                "%d skipped) -> CUDA graph %zu nodes = %zu kernels + %zu copies/memsets in %zu chunks; last node %s [%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                device, cgraph->n_nodes, n_single + n_fused_groups, n_single, n_fused_groups, n_fused_nodes, n_skipped,
+                "%d skipped, %d groups past views) -> CUDA graph %zu nodes = %zu kernels + %zu copies/memsets in %zu chunks; last node %s [%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                device, cgraph->n_nodes, n_single + n_fused_groups, n_single, n_fused_groups, n_fused_nodes, n_skipped, n_view_groups,
                 cg_nodes, cg_kernels, cg_copies, cg_chunks, last ? ggml_op_desc(last) : "-",
                 last ? last->ne[0] : 0, last ? last->ne[1] : 0, last ? last->ne[2] : 0);
         } else {
             GGML_LOG_INFO("ggml_cuda_graph_stats: CUDA%d direct: %d ggml nodes -> %d launches (%d single, %d fused groups of %d nodes, "
-                "%d skipped); last node %s [%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                device, cgraph->n_nodes, n_single + n_fused_groups, n_single, n_fused_groups, n_fused_nodes, n_skipped,
+                "%d skipped, %d groups past views); last node %s [%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                device, cgraph->n_nodes, n_single + n_fused_groups, n_single, n_fused_groups, n_fused_nodes, n_skipped, n_view_groups,
                 last ? ggml_op_desc(last) : "-", last ? last->ne[0] : 0, last ? last->ne[1] : 0, last ? last->ne[2] : 0);
         }
         GGML_LOG_INFO("ggml_cuda_graph_stats: CUDA%d launches by op:%s\n", device, top.c_str());
@@ -4769,6 +4825,28 @@ static int ggml_cuda_try_decode_fusion(ggml_backend_cuda_context * cuda_ctx, ggm
     return 0;
 }
 
+// the decode fusions that leave node i (and the nodes after it) to a later kernel: -1 none, else the nodes to skip after i
+static int ggml_cuda_try_df_skip(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i, int df_mask) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if ((df_mask & GGML_CUDA_DF_CONVSTATE) && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_skip_conv_state(cuda_ctx, cgraph, i)) {
+        return 0;
+    }
+    if ((df_mask & GGML_CUDA_DF_GDNL2) && node->op == GGML_OP_RMS_NORM) {
+        if (const int n = ggml_cuda_try_skip_gdn_l2(cuda_ctx, cgraph, i); n > 0) {
+            return n - 1;
+        }
+    }
+    if ((df_mask & GGML_CUDA_DF_GDNSTATE) && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_skip_gdn_state_gather(cuda_ctx, cgraph, i)) {
+        return 0;
+    }
+    if ((df_mask & GGML_CUDA_DF_GDNGATE) && (node->op == GGML_OP_ADD || node->op == GGML_OP_UNARY)) {
+        if (const int n = ggml_cuda_try_skip_gdn_gates(cuda_ctx, cgraph, i); n > 0) {
+            return n - 1;
+        }
+    }
+    return -1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5705,6 +5783,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_l2_remap.clear();
             cuda_ctx->conv_state_remap.clear();
             cuda_ctx->df_skip.clear();
+            ggml_cuda_view_window views;
+            if (df_mask & GGML_CUDA_DF_VIEWS) {
+                views.reset(cgraph);
+            }
             ggml_cuda_graph_stats * gstats = ggml_cuda_graph_stats_get(cuda_ctx->device);
             if (gstats) {
                 gstats->begin_eval();
@@ -5767,41 +5849,54 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     continue;
                 }
-                if ((df_mask & GGML_CUDA_DF_CONVSTATE) && node->op == GGML_OP_GET_ROWS &&
-                        ggml_cuda_try_skip_conv_state(cuda_ctx, cgraph, i)) {
+                // views: the decode fusions see past the no-op nodes (their scans already skip them), then every
+                // fusion on the graph as it is, then the rest past the no-op nodes
+                const bool vwin = (df_mask & GGML_CUDA_DF_VIEWS) && views.open(cgraph, i);
+                if (int n_dfs = vwin ? ggml_cuda_try_df_skip(cuda_ctx, &views.g, 0, df_mask) :
+                                       ggml_cuda_try_df_skip(cuda_ctx, cgraph, i, df_mask); n_dfs >= 0) {
                     if (gstats) {
-                        gstats->n_skipped++;
+                        gstats->n_skipped += n_dfs + 1;
+                        gstats->n_view_groups += vwin && views.orig(n_dfs) != i + n_dfs;
                     }
+                    if (vwin) {
+                        n_dfs = views.orig(n_dfs) - i;
+                        views.close(cgraph);
+                    }
+                    i += n_dfs;
                     continue;
-                }
-                if ((df_mask & GGML_CUDA_DF_GDNL2) && node->op == GGML_OP_RMS_NORM) {
-                    if (const int n_l2 = ggml_cuda_try_skip_gdn_l2(cuda_ctx, cgraph, i); n_l2 > 0) {
-                        if (gstats) {
-                            gstats->n_skipped += n_l2;
-                        }
-                        i += n_l2 - 1;
-                        continue;
-                    }
-                }
-                if ((df_mask & GGML_CUDA_DF_GDNSTATE) && node->op == GGML_OP_GET_ROWS &&
-                        ggml_cuda_try_skip_gdn_state_gather(cuda_ctx, cgraph, i)) {
-                    if (gstats) {
-                        gstats->n_skipped++;
-                    }
-                    continue;
-                }
-                if ((df_mask & GGML_CUDA_DF_GDNGATE) && (node->op == GGML_OP_ADD || node->op == GGML_OP_UNARY)) {
-                    if (const int n_gate = ggml_cuda_try_skip_gdn_gates(cuda_ctx, cgraph, i); n_gate > 0) {
-                        if (gstats) {
-                            gstats->n_skipped += n_gate;
-                        }
-                        i += n_gate - 1;
-                        continue;
-                    }
                 }
 
                 cuda_ctx->q8_gen++;
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                const ggml_cgraph * fused_graph = cgraph;
+                int fused_i = i;
+                int nodes_to_skip = 0;
+                if (vwin && (df_mask & ~GGML_CUDA_DF_VIEWS) != 0) {
+                    nodes_to_skip = ggml_cuda_try_decode_fusion(cuda_ctx, &views.g, 0, df_mask);
+                    if (nodes_to_skip > 0) {
+                        fused_graph = &views.g;
+                        fused_i = 0;
+                    }
+                }
+                if (nodes_to_skip == 0) {
+                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                }
+                if (nodes_to_skip == 0 && vwin) {
+                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, &views.g, 0);
+                    if (nodes_to_skip > 0) {
+                        fused_graph = &views.g;
+                        fused_i = 0;
+                    }
+                }
+                if (gstats) {
+                    gstats->count(fused_graph, fused_i, nodes_to_skip);
+                    gstats->n_view_groups += fused_graph != cgraph && views.orig(nodes_to_skip) != i + nodes_to_skip;
+                }
+                if (fused_graph != cgraph) {
+                    nodes_to_skip = views.orig(nodes_to_skip) - i;
+                }
+                if (vwin) {
+                    views.close(cgraph);
+                }
 
                 if (cuda_ctx->q8_active) {
                     // the q8_1 rows of an earlier input are stale once a node writes over them
@@ -5811,9 +5906,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             cuda_ctx->q8_invalidate(t->data, ggml_nbytes(t));
                         }
                     }
-                }
-                if (gstats) {
-                    gstats->count(cgraph, i, nodes_to_skip);
                 }
 
                 if (nodes_to_skip != 0) {

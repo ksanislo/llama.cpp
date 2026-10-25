@@ -5181,6 +5181,127 @@ struct test_decode_fusion_conv_state : public test_case {
     }
 };
 
+// views: fusions whose ops have no-op nodes (views, reshapes) between them, matched with GGML_CUDA_DECODE_FUSION=views
+//   add_chain : the mean over hc streams, CONT(view 0) + view 1 + ... (multi-add, each view between two ADDs)
+//   rms_mul   : RMS_NORM, view of a bigger weight, MUL (and view of a bigger bias, ADD)
+//   glu       : MUL_MAT gate, view of a bigger up weight, MUL_MAT up, SWIGLU (MMVQ)
+//   hcnorm    : hc_post, reshape of it read by another node (h_nextn), RMS_NORM, MUL
+//   negative  : RMS_NORM read through a view by the ADD after the MUL: must not fuse
+enum test_dfv_mode { DFV_ADD_CHAIN, DFV_RMS_MUL, DFV_RMS_MUL_ADD, DFV_GLU, DFV_HCNORM, DFV_NEGATIVE };
+
+static const char * dfv_mode_name(test_dfv_mode m) {
+    switch (m) {
+        case DFV_ADD_CHAIN:   return "add_chain";
+        case DFV_RMS_MUL:     return "rms_mul";
+        case DFV_RMS_MUL_ADD: return "rms_mul_add";
+        case DFV_GLU:         return "glu";
+        case DFV_HCNORM:      return "hcnorm";
+        case DFV_NEGATIVE:    return "negative";
+    }
+    return "?";
+}
+
+struct test_decode_fusion_views : public test_case {
+    const test_dfv_mode mode;
+    const ggml_type type;
+    const int64_t n_embd, n;
+    ggml_tensor * res = nullptr;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DECODE_FUSION_VIEWS"; }
+    std::string vars() override {
+        return std::string("mode=") + dfv_mode_name(mode) + "," + VARS_TO_STR3(type, n_embd, n);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return mode == DFV_GLU ? 5e-4 : 1e-7; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (mode == DFV_HCNORM) {
+            return { res, out };
+        }
+        return { out };
+    }
+
+    test_decode_fusion_views(test_dfv_mode mode, ggml_type type = GGML_TYPE_F32, int64_t n_embd = 2560, int64_t n = 1)
+        : mode(mode), type(type), n_embd(n_embd), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        switch (mode) {
+            case DFV_ADD_CHAIN: {
+                const int hc = 4;
+                ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n);
+                ggml_set_name(x, "x");
+                x = ggml_scale(ctx, x, 0.5f); // a computed tensor, as the hc mix output
+                ggml_tensor * acc = ggml_cont(ctx, ggml_view_2d(ctx, x, n_embd, n, x->nb[2], 0));
+                for (int s = 1; s < hc; ++s) {
+                    acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, n_embd, n, x->nb[2], s*x->nb[1]));
+                }
+                out = ggml_scale(ctx, acc, 1.0f / hc);
+                break;
+            }
+            case DFV_RMS_MUL:
+            case DFV_RMS_MUL_ADD:
+            case DFV_NEGATIVE: {
+                ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+                ggml_set_name(x, "x");
+                ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 3);
+                ggml_set_name(wb, "wb");
+                ggml_tensor * rms = ggml_rms_norm(ctx, x, 1e-6f);
+                if (mode == DFV_NEGATIVE) {
+                    ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+                    ggml_set_name(w, "w");
+                    // DFS order: rms, the view of it, mul, add
+                    out = ggml_add(ctx, ggml_view_2d(ctx, rms, n_embd, n, rms->nb[1], 0), ggml_mul(ctx, rms, w));
+                    break;
+                }
+                // the second row of a [n_embd, 3] tensor: a view node between RMS_NORM and MUL
+                out = ggml_mul(ctx, rms, ggml_view_1d(ctx, wb, n_embd, wb->nb[1]));
+                if (mode == DFV_RMS_MUL_ADD) {
+                    ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n, 2);
+                    ggml_set_name(b, "b");
+                    out = ggml_add(ctx, out, ggml_view_2d(ctx, b, n_embd, n, b->nb[1], b->nb[2]));
+                }
+                break;
+            }
+            case DFV_GLU: {
+                const int64_t m = 640;
+                ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+                ggml_set_name(x, "x");
+                ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, n_embd, m);
+                ggml_set_name(wg, "wg");
+                ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, n_embd, 3*m);
+                ggml_set_name(wu, "wu");
+                ggml_tensor * gate = ggml_mul_mat(ctx, wg, x);
+                // rows m..2m of the up bank: a view node between the two projections
+                ggml_tensor * up = ggml_mul_mat(ctx, ggml_view_2d(ctx, wu, n_embd, m, wu->nb[1], m*wu->nb[1]), x);
+                out = ggml_swiglu_split(ctx, gate, up);
+                break;
+            }
+            case DFV_HCNORM: {
+                const int hc = 4;
+                ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+                ggml_set_name(x, "x");
+                ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n);
+                ggml_set_name(residual, "residual");
+                ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n);
+                ggml_set_name(post, "post");
+                ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+                ggml_set_name(w, "w");
+                post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+                res = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+                ggml_set_name(res, "res");
+                // h_nextn: a reshape of hc_post read after the norm, built first so it sits between them
+                ggml_tensor * nextn = ggml_reshape_2d(ctx, res, n_embd*hc, n);
+                ggml_tensor * xn    = ggml_mul(ctx, ggml_rms_norm(ctx, res, 1e-6f), w);
+                out = ggml_concat(ctx, nextn, ggml_reshape_2d(ctx, xn, n_embd*hc, n), 1);
+                break;
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -13276,6 +13397,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_decode_fusion_conv_state(256, 4, n, 3, 1));
         test_cases.emplace_back(new test_decode_fusion_conv_state(256, 4, n, 3, 2));
         test_cases.emplace_back(new test_decode_fusion_conv_state(10240, 4, n, 2, 1));
+        for (test_dfv_mode mode : { DFV_ADD_CHAIN, DFV_RMS_MUL, DFV_RMS_MUL_ADD, DFV_HCNORM, DFV_NEGATIVE }) {
+            test_cases.emplace_back(new test_decode_fusion_views(mode, GGML_TYPE_F32, 2560, n));
+        }
+        test_cases.emplace_back(new test_decode_fusion_views(DFV_ADD_CHAIN, GGML_TYPE_F32, 256, n));
+        test_cases.emplace_back(new test_decode_fusion_views(DFV_GLU, GGML_TYPE_Q4_K, 2560, n));
+        test_cases.emplace_back(new test_decode_fusion_views(DFV_GLU, GGML_TYPE_Q8_0, 2560, n));
     }
 
 #if 0
