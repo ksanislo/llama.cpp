@@ -2367,7 +2367,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // the experts of host-resident layers may be read from the MoE cache
+    // the prediction for the next layer goes before the lookup, so the cache reads it back with the selected experts
+    ggml_tensor * pred  = weight_before_ffn ? nullptr : build_moe_cache_prediction(cur, n_expert_used, gating_op, il);
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    if (slots != nullptr) {
+        moe_cache->set_prediction(slots->view_src, pred);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2682,6 +2687,58 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     ggml_build_forward_expand(gf, slots);
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+}
+
+ggml_tensor * llm_graph_context::build_moe_cache_prediction(
+         ggml_tensor * cur,
+             int64_t   n_expert_used,
+    llama_expert_gating_func_type gating_op,
+                 int   il) const {
+    llama_moe_cache::next_router r;
+    if (moe_cache == nullptr || cur->ne[1] == 0 || !moe_cache->get_next_router(il, cur->ne[1], n_expert_used, r) ||
+        r.n_pred > r.gate_inp->ne[1] || cur->ne[0] != r.gate_inp->ne[0]) {
+        return nullptr;
+    }
+
+    // monotonic in the logits like the real selection, only the order matters
+    ggml_tensor * logits = ggml_mul_mat(ctx0, r.gate_inp, cur); // [n_expert, n_tokens]
+    std::vector<ggml_tensor *> nodes = { logits };
+    if (r.gate_inp_b) {
+        logits = ggml_add(ctx0, logits, r.gate_inp_b);
+        nodes.push_back(logits);
+    }
+    ggml_tensor * probs = logits;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       probs = ggml_soft_max(ctx0, logits); break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       probs = ggml_sigmoid(ctx0, logits); break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); nodes.push_back(probs->src[0]); break;
+        default: break;
+    }
+    if (probs != logits) {
+        nodes.push_back(probs);
+    }
+    if (r.exp_probs_b) {
+        probs = ggml_add(ctx0, probs, r.exp_probs_b);
+        nodes.push_back(probs);
+    }
+    ggml_tensor * top = ggml_argsort_top_k(ctx0, probs, r.n_pred);
+    nodes.push_back(top->view_src);
+    ggml_tensor * pred = ggml_cont(ctx0, top); // [n_pred, n_tokens]
+    nodes.push_back(pred);
+
+    ggml_backend_t backend = moe_cache->backend(il);
+    for (ggml_tensor * t : nodes) {
+        if (!ggml_backend_supports_op(backend, t)) {
+            return nullptr; // the nodes are not in the graph yet
+        }
+    }
+    for (ggml_tensor * t : nodes) {
+        ggml_backend_sched_set_tensor_backend(sched, t, backend);
+    }
+    ggml_set_name(pred, ("ffn_moe_pred-" + std::to_string(il)).c_str());
+    ggml_set_output(pred);
+    ggml_build_forward_expand(gf, pred);
+    return pred;
 }
 
 // input embeddings with optional lora
