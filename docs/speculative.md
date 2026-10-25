@@ -256,6 +256,9 @@ Use exactly one of these options:
 --spec-draft-p-min, --draft-p-min       P
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-p-min-keep, --no-spec-draft-p-min-keep
+                                        draft-mtp: keep the draft token that falls below --spec-draft-p-min and stop after it, so every step drafts at least one token; when disabled the token is dropped and a step whose first token is below it drafts none (default: disabled)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_P_MIN_KEEP)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)
