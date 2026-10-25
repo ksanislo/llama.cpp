@@ -13,6 +13,8 @@ struct llama_model;
 // with LLAMA_MOE_ASYNC=n, the batches the cache does not serve read the experts of a layer from one of n staging slots per device instead,
 // filled on a separate stream of the device; large batches stage all the experts of the next layer while the current one computes
 // with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
+// with LLAMA_MOE_RING=K the K staging slots are a ring: every uncached expert of a device's staged layers streams on the copy stream in
+// layer order, independent of the routing, as far ahead as the slots allow, with no host step per layer (borrows the cache by default)
 // with LLAMA_MOE_PREFETCH=k the router of the next layer is applied to the input of the current one, and the missing experts among its top k
 // are uploaded on a second stream while the current layer and the attention of the next one compute (decode, cached batches only)
 // with LLAMA_MOE_DEVICE_HITS=1|2 small batches look the slots up on the device and read the misses straight from the pinned host experts,
