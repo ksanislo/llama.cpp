@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-rope-level.h"
 
 #include <algorithm>
 #include <cassert>
@@ -146,6 +147,8 @@ llama_kv_cache::llama_kv_cache(
 
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
+
+    rope_lvl_pending.assign(LLAMA_MAX_SEQ, -1);
 
     if (n_stream > 1) {
         seq_to_stream.resize(n_stream, 0);
@@ -552,6 +555,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
 
             v_cells[s1].ext_set(i, ext);
+            v_cells[s1].rope_set(i, v_cells[s0].rope_get(i));
         }
     }
 
@@ -765,7 +769,7 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
-    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
+    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info), get_has_rope_level());
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
@@ -913,6 +917,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             cells.reset_shift();
         }
+    }
+
+    if (get_has_rope_level()) {
+        // build_rope_shift ropes with the context's (level 1) parameters
+        GGML_ASSERT(!do_shift && "K-shift with elastic YaRN is not implemented");
+
+        updated = update_rope_level(lctx) || updated;
     }
 
     return updated;
@@ -1172,6 +1183,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 }
 
                 cells.ext_set(idx, ext);
+            }
+
+            if (rope_lvl_on) {
+                llama_kv_cell_rope rope;
+                rope.e     = ubatch.n_pos >= 4 ? ubatch.pos[i + ubatch.n_tokens*3] : 0;
+                rope.level = (uint8_t) ubatch.rope_level;
+
+                cells.rope_set(idx, rope);
             }
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
@@ -2071,6 +2090,355 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+//
+// elastic YaRN
+//
+
+bool llama_kv_cache::get_can_rope_level() const {
+    if (other || hparams.rope_type == LLAMA_ROPE_TYPE_NONE) {
+        return false;
+    }
+
+    // per-layer rope dims, partial (MLA) keys and SWA layers with their own rope are not handled
+    if (model.arch == LLM_ARCH_STEP35 || hparams.n_lora_kv > 0 || hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+
+    // the move rotates a cell by its cached positions: M-RoPE needs all 4 sections of it, see llama_kv_cell_rope
+    if (hparams.n_pos_per_embd() > 1 && hparams.n_pos_per_embd() != 4) {
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::get_has_rope_level() const {
+    return rope_lvl_on && std::any_of(rope_lvl_pending.begin(), rope_lvl_pending.end(), [](int8_t l) { return l >= 0; });
+}
+
+bool llama_kv_cache::rope_level_enable() {
+    if (!get_can_rope_level()) {
+        return false;
+    }
+
+    rope_lvl_on = true;
+
+    return true;
+}
+
+int32_t llama_kv_cache::seq_rope_level(llama_seq_id seq_id) const {
+    // a non-unified cache has a stream per sequence, and nothing past them
+    if (!rope_lvl_on || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    const auto & sp    = cells.seq_pos_get(seq_id);
+
+    if (sp.empty()) {
+        return -1;
+    }
+
+    // a pending move counts as done: the next update applies it before any ubatch
+    if (rope_lvl_pending[seq_id] >= 0) {
+        return rope_lvl_pending[seq_id];
+    }
+
+    return cells.rope_get(sp.begin()->second).level;
+}
+
+std::vector<llama_seq_id> llama_kv_cache::seq_rope_group(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    // only a unified cache shares cells between sequences
+    if (n_stream > 1) {
+        return { seq_id };
+    }
+
+    const auto & cells = v_cells[0];
+
+    llama_kv_cells::seq_set_t group;
+    group.set(seq_id);
+
+    std::vector<llama_seq_id> todo = { seq_id };
+
+    while (!todo.empty()) {
+        const llama_seq_id s = todo.back();
+        todo.pop_back();
+
+        for (const auto & [pos, cell] : cells.seq_pos_get(s)) {
+            GGML_UNUSED(pos);
+
+            const auto & seqs = cells.seq_get_all(cell);
+            if ((seqs & ~group).none()) {
+                continue;
+            }
+
+            for (int32_t t = 0; t < LLAMA_MAX_SEQ; ++t) {
+                if (seqs.test(t) && !group.test(t)) {
+                    group.set(t);
+                    todo.push_back(t);
+                }
+            }
+        }
+    }
+
+    std::vector<llama_seq_id> res;
+    for (int32_t t = 0; t < LLAMA_MAX_SEQ; ++t) {
+        if (group.test(t)) {
+            res.push_back(t);
+        }
+    }
+
+    return res;
+}
+
+void llama_kv_cache::seq_rope_level_set(llama_seq_id seq_id, int32_t level) {
+    GGML_ASSERT(rope_lvl_on);
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    GGML_ASSERT(level == 0 || level == 1);
+
+    rope_lvl_pending[seq_id] = (int8_t) level;
+}
+
+bool llama_kv_cache::update_rope_level(llama_context * lctx) {
+    const uint32_t kv_size = get_size();
+    const uint32_t n_pos   = hparams.n_pos_per_embd();
+
+    // the cells to move, by direction; the caller moves whole seq_rope_group()s, so the sequences of a
+    // cell agree, take the highest level anyway
+    std::vector<std::pair<uint32_t, uint32_t>> cells_up;   // (stream, cell) 0 -> 1
+    std::vector<std::pair<uint32_t, uint32_t>> cells_down; // (stream, cell) 1 -> 0
+
+    std::vector<std::vector<int8_t>> target(n_stream);
+    std::vector<std::pair<uint32_t, uint32_t>> touched;
+
+    for (size_t s = 0; s < rope_lvl_pending.size() && s < seq_to_stream.size(); ++s) {
+        if (rope_lvl_pending[s] < 0) {
+            continue;
+        }
+
+        const uint32_t strm = seq_to_stream[s];
+        if (target[strm].empty()) {
+            target[strm].assign(kv_size, -1);
+        }
+
+        for (const auto & [pos, cell] : v_cells[strm].seq_pos_get(s)) {
+            GGML_UNUSED(pos);
+
+            if (target[strm][cell] < 0) {
+                touched.emplace_back(strm, cell);
+            }
+            target[strm][cell] = std::max(target[strm][cell], rope_lvl_pending[s]);
+        }
+    }
+
+    for (const auto & [strm, cell] : touched) {
+        const int8_t t = target[strm][cell];
+        if (t != v_cells[strm].rope_get(cell).level) {
+            (t > 0 ? cells_up : cells_down).emplace_back(strm, cell);
+        }
+    }
+
+    std::fill(rope_lvl_pending.begin(), rope_lvl_pending.end(), -1);
+
+    if (cells_up.empty() && cells_down.empty()) {
+        return false;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    // move in chunks, so the f32 copies of the keys stay small next to the compute buffer
+    uint32_t n_embd_k_gqa_max = 1;
+    for (const auto & layer : layers) {
+        n_embd_k_gqa_max = std::max(n_embd_k_gqa_max, hparams.n_embd_k_gqa(layer.il));
+    }
+    const size_t n_chunk = std::max<size_t>(256, (64ull*1024*1024) / (sizeof(float)*n_embd_k_gqa_max));
+
+    auto * sched = lctx->get_sched();
+
+    for (int dir = 0; dir < 2; ++dir) {
+        const auto & todo = dir == 0 ? cells_up : cells_down;
+
+        for (size_t i0 = 0; i0 < todo.size(); i0 += n_chunk) {
+            const size_t n = std::min(n_chunk, todo.size() - i0);
+
+            rope_move mv;
+            mv.from = dir == 0 ? 0 : 1;
+            mv.to   = dir == 0 ? 1 : 0;
+            mv.idxs.resize(n);
+            mv.pos .resize(n*n_pos);
+
+            for (size_t i = 0; i < n; ++i) {
+                const auto [strm, cell] = todo[i0 + i];
+                const auto & cells = v_cells[strm];
+
+                mv.idxs[i] = (int32_t) (strm*kv_size + cell);
+                mv.pos[i]  = cells.pos_get(cell);
+
+                if (n_pos == 4) {
+                    // the sections as apply_ubatch() stored them: y, x in the cell ext, the 4th in the cell rope
+                    const auto & ext = cells.ext_get(cell);
+                    mv.pos[i + n]   = ext.y;
+                    mv.pos[i + n*2] = ext.x;
+                    mv.pos[i + n*3] = cells.rope_get(cell).e;
+                }
+            }
+
+            ggml_backend_sched_reset(sched);
+
+            auto * res = lctx->get_gf_res_reserve();
+
+            res->reset();
+
+            auto * gf = build_graph_rope_level(res, lctx, mv);
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate compute graph for the rope level move\n", __func__);
+                return true;
+            }
+
+            res->set_inputs(nullptr);
+
+            if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: failed to compute the rope level move\n", __func__);
+                return true;
+            }
+
+            for (size_t i = 0; i < n; ++i) {
+                const auto [strm, cell] = todo[i0 + i];
+                auto & cells = v_cells[strm];
+
+                auto rope = cells.rope_get(cell);
+                rope.level = (uint8_t) mv.to;
+                cells.rope_set(cell, rope);
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: elastic YaRN: moved %zu cells to YaRN, %zu to plain RoPE, %d layers, in %.1f ms\n", __func__,
+            cells_up.size(), cells_down.size(), (int) layers.size(), (ggml_time_us() - t_start_us)/1000.0);
+
+    return true;
+}
+
+class llm_graph_input_rope_level : public llm_graph_input_i {
+public:
+    llm_graph_input_rope_level(const llama_kv_cache * kv_self, const llama_kv_cache::rope_move & mv) : kv_self(kv_self), mv(mv) {}
+    virtual ~llm_graph_input_rope_level() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * idxs    = nullptr; // I32 [n], get_rows takes no I64
+    ggml_tensor * pos     = nullptr; // I32 [n*n_pos]
+    ggml_tensor * pos_neg = nullptr; // I32 [n*n_pos], -pos: rotating by it undoes a rotation by pos
+
+    // note: assumes k_rot^2 == I
+    ggml_tensor * k_rot = nullptr;
+
+    const llama_kv_cache * kv_self;
+
+    const llama_kv_cache::rope_move mv;
+};
+
+void llm_graph_input_rope_level::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
+    memcpy(idxs->data, mv.idxs.data(), ggml_nbytes(idxs));
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(pos_neg->buffer));
+
+    int32_t * dp = (int32_t *) pos->data;
+    int32_t * dn = (int32_t *) pos_neg->data;
+    for (size_t i = 0; i < mv.pos.size(); ++i) {
+        dp[i] =  mv.pos[i];
+        dn[i] = -mv.pos[i];
+    }
+
+    if (k_rot && k_rot->buffer) {
+        kv_self->set_input_k_rot(k_rot);
+    }
+}
+
+ggml_cgraph * llama_kv_cache::build_graph_rope_level(llm_graph_result * res, llama_context * lctx, const rope_move & mv) const {
+    GGML_ASSERT(!other);
+
+    auto * ctx = res->get_ctx();
+    auto * gf  = res->get_gf();
+
+    const auto & cparams = lctx->get_cparams();
+    GGML_ASSERT(cparams.rope_elastic && mv.from < 2 && mv.to < 2);
+
+    const int64_t n     = mv.idxs.size();
+    const int64_t n_pos = hparams.n_pos_per_embd();
+
+    auto inp = std::make_unique<llm_graph_input_rope_level>(this, mv);
+
+    inp->idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+    ggml_set_input(inp->idxs);
+
+    inp->pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n*n_pos);
+    ggml_set_input(inp->pos);
+
+    inp->pos_neg = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n*n_pos);
+    ggml_set_input(inp->pos_neg);
+
+    inp->k_rot = build_input_k_rot(ctx);
+
+    const auto & lv_from = cparams.rope_levels[mv.from];
+    const auto & lv_to   = cparams.rope_levels[mv.to];
+
+    const bool is_mrope = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE ||
+                          hparams.rope_type == LLAMA_ROPE_TYPE_VISION;
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        if (!hparams.has_rope(il)) {
+            continue;
+        }
+
+        const int64_t n_head_kv     = hparams.n_head_kv(il);
+        const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+        const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
+        const int     n_rot         = hparams.n_rot(il);
+
+        const float freq_base = model.get_rope_freq_base(cparams, il);
+
+        ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+
+        // all streams as one: the indices are global
+        ggml_tensor * k = ggml_reshape_2d(ctx, layer.k, n_embd_k_gqa, (int64_t) get_size()*n_stream);
+
+        ggml_tensor * cur = ggml_get_rows(ctx, k, inp->idxs); // F32 [n_embd_k_gqa, n]
+        cur = ggml_reshape_3d(ctx, cur, n_embd_head_k, n_head_kv, n);
+
+        // the cache holds rot*rope(k) for a quantized K, see build_attn
+        if (inp->k_rot) {
+            cur = llama_mul_mat_hadamard(ctx, cur, inp->k_rot);
+        }
+
+        cur = llama_rope_level_move(ctx, cur, inp->pos, inp->pos_neg, rope_factors, n_rot, is_mrope ? sections : nullptr,
+                hparams.rope_type, cparams.n_ctx_orig_yarn, freq_base, lv_from, lv_to, cparams.yarn_beta_fast, cparams.yarn_beta_slow);
+
+        if (inp->k_rot) {
+            cur = llama_mul_mat_hadamard(ctx, cur, inp->k_rot);
+        }
+
+        cur = ggml_reshape_2d(ctx, cur, n_embd_k_gqa, n);
+
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k, cur, inp->idxs));
+    }
+
+    res->add_input(std::move(inp));
+
+    return gf;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2257,13 +2625,39 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
     const auto & cells = v_cells[cr.strm];
 
-    const uint32_t v_trans = this->v_trans ? 1 : 0;
+    // elastic YaRN: cells whose key is not at rope level 0 (or that carry a 4th M-RoPE position) are flagged in
+    // bit 1 of the v_trans word and followed by their llama_kv_cell_rope; without them the format is unchanged,
+    // and an older reader refuses a flagged state, whose keys it would misread, as a V transposition mismatch
+    bool has_rope = false;
+    if (rope_lvl_on) {
+        for (const auto & range : cr.data) {
+            for (uint32_t i = range.first; i < range.second && !has_rope; ++i) {
+                has_rope = cells.rope_get(i).level != 0 || cells.rope_get(i).e != 0;
+            }
+        }
+    }
+
+    const uint32_t v_trans = (this->v_trans ? 1 : 0) | (has_rope ? 2 : 0);
     const uint32_t n_layer = layers.size();
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
     io.write(&n_rot_k, sizeof(n_rot_k));
     io.write(&n_rot_v, sizeof(n_rot_v));
+
+    if (has_rope) {
+        for (const auto & range : cr.data) {
+            for (uint32_t i = range.first; i < range.second; ++i) {
+                const llama_kv_cell_rope & rope = cells.rope_get(i);
+
+                const int32_t e     = rope.e;
+                const uint8_t level = rope.level;
+
+                io.write(&e,     sizeof(e));
+                io.write(&level, sizeof(level));
+            }
+        }
+    }
 
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
@@ -2564,6 +2958,15 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
     io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
 
+    // see state_write_data
+    const bool has_rope = (v_trans & 2) != 0;
+    v_trans &= 1;
+
+    if (has_rope && !rope_lvl_on) {
+        LLAMA_LOG_ERROR("%s: the state holds keys of an elastic YaRN context (--rope-scaling yarn-elastic)\n", __func__);
+        return false;
+    }
+
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
         return false;
@@ -2587,6 +2990,30 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     if (n_rot_v_ref != n_rot_v) {
         LLAMA_LOG_ERROR("%s: incompatible value rotation (%u instead of %u)\n", __func__, n_rot_v_ref, n_rot_v);
         return false;
+    }
+
+    if (rope_lvl_on) {
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            llama_kv_cell_rope rope;
+
+            if (has_rope) {
+                int32_t e;
+                uint8_t level;
+
+                io.read(&e,     sizeof(e));
+                io.read(&level, sizeof(level));
+
+                if (level > 1) {
+                    LLAMA_LOG_ERROR("%s: invalid rope level %u\n", __func__, level);
+                    return false;
+                }
+
+                rope.e     = e;
+                rope.level = level;
+            }
+
+            cells.rope_set(sinfo.idxs[0][i], rope);
+        }
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
@@ -2836,8 +3263,9 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_context * lctx,
         bool do_shift,
-        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+        stream_copy_info sc_info,
+        bool do_rope_level) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
+    if (!do_shift && this->sc_info.empty() && !do_rope_level) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }

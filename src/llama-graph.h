@@ -845,6 +845,7 @@ struct llm_graph_params {
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             ubatch.is_mixed()   == other.ubatch.is_mixed() &&
+            ubatch.rope_level   == other.ubatch.rope_level &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||

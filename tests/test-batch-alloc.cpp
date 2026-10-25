@@ -1176,6 +1176,99 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+// elastic YaRN: sequences of different rope levels never share a ubatch
+static void test_rope_level(testing & t) {
+    llama_vocab vocab;
+
+    // seqs 0 and 2 at level 1, seq 1 at level 0, interleaved in the batch
+    auto build = [](batch_builder & bb) {
+        for (int i = 0; i < 4; ++i) {
+            for (llama_seq_id s = 0; s < 3; ++s) {
+                bb.add(i, {s}, i == 3);
+            }
+        }
+    };
+
+    std::vector<uint8_t> levels(LLAMA_MAX_SEQ, 0);
+    levels[0] = 1;
+    levels[2] = 1;
+
+    auto check = [&](testing & t, const llama_ubatch & ub) {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            t.assert_equal("token level is the ubatch level", (uint32_t) levels[ub.seq_id[i][0]], ub.rope_level);
+        }
+    };
+
+    t.test("split_simple", [&](testing & t) {
+        batch_builder bb;
+        build(bb);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        ba.set_seq_rope_levels(levels);
+
+        uint32_t n = 0;
+        llama_ubatch ub = ba.split_simple(16);
+        t.assert_equal("seqs 0 and 2 first", 8u, ub.n_tokens);
+        t.assert_equal(1u, ub.rope_level);
+        check(t, ub);
+        n += ub.n_tokens;
+
+        ub = ba.split_simple(16);
+        t.assert_equal("then seq 1", 4u, ub.n_tokens);
+        t.assert_equal(0u, ub.rope_level);
+        check(t, ub);
+        n += ub.n_tokens;
+
+        t.assert_equal(0u, ba.split_simple(16).n_tokens);
+        t.assert_equal(12u, n);
+    });
+
+    t.test("split_equal", [&](testing & t) {
+        batch_builder bb;
+        build(bb);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        ba.set_seq_rope_levels(levels);
+
+        uint32_t n = 0;
+        for (llama_ubatch ub = ba.split_equal(16, false, 0); ub.n_tokens > 0; ub = ba.split_equal(16, false, 0)) {
+            check(t, ub);
+            n += ub.n_tokens;
+        }
+        t.assert_equal(12u, n);
+    });
+
+    t.test("split_seq", [&](testing & t) {
+        batch_builder bb;
+        build(bb);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        ba.set_seq_rope_levels(levels);
+
+        uint32_t n = 0;
+        for (llama_ubatch ub = ba.split_seq(16); ub.n_tokens > 0; ub = ba.split_seq(16)) {
+            check(t, ub);
+            n += ub.n_tokens;
+        }
+        t.assert_equal(12u, n);
+    });
+
+    t.test("no_levels_is_level_0", [&](testing & t) {
+        batch_builder bb;
+        build(bb);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        llama_ubatch ub = ba.split_simple(16);
+        t.assert_equal(12u, ub.n_tokens);
+        t.assert_equal(0u, ub.rope_level);
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1199,6 +1292,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("rope_level",     test_rope_level);
 
     return t.summary();
 }

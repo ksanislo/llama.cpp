@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-rope-level.h"
 
 #include <cstdint>
 #include <vector>
@@ -31,6 +32,12 @@ struct llama_cparams {
     float yarn_attn_factor;
     float yarn_beta_fast;
     float yarn_beta_slow;
+
+    // elastic YaRN: each sequence ropes plain (level 0) until it reaches rope_elastic_thr, then with the
+    // configured YaRN (level 1); the fields above hold level 1, see llama_ubatch::rope_level
+    bool              rope_elastic     = false;
+    uint32_t          rope_elastic_thr = 0; // first position that needs level 1
+    llama_rope_params rope_levels[2]   = {};
 
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm

@@ -303,6 +303,7 @@ bool llama_batch_allocr::init(
             /*.n_seqs       =*/ (uint32_t) batch.n_tokens,
             /*.n_seqs_unq   =*/ (uint32_t) this->seq_id_unq.size(),
             /*.n_pos        =*/ n_pos_per_embd,
+            /*.rope_level   =*/ 0,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
             /*.embd_state   =*/ state_vec.empty() ? nullptr : state_vec.data(),
@@ -527,6 +528,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ n_seqs,
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.rope_level   =*/ 0,
 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
@@ -573,6 +575,12 @@ llama_pos llama_batch_allocr::seq_pos_max(llama_seq_id seq_id) const {
     return seq_pos[seq_id].empty() ? -1 : *seq_pos[seq_id].rbegin();
 }
 
+void llama_batch_allocr::set_seq_rope_levels(const std::vector<uint8_t> & levels) {
+    GGML_ASSERT(levels.empty() || levels.size() >= n_seq_max);
+
+    seq_rope_lvl = levels;
+}
+
 void llama_batch_allocr::split_reset() {
     out_ids.clear();
 
@@ -596,13 +604,18 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
     std::vector<int32_t> idxs;
 
+    // tokens of another rope level are left for a later ubatch
+    const uint32_t level = tok_rope_level(cur_idx);
+
     while (true) {
         idxs.push_back(cur_idx);
 
         used[cur_idx] = true;
         ++n_used;
 
-        ++cur_idx;
+        do {
+            ++cur_idx;
+        } while (cur_idx < used.size() && (used[cur_idx] || tok_rope_level(cur_idx) != level));
 
         if (cur_idx >= used.size()) {
             break;
@@ -627,13 +640,16 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     llama_seq_id last_seq_id = -1;
 
+    // the rope level of the first sequence set, the others must match it
+    int32_t level = -1;
+
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (used[i]) {
             continue;
         }
 
-        bool add = true;
+        bool add = level < 0 || tok_rope_level(i) == (uint32_t) level;
 
         for (uint32_t s = 0; s < cur_seq_set.size(); ++s) {
             // no overlap with existing sequence sets:
@@ -652,6 +668,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             cur_seq_set.push_back(seq_set[i]);
 
             last_seq_id = batch.seq_id[i][0];
+            level       = tok_rope_level(i);
 
             if (cur_seq_set.size() > n_ubatch) {
                 break;
@@ -817,7 +834,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
         do {
             ++cur_idx;
-        } while (cur_idx < get_n_tokens() && (used[cur_idx] || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx])));
+        } while (cur_idx < get_n_tokens() && (used[cur_idx] || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx]) ||
+                    tok_rope_level(cur_idx) != tok_rope_level(idxs[0])));
 
         if (cur_idx == get_n_tokens()) {
             break;
@@ -845,6 +863,7 @@ void llama_batch_allocr::clear() {
     seq_id_unq  .clear();
     output      .clear();
     decision_order.clear();
+    seq_rope_lvl  .clear();
 
     for (auto & cur : seq_pos) {
         cur.clear();
@@ -963,6 +982,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.rope_level   =*/ idxs.empty() ? 0 : tok_rope_level(idxs[0]),
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
