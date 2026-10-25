@@ -1565,6 +1565,61 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // GGML_CUDA_DECODE_FUSION q8: the q8_1 activations of the last MMVQ inputs of the graph being evaluated,
+    // reused by the next MMVQ that reads the same rows (q/k/v, qkv/z, the experts and the shared expert)
+    struct q8_entry {
+        const char * src   = nullptr; // first byte of the F32 rows
+        size_t       span  = 0;       // bytes from src to the end of the last row
+        int64_t      ne10  = 0;
+        int64_t      nrows = 0;
+        int64_t      nb_row = 0;
+        uint32_t     gen   = 0;       // q8_gen of the node that made it
+        bool         valid = false;
+    };
+    static constexpr int    q8_n_slots    = 8;
+    static constexpr size_t q8_slot_bytes = 256*1024;
+    bool     q8_active = false;     // set by the graph loop, only around its own nodes
+    char *   q8_buf    = nullptr;   // q8_n_slots * q8_slot_bytes, kept for the life of the context
+    int      q8_next   = 0;
+    uint32_t q8_gen    = 0;         // bumped per node of the graph loop
+    q8_entry q8_slots[q8_n_slots];
+
+    void q8_clear() {
+        for (q8_entry & e : q8_slots) {
+            e.valid = false;
+        }
+        q8_next = 0;
+    }
+
+    // a node wrote [data, data + size): drop the entries it overlaps, except those it made itself (a norm that also
+    // wrote the q8_1 rows of its output)
+    void q8_invalidate(const void * data, size_t size) {
+        const char * a = (const char *) data;
+        for (q8_entry & e : q8_slots) {
+            if (e.valid && e.gen != q8_gen && a < e.src + e.span && e.src < a + size) {
+                e.valid = false;
+            }
+        }
+    }
+
+    // GGML_CUDA_DECODE_FUSION gdnstate: a skipped state gather; the GDN reads row ids[s] of rows instead
+    struct gdn_state_src {
+        const float *   rows;
+        const int32_t * ids;
+        int64_t         row_stride; // floats
+    };
+    std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_remap;
+
+    // GGML_CUDA_DECODE_FUSION gdngate: skipped gate ops; the GDN computes g = softplus(g_raw + dt[h])*a[h] and/or
+    // beta = sigmoid(beta_raw) itself (nullptr: that input as given)
+    struct gdn_gate_src {
+        const float * g_raw    = nullptr;
+        const float * dt       = nullptr;
+        const float * a        = nullptr;
+        const float * beta_raw = nullptr;
+    };
+    std::unordered_map<const ggml_tensor *, gdn_gate_src> gdn_gate_remap;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

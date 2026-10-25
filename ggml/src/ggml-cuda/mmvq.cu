@@ -1487,9 +1487,70 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// GGML_CUDA_DECODE_FUSION q8: the q8_1 rows of src1 if an earlier MMVQ of this graph quantized them (hit), else a slot to
+// quantize into, or nullptr when src1 is not a graph tensor in a compute buffer or too large for a slot
+char * ggml_cuda_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int64_t ne10_padded, bool & hit) {
+    hit = false;
+    // device buffers only: host-mapped memory may be written by the host while the graph runs
+    if (!ctx.q8_active || src1->buffer == nullptr || src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) ||
+            ggml_backend_buffer_is_host(src1->buffer)) {
+        return nullptr;
+    }
+    // temporaries made by the ops (e.g. sorted rows in pool memory) are not graph tensors
+    const char * base = (const char *) ggml_backend_buffer_get_base(src1->buffer);
+    const char * data = (const char *) src1->data;
+    if (data < base || data + ggml_nbytes(src1) > base + ggml_backend_buffer_get_size(src1->buffer)) {
+        return nullptr;
+    }
+
+    // the rows in quantize order (i1, then i2, then i3) must be evenly spaced, so [n_embd, 1, T] and [n_embd, T] match
+    int64_t nrows  = 1;
+    int64_t nb_row = 0;
+    for (int d = 1; d < 4; ++d) {
+        if (src1->ne[d] == 1) {
+            continue;
+        }
+        if (nrows > 1 && (int64_t) src1->nb[d] != nrows*nb_row) {
+            return nullptr;
+        }
+        if (nrows == 1) {
+            nb_row = src1->nb[d];
+        }
+        nrows *= src1->ne[d];
+    }
+    const size_t bytes = nrows*ne10_padded*sizeof(block_q8_1)/QK8_1;
+    if (bytes > ggml_backend_cuda_context::q8_slot_bytes) {
+        return nullptr;
+    }
+
+    for (int i = 0; i < ggml_backend_cuda_context::q8_n_slots; ++i) {
+        const ggml_backend_cuda_context::q8_entry & e = ctx.q8_slots[i];
+        if (e.valid && e.src == data && e.ne10 == src1->ne[0] && e.nrows == nrows && (nrows == 1 || e.nb_row == nb_row)) {
+            hit = true;
+            return ctx.q8_buf + i*ggml_backend_cuda_context::q8_slot_bytes;
+        }
+    }
+
+    if (ctx.q8_buf == nullptr) {
+        // fixed for the life of the context: CUDA graphs keep the address
+        CUDA_CHECK(cudaMalloc(&ctx.q8_buf, ggml_backend_cuda_context::q8_n_slots*ggml_backend_cuda_context::q8_slot_bytes));
+    }
+    const int i = ctx.q8_next;
+    ctx.q8_next = (ctx.q8_next + 1) % ggml_backend_cuda_context::q8_n_slots;
+    ggml_backend_cuda_context::q8_entry & e = ctx.q8_slots[i];
+    e.src    = data;
+    e.span   = (nrows - 1)*nb_row + src1->ne[0]*sizeof(float);
+    e.ne10   = src1->ne[0];
+    e.nrows  = nrows;
+    e.nb_row = nb_row;
+    e.gen    = ctx.q8_gen;
+    e.valid  = true;
+    return ctx.q8_buf + i*ggml_backend_cuda_context::q8_slot_bytes;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * src1_scale) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1599,12 +1660,28 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+    char * src1_q8_1 = nullptr;
+    if (src1_scale != nullptr) {
+        // src1 is the elided SILU of SCALE(src1_scale->src[0]): quantize silu(scale*x + bias) from the SCALE input
+        const ggml_tensor * x = src1_scale->src[0];
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_are_same_shape(x, src1) && x->nb[0] == sizeof(float));
+        src1_q8_1 = src1_q8_1_pool.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        quantize_row_q8_1_scale_silu_cuda((const float *) x->data, src1_q8_1, ne10,
+            x->nb[1] / ts_src1, x->nb[2] / ts_src1, x->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13,
+            ggml_get_op_params_f32(src1_scale, 0), ggml_get_op_params_f32(src1_scale, 1), stream);
+    } else {
+        bool hit = false;
+        src1_q8_1 = ggml_cuda_q8_cache_get(ctx, src1, ne10_padded, hit);
+        if (src1_q8_1 == nullptr) {
+            src1_q8_1 = src1_q8_1_pool.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        }
+        if (!hit) {
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1630,7 +1707,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

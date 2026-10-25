@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -50,11 +51,13 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+// scale_silu: quantize silu(scale*x + bias), the elided SCALE -> SILU in front of a mat-vec (GGML_CUDA_DECODE_FUSION silu)
+template <bool scale_silu>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2, const float scale, const float bias) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
@@ -81,7 +84,14 @@ static __global__ void quantize_q8_1(
     const int64_t iqs = i_cont % QK8_1; // quant index
 
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    if constexpr (scale_silu) {
+        if (i0 < ne00) {
+            // the expressions of scale_f32 and op_silu, so the values match the unfused ops
+            xi = scale * xi + bias;
+            xi = ggml_cuda_op_silu_single(xi);
+        }
+    }
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -567,8 +577,23 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, 1.0f, 0.0f);
     GGML_UNUSED(type_src0);
+}
+
+void quantize_row_q8_1_scale_silu_cuda(
+        const float * x, void * vy, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const float scale, const float bias,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK8_1 == 0);
+
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+
+    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, scale, bias);
 }
 
 void quantize_mmq_q8_1_cuda(
