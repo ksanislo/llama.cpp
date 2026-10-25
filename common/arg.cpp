@@ -4262,6 +4262,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-p-min-keep"},
+        {"--no-spec-draft-p-min-keep"},
+        string_format("draft-mtp: keep the draft token that falls below --spec-draft-p-min and stop after it, so every step drafts "
+                      "at least one token; when disabled the token is dropped and a step whose first token is below it drafts none "
+                      "(default: %s)",
+                      params.speculative.draft.p_min_keep ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.p_min_keep = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_KEEP"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
