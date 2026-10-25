@@ -1841,6 +1841,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    // nothing to copy, and a synchronous copy path would still wait for the input backend
+    if (ggml_nbytes(input) == 0) {
+        return;
+    }
+
     if (sched->n_copies > 1 && ggml_backend_sched_is_user_input(input)) {
         return; // already uploaded
     }
