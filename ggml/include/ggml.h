@@ -3056,6 +3056,20 @@ extern "C" {
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
 
+    // NUMA interleave of host memory: pages spread round-robin over all memory nodes (MPOL_INTERLEAVE)
+    // used for large host-resident weights (MoE experts) so CPU reads and host->device copies use every socket's memory
+    // switched on by GGML_NUMA_INTERLEAVE=1 or ggml_numa_set_interleave(true); Linux with >1 node only, a no-op elsewhere
+    GGML_API void   ggml_numa_set_interleave(bool enable);
+    GGML_API bool   ggml_numa_interleave_enabled(void);
+    // set the policy of an anonymous range (pages already touched are migrated)
+    GGML_API bool   ggml_numa_interleave(void * addr, size_t size);
+    // page-aligned anonymous memory, interleaved before any page is touched; NULL if not enabled or on failure
+    GGML_API void * ggml_numa_interleave_alloc(size_t size);
+    GGML_API void   ggml_numa_interleave_free(void * ptr, size_t size);
+    // fault in a range of a read-only file mapping with its page-cache pages interleaved (the page cache ignores
+    // the mapping's policy); cached pages that sit mostly on one node are dropped and read again
+    GGML_API bool   ggml_numa_interleave_mapped(void * addr, size_t size, int fd, size_t offset);
+
 #ifdef  __cplusplus
 }
 #endif

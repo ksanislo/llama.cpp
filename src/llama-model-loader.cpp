@@ -1128,6 +1128,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_expert = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1206,6 +1207,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else {
             op = info.op;
         }
+        is_expert = op == GGML_OP_MUL_MAT_ID || op == GGML_OP_ADD_ID;
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -1390,6 +1392,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
 
+    if (is_expert) {
+        expert_tensors.insert(tensor);
+    }
+
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
     } else {
@@ -1438,8 +1444,36 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // expert weights read from the mapping by the CPU backend
+            llama_mmap::ranges interleave_ranges;
+            if (use_mmap && !no_alloc && ggml_numa_interleave_enabled()) {
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                for (const auto & [key, ctx] : ctx_map) {
+                    if (key.lazy || !cpu_dev || key.buft != ggml_backend_dev_buffer_type(cpu_dev)) {
+                        continue;
+                    }
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                        const auto * w = get_weight(ggml_get_name(t));
+                        if (w && w->idx == idx && expert_tensors.count(t)) {
+                            interleave_ranges.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+                        }
+                    }
+                }
+                std::sort(interleave_ranges.begin(), interleave_ranges.end());
+                // merge ranges that touch or are separated by less than 1 MiB
+                llama_mmap::ranges merged;
+                for (const auto & r : interleave_ranges) {
+                    if (!merged.empty() && r.first <= merged.back().second + 1024*1024) {
+                        merged.back().second = std::max(merged.back().second, r.second);
+                    } else {
+                        merged.push_back(r);
+                    }
+                }
+                interleave_ranges = std::move(merged);
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), interleave_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

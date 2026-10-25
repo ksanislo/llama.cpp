@@ -1977,6 +1977,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
+            // interleave CPU buffers of expert weights before they are loaded
+            // pinned buffers cannot move: the backend interleaves those when it allocates them
+            if (!ml.no_alloc && ggml_backend_buffer_is_host(buf) && ggml_numa_interleave_enabled()) {
+                std::vector<ggml_backend_buffer_t> numa_bufs;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->buffer != nullptr && ml.expert_tensors.count(t) && std::find(numa_bufs.begin(), numa_bufs.end(), t->buffer) == numa_bufs.end()) {
+                        numa_bufs.push_back(t->buffer);
+                    }
+                }
+                for (ggml_backend_buffer_t numa_buf : numa_bufs) {
+                    ggml_backend_dev_t buf_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(numa_buf));
+                    if (buf_dev == nullptr || ggml_backend_dev_type(buf_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_numa_interleave(ggml_backend_buffer_get_base(numa_buf), ggml_backend_buffer_get_size(numa_buf));
+                    }
+                }
+            }
             // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
             if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
                 std::vector<ggml_backend_buffer_t> lock_bufs;

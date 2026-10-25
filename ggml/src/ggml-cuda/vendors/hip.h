@@ -79,6 +79,7 @@
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
+#define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel

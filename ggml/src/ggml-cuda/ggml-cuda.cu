@@ -1335,6 +1335,32 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
+static void ggml_backend_cuda_host_buffer_free_buffer_interleaved(ggml_backend_buffer_t buffer) {
+    CUDA_CHECK(cudaHostUnregister(buffer->context));
+    ggml_numa_interleave_free(buffer->context, buffer->size);
+}
+
+// NUMA interleave: mmap + mbind first, then pin; cudaMallocHost would fault the pages in before mbind could place them
+static void * ggml_cuda_host_malloc_interleaved(size_t size) {
+    // small host buffers (staging, outputs) are not worth it
+    if (size < 64ull*1024*1024) {
+        return nullptr;
+    }
+    void * ptr = ggml_numa_interleave_alloc(size);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of interleaved memory: %s\n", __func__,
+                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        ggml_numa_interleave_free(ptr, size);
+        return nullptr;
+    }
+    return ptr;
+}
+
 static void * ggml_cuda_host_malloc(size_t size) {
     if (ggml_cuda_pinned_memory_disabled()) {
         return nullptr;
@@ -1354,6 +1380,16 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    if (!ggml_cuda_pinned_memory_disabled() && ggml_numa_interleave_enabled()) {
+        void * ptr = ggml_cuda_host_malloc_interleaved(size);
+        if (ptr != nullptr) {
+            ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+            buffer->buft = buft;
+            buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer_interleaved;
+            return buffer;
+        }
+    }
+
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
