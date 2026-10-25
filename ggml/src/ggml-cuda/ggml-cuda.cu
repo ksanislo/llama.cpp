@@ -3070,6 +3070,9 @@ static int ggml_cuda_graph_chunk_size() {
     return chunk_size;
 }
 
+// graph_capture_all: executables per graph key, used in turn
+#define GGML_CUDA_GRAPH_CAPTURE_SLOTS 4
+
 // end the capture of chunk `idx`, update or create its executable and launch it
 static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
     cudaGraph_t cuda_graph = nullptr;
@@ -5105,7 +5108,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (cuda_ctx->graph_capture_all) {
+        // a round robin of executables per key: the one updated was launched GGML_CUDA_GRAPH_CAPTURE_SLOTS calls ago
+        // (the scheduler's copies differ per call anyway, so every call is captured)
+        if (graph->is_enabled() && ggml_cuda_graph_check_compability(cgraph)) {
+            const uint32_t slot = graph->capture_all_next++ % GGML_CUDA_GRAPH_CAPTURE_SLOTS;
+            graph_key = (const char *) graph_key + slot; // not a tensor address: no clash with the normal keys
+            graph = cuda_ctx->cuda_graph(graph_key);
+            // the normal path must not trust properties of a graph captured here
+            graph->node_props.clear();
+            graph->uid             = 0;
+            graph->warmup_complete = false;
+            use_cuda_graph             = true;
+            cuda_graph_update_required = true;
+        }
+    } else if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -6553,6 +6570,13 @@ static __global__ void k_gather_blocks(const ggml_cuda_gather_srcs srcs, char * 
     }
 }
 
+// with on, every compatible graph computed on this backend is captured and launched as CUDA graphs (see graph_capture_all)
+static void ggml_backend_cuda_set_graph_capture_all(ggml_backend_t backend, bool on) {
+    if (ggml_backend_is_cuda(backend)) {
+        ((ggml_backend_cuda_context *) backend->context)->graph_capture_all = on;
+    }
+}
+
 static void ggml_backend_cuda_gather_blocks_async(ggml_backend_t backend, void * dst, size_t dst_stride, const void * const * srcs, int n, size_t size) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6614,6 +6638,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_gather_blocks_async") == 0) {
         return (void *)ggml_backend_cuda_gather_blocks_async;
+    }
+    if (strcmp(name, "ggml_backend_set_graph_capture_all") == 0) {
+        return (void *)ggml_backend_cuda_set_graph_capture_all;
     }
 #if defined(GGML_CUDA_VMM_BUFFER)
     if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {

@@ -638,9 +638,12 @@ llama_context::llama_context(
             if (const char * env = getenv("LLAMA_PROMPT_PIPE_STABLE")) {
                 prompt_pipe_stable = atoi(env) != 0;
             }
+            if (const char * env = getenv("LLAMA_PROMPT_PIPE_GRAPHS")) {
+                prompt_pipe_graphs = atoi(env) != 0;
+            }
             if (cparams.pipeline_parallel && n_pipe_devices > 1) {
-                LLAMA_LOG_INFO("%s: prompt pipe: batches are read in chunks planned for %d stages (LLAMA_PROMPT_PIPE=%g, stable shapes %d)\n",
-                        __func__, n_pipe_devices, prompt_pipe, prompt_pipe_stable);
+                LLAMA_LOG_INFO("%s: prompt pipe: batches are read in chunks planned for %d stages (LLAMA_PROMPT_PIPE=%g, stable shapes %d, graphs %d)\n",
+                        __func__, n_pipe_devices, prompt_pipe, prompt_pipe_stable, prompt_pipe_graphs);
             } else {
                 LLAMA_LOG_INFO("%s: prompt pipe not used: it needs pipeline parallelism over several devices\n", __func__);
             }
@@ -2179,6 +2182,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     std::vector<int64_t> t_pipe_enqueue_us;
     const int32_t n_reallocs_pipe = n_reallocs_all;
+
+    // LLAMA_PROMPT_PIPE_GRAPHS: the device backends capture the chunks' splits as CUDA graphs for this decode
+    using set_capture_all_t = void (*)(ggml_backend_t, bool);
+    struct graphs_reset {
+        std::vector<std::pair<set_capture_all_t, ggml_backend_t>> on;
+        ~graphs_reset() { for (auto & [fn, backend] : on) { fn(backend, false); } }
+    } graphs_reset_on_exit;
+    if (prompt_pipe_graphs && prompt_pipe_chunk > 0 && n_tokens_all > prompt_pipe_chunk) {
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg ? (set_capture_all_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_graph_capture_all") : nullptr;
+            if (fn) {
+                fn(backend.get(), true);
+                graphs_reset_on_exit.on.emplace_back(fn, backend.get());
+            }
+        }
+    }
 
     // the chunks of a piped batch keep the shape of its last one (see set_batch_shapes_stable)
     // (LLAMA_BATCH_SHAPES_STABLE=1 does it for every batch, a check that the shapes do not change the results)
