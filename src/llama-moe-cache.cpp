@@ -467,6 +467,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * dh_map = nullptr;      // I32 [1, n_expert] on the device: the slot of a cached expert, -1 - e for the others
         ggml_tensor * dh_log = nullptr;      // I32 [dh_log_cap] on the device: the experts selected by the last graph, -1 after them
         std::vector<ggml_tensor *> dh_alias; // the host experts as tensors of the device (mapped pinned memory), in the order of the banks
+        std::vector<const uint8_t *> ring_host; // LLAMA_MOE_RING: device address of the host experts (mapped pinned memory), per bank
     };
 
     struct binding {
@@ -513,8 +514,11 @@ struct llama_moe_cache::impl {
     int32_t n_stage  = 0; // staging slots per device, 0 if the batches that the cache does not serve use op offload
     int32_t ring       = 0; // LLAMA_MOE_RING=K: the K staging slots are filled as a ring, all uncached experts of a device's layers
     int32_t ring_merge = 0; // LLAMA_MOE_RING_MERGE=g: up to g cached experts between two uploaded runs are uploaded with them
-    typedef void (*copy_blocks_t)(ggml_backend_t, void * const *, const void * const *, int, size_t);
+    int32_t ring_zc     = 1;  // LLAMA_MOE_RING_ZC=0: uncached experts by host copies on the copy engine (one per run) instead of the kernel
+    int32_t ring_blocks = 16; // LLAMA_MOE_RING_BLOCKS: CUDA blocks of the copy kernel
+    typedef void (*copy_blocks_t)(ggml_backend_t, void * const *, const void * const *, int, size_t, int);
     copy_blocks_t copy_blocks = nullptr;
+    std::unordered_map<const ggml_tensor *, int32_t> stage_view_layer; // staged experts (the matmul's src[0]) -> layer
     int64_t full_ids = 8; // ids per expert from which a batch stages all the experts of a layer without reading the ids back
     bool    zero_rows = true; // LLAMA_MOE_CACHE_ZERO_ROWS=0: a lookup of 0 tokens bypasses the cache (graphs reallocate, see use_cache)
     bool    borrow   = false; // the staging slots take cache slots during large batches instead of their own memory
@@ -679,6 +683,12 @@ struct llama_moe_cache::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_RING_MERGE")) {
             ring_merge = std::max(0, atoi(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_RING_ZC")) {
+            ring_zc = atoi(env);
+        }
+        if (const char * env = getenv("LLAMA_MOE_RING_BLOCKS")) {
+            ring_blocks = std::max(1, atoi(env));
         }
         if (const char * env = getenv("LLAMA_MOE_PREFETCH")) {
             n_pref = std::clamp(atoi(env), 0, (int) model.hparams.n_expert);
@@ -943,7 +953,8 @@ struct llama_moe_cache::impl {
             }
             if (d.mtx) {
                 LLAMA_LOG_INFO("%s: %10s MoE ring: the %d staging slots stream every uncached expert of the device's layers ahead of "
-                    "large batches (LLAMA_MOE_RING=%d, merge %d)\n", __func__, ggml_backend_buft_name(d.buft), n_stage, ring, ring_merge);
+                    "large batches (LLAMA_MOE_RING=%d, %s)\n", __func__, ggml_backend_buft_name(d.buft), n_stage, ring,
+                    copy_blocks && ring_zc ? "one copy kernel per 128 experts, uncached ones read from mapped host memory" : "host copies per run");
             }
             if (d.lender >= 0) {
                 const group & g = groups[d.lender];
@@ -1331,6 +1342,7 @@ struct llama_moe_cache::impl {
                         ggml_backend_view_init(v);
                     }
                     stage_bindings[l.experts[ip]] = v;
+                    stage_view_layer[v] = il;
                 }
             }
 
@@ -1409,6 +1421,38 @@ struct llama_moe_cache::impl {
         copy_blocks = reg ? (copy_blocks_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_blocks_async") : nullptr;
         if (copy_blocks == nullptr) {
             LLAMA_LOG_WARN("%s: %s has no block copy kernel, the MoE ring copies the cached experts one run at a time\n", __func__, ggml_backend_name(d.backend));
+            return;
+        }
+
+        // the kernel reads the uncached experts in place from pinned host memory (one launch per 128 experts, not one copy per run)
+        typedef ggml_backend_buffer_t (*from_mapped_t)(ggml_backend_dev_t, void *, size_t);
+        auto from_mapped = ring_zc ? (from_mapped_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_from_mapped_host_ptr") : nullptr;
+        std::unordered_map<ggml_backend_buffer_t, const uint8_t *> base_of_buf;
+        size_t n_mapped = 0;
+        for (int32_t il : d.layers) {
+            layer & l = layers[il];
+            l.ring_host.assign(l.experts.size(), nullptr);
+            for (size_t ip = 0; ip < l.experts.size() && from_mapped; ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                ggml_backend_buffer_t hb = w->buffer;
+                auto it = base_of_buf.find(hb);
+                if (it == base_of_buf.end()) {
+                    const uint8_t * base = nullptr;
+                    if (ggml_backend_buffer_t mb = from_mapped(dev, ggml_backend_buffer_get_base(hb), ggml_backend_buffer_get_size(hb))) {
+                        base = (const uint8_t *) ggml_backend_buffer_get_base(mb);
+                        ggml_backend_buffer_free(mb); // the mapping is the pinned allocation's, the buffer only holds its address
+                    }
+                    it = base_of_buf.emplace(hb, base).first;
+                }
+                if (it->second != nullptr && ggml_is_contiguous(w)) {
+                    l.ring_host[ip] = it->second + ((const uint8_t *) w->data - (const uint8_t *) ggml_backend_buffer_get_base(hb));
+                    n_mapped++;
+                }
+            }
+        }
+        if (ring_zc && n_mapped == 0) {
+            LLAMA_LOG_WARN("%s: %s cannot read the host experts in place (use --load-mode none), the MoE ring uploads them one run at a time\n",
+                __func__, ggml_backend_name(d.backend));
         }
     }
 
@@ -2158,26 +2202,29 @@ struct llama_moe_cache::impl {
             return;
         }
         std::vector<std::vector<llama_moe_ring_sched::entry>> plans(devices.size());
+        // the matmuls that read a staging slot: the scheduler has already replaced the staging maps in the graph by their per-split
+        // input copies (ggml_backend_sched_alloc_graph runs before the compute), the device weights they read stay as they are
         const int n_nodes = ggml_graph_n_nodes(gf);
         for (int i = 0; i < n_nodes; ++i) {
             const ggml_tensor * node = ggml_graph_node(gf, i);
-            if (node->op != GGML_OP_GET_ROWS) {
+            if (node->op != GGML_OP_MUL_MAT_ID) {
                 continue;
             }
-            const auto it = stage_layer_of.find(node->src[0]);
-            if (it == stage_layer_of.end()) {
+            const auto it = stage_view_layer.find(node->src[0]);
+            if (it == stage_view_layer.end()) {
                 continue;
             }
             const layer & l = layers[it->second];
-            const int64_t n_ids = ggml_nelements(node->src[1]);
-            if (n_ids == 0) {
-                continue;
+            const int64_t n_ids = ggml_nelements(node->src[2]);
+            auto & plan = plans[groups[l.ig].id];
+            if (n_ids == 0 || (!plan.empty() && plan.back().il == it->second)) {
+                continue; // gate, up and down of one layer
             }
             llama_moe_ring_sched::entry e;
             e.il   = it->second;
             e.slot = l.rank % n_stage;
             e.full = n_ids >= full_ids*l.stage_map->ne[1];
-            plans[groups[l.ig].id].push_back(e);
+            plan.push_back(e);
         }
         for (size_t id = 0; id < devices.size(); ++id) {
             if (devices[id].mtx) {
@@ -2259,9 +2306,46 @@ struct llama_moe_cache::impl {
         const int32_t n_expert = (int32_t) l.stage_map->ne[1];
 
         llama_moe_ring_copies & cp = d.r_cp;
-        cp.plan(slots, g.n_slots, n_expert, used, ring_merge);
+        const bool zc = copy_blocks != nullptr && !l.ring_host.empty() &&
+            std::all_of(l.ring_host.begin(), l.ring_host.end(), [](const uint8_t * p) { return p != nullptr; });
+        cp.plan(slots, g.n_slots, n_expert, used, zc ? 0 : ring_merge);
 
-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+        for (size_t ip = 0; ip < l.experts.size() && zc; ++ip) {
+            const ggml_tensor * w    = l.experts[ip];
+            ggml_tensor       * st   = g.stage[is][ip];
+            const ggml_tensor * bank = g.banks[ip];
+            const size_t expert_size = w->nb[2];
+            GGML_ASSERT(st->nb[2] == expert_size && bank->nb[2] == expert_size);
+
+            // one kernel for the layer's tensor: cached experts from the bank, the others from the mapped host experts
+            d.r_dst.clear();
+            d.r_src.clear();
+            for (const auto & r : cp.upload) {
+                for (int32_t e = r.first; e < r.first + r.n; ++e) {
+                    d.r_dst.push_back((uint8_t *) st->data + (size_t) e*expert_size);
+                    d.r_src.push_back(l.ring_host[ip] + (size_t) e*expert_size);
+                }
+                d.rstats.bytes_host += r.n*expert_size;
+            }
+            for (int32_t e : cp.cached) {
+                d.r_dst.push_back((uint8_t *) st->data + (size_t) e*expert_size);
+                d.r_src.push_back((const uint8_t *) bank->data + (size_t) slots[e]*expert_size);
+            }
+            d.rstats.bytes_cache += cp.cached.size()*expert_size;
+            copy_blocks(copy, d.r_dst.data(), d.r_src.data(), (int) d.r_dst.size(), expert_size, ring_blocks);
+            d.rstats.launches += (d.r_dst.size() + 127)/128;
+
+            const size_t padding = std::min(expert_size, zeros.size());
+            for (int32_t e : cp.pad_next) {
+                ggml_backend_tensor_set_async(copy, st, (const uint8_t *) w->data + e*expert_size, e*expert_size, padding);
+            }
+            if (cp.pad_end) {
+                ggml_backend_tensor_set_async(copy, st, d.pinned_zeros, (size_t) n_expert*expert_size, padding);
+            }
+            d.rstats.copies += cp.pad_next.size() + (cp.pad_end ? 1 : 0);
+        }
+
+        for (size_t ip = 0; ip < l.experts.size() && !zc; ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * st   = g.stage[is][ip];
             const ggml_tensor * bank = g.banks[ip];
@@ -2283,7 +2367,7 @@ struct llama_moe_cache::impl {
                     d.r_src.push_back((const uint8_t *) bank->data + (size_t) slots[e]*expert_size);
                 }
                 if (copy_blocks != nullptr) {
-                    copy_blocks(copy, d.r_dst.data(), d.r_src.data(), (int) d.r_dst.size(), expert_size);
+                    copy_blocks(copy, d.r_dst.data(), d.r_src.data(), (int) d.r_dst.size(), expert_size, ring_blocks);
                     d.rstats.launches += (d.r_dst.size() + 127)/128;
                 } else {
                     for (size_t k = 0; k < d.r_dst.size(); ++k) {
