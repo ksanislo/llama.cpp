@@ -1799,7 +1799,9 @@ struct llama_moe_cache::impl {
             }
             return res;
         };
-        auto min_first = [](const group & g) { return (int32_t) g.ref[0]->ne[2] + g.n_slots/8; };
+        // LLAMA_MOE_RING's borrowed staging slots (n_stage layer-sized slots) sit below the lent tail as well (plan_borrow)
+        const int32_t ring_room = ring > 0 && borrow ? n_stage : 0;
+        auto min_first = [ring_room](const group & g) { return (int32_t) g.ref[0]->ne[2]*(1 + ring_room) + ring_room + 1 + g.n_slots/8; };
         std::vector<double> want(groups.size(), 0.0);
         std::vector<double> room(groups.size(), 0.0);
         double short_sum = 0.0;
@@ -2606,8 +2608,9 @@ struct llama_moe_cache::impl {
     }
 
     // place the staging slots of device id in the bank tails of its largest group, slot is of tensor position ip at start[ip] + is*sec[ip]
+    // the largest group first; with LLAMA_MOE_DECODE_MEM a group whose room below its lent tail is too small passes to the next
     bool plan_borrow(device & d, int32_t id, const std::vector<size_t> & sec, std::vector<size_t> & start) {
-        int32_t best = -1;
+        std::vector<int32_t> cand;
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             const group & g = groups[ig];
             if (g.id != id || g.n_slots == 0) {
@@ -2616,37 +2619,35 @@ struct llama_moe_cache::impl {
             if (g.ref.size() != sec.size()) {
                 return false;
             }
-            if (best < 0 || g.n_slots > groups[best].n_slots) {
-                best = (int32_t) ig;
-            }
+            cand.push_back((int32_t) ig);
         }
-        if (best < 0) {
-            return false;
-        }
-        const group & g = groups[best];
+        std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return groups[a].n_slots > groups[b].n_slots; });
         const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
-        int32_t k = 1; // bank slots under the staging slots, including the extra one at the end
-        for (size_t ip = 0; ip < sec.size(); ++ip) {
-            k = std::max(k, (int32_t) ((n_stage*sec[ip] + g.banks[ip]->nb[2] - 1)/g.banks[ip]->nb[2]));
-        }
-        // with misses on the CPU, the n_zero slots after the cached ones must stay zero, so the staging slots end before them
-        // LLAMA_MOE_DECODE_MEM: the tail [lend_first, n_slots) backs the compute buffer during large batches, the slots end below it
-        const bool lends = g.lend_first < g.n_slots;
-        const int32_t end = lends ? g.lend_first : n_zero > 0 ? g.n_slots : g.n_slots + 1;
-        const int32_t min_first = lends ? (int32_t) g.ref[0]->ne[2] + g.n_slots/8 : 0; // as dm_alloc: a layer's experts, the transient slots
-        for (; k <= g.n_slots && end - k >= min_first; ++k) {
-            const int32_t first = end - k;
-            bool fits = true;
-            start.assign(sec.size(), 0);
+        for (int32_t best : cand) {
+            const group & g = groups[best];
+            int32_t k = 1; // bank slots under the staging slots, including the extra one at the end
             for (size_t ip = 0; ip < sec.size(); ++ip) {
-                start[ip] = GGML_PAD((size_t) first*g.banks[ip]->nb[2], alignment);
-                fits = fits && start[ip] + n_stage*sec[ip] <= (size_t) end*g.banks[ip]->nb[2];
+                k = std::max(k, (int32_t) ((n_stage*sec[ip] + g.banks[ip]->nb[2] - 1)/g.banks[ip]->nb[2]));
             }
-            if (fits) {
-                d.lender       = best;
-                d.borrow_first = first;
-                d.borrow_end   = std::min(end, g.n_slots);
-                return true;
+            // with misses on the CPU, the n_zero slots after the cached ones must stay zero, so the staging slots end before them
+            // LLAMA_MOE_DECODE_MEM: the tail [lend_first, n_slots) backs the compute buffer during large batches, the slots end below it
+            const bool lends = g.lend_first < g.n_slots;
+            const int32_t end = lends ? g.lend_first : n_zero > 0 ? g.n_slots : g.n_slots + 1;
+            const int32_t min_first = lends ? (int32_t) g.ref[0]->ne[2] + g.n_slots/8 : 0; // as dm_alloc: a layer's experts, the transient slots
+            for (; k <= g.n_slots && end - k >= min_first; ++k) {
+                const int32_t first = end - k;
+                bool fits = true;
+                start.assign(sec.size(), 0);
+                for (size_t ip = 0; ip < sec.size(); ++ip) {
+                    start[ip] = GGML_PAD((size_t) first*g.banks[ip]->nb[2], alignment);
+                    fits = fits && start[ip] + n_stage*sec[ip] <= (size_t) end*g.banks[ip]->nb[2];
+                }
+                if (fits) {
+                    d.lender       = best;
+                    d.borrow_first = first;
+                    d.borrow_end   = std::min(end, g.n_slots);
+                    return true;
+                }
             }
         }
         return false;
