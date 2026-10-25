@@ -404,6 +404,7 @@ struct llama_moe_cache::impl {
 
     int32_t n_stage  = 0; // staging slots per device, 0 if the batches that the cache does not serve use op offload
     int64_t full_ids = 8; // ids per expert from which a batch stages all the experts of a layer without reading the ids back
+    bool    zero_rows = true; // LLAMA_MOE_CACHE_ZERO_ROWS=0: a lookup of 0 tokens bypasses the cache (graphs reallocate, see use_cache)
     bool    borrow   = false; // the staging slots take cache slots during large batches instead of their own memory
     stage_stats stats_stage;
     std::unordered_map<const ggml_tensor *, int32_t> stage_layer_of;              // staging map -> layer
@@ -477,6 +478,9 @@ struct llama_moe_cache::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_ASYNC_FULL")) {
             full_ids = std::max<int64_t>(1, atoll(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_ZERO_ROWS")) {
+            zero_rows = atoi(env) != 0;
         }
         if (const char * env = getenv("LLAMA_MOE_ASYNC_BORROW")) {
             borrow = atoi(env) != 0;
@@ -1075,9 +1079,11 @@ struct llama_moe_cache::impl {
     }
 
     // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
+    // 0 tokens (the last layer of a prompt ubatch without outputs, cropped to the output rows) takes the cache path too: the
+    // graph then has the topology of one with an output, which the worst case is reserved with, so it does not reallocate
     bool use_cache(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
         const layer & l = layers[il];
-        return n_tokens > 0 && n_tokens <= max_batch && std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) <= groups[l.ig].n_slots;
+        return n_tokens >= (zero_rows ? 0 : 1) && n_tokens <= max_batch && std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) <= groups[l.ig].n_slots;
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -1440,6 +1446,11 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(backend == d.backend);
 
         const ggml_tensor * lookup = find_lookup(graph, dst);
+        if (ggml_nelements(lookup) == 0) {
+            // no experts selected: nothing to read back or upload, and no synchronization of the graphs in flight
+            stash.clear();
+            return true;
+        }
         const cpu_part * part = read_cpu_inputs(backend, graph, lookup, l);
         const bool has_cpu = part != nullptr;
         read_ids(backend, graph, lookup, il);
