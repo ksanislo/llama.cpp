@@ -1131,7 +1131,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     bool is_expert = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        // host experts of a layer go with its device's node
+        int node = -1;
+        if (is_expert && !is_lazy && tn.bid >= 0 && (size_t) tn.bid < layer_numa_node.size() &&
+                (ggml_backend_buft_is_host(buft) || (ggml_backend_buft_get_device(buft) &&
+                 ggml_backend_dev_type(ggml_backend_buft_get_device(buft)) == GGML_BACKEND_DEVICE_TYPE_CPU))) {
+            node = layer_numa_node[tn.bid];
+        }
+        const ctx_key key { buft, is_lazy, node };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {

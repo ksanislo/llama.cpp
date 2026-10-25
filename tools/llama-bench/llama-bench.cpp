@@ -430,7 +430,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("options:\n");
     printf("  -h, --help\n");
     printf("  --version                                   show version and build info\n");
-    printf("  --numa <distribute|isolate|numactl|interleave> numa mode (default: disabled)\n");
+    printf("  --numa <distribute|isolate|numactl|interleave|device-local> numa mode (default: disabled)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
@@ -860,6 +860,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     params.numa = GGML_NUMA_STRATEGY_NUMACTL;
                 } else if (value == "interleave") {
                     params.numa = GGML_NUMA_STRATEGY_INTERLEAVE;
+                } else if (value == "device-local") {
+                    params.numa = GGML_NUMA_STRATEGY_DEVICE_LOCAL;
                 } else {
                     invalid_param = true;
                     break;

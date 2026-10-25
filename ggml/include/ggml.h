@@ -3128,6 +3128,27 @@ extern "C" {
     // MemFree of each node (bytes, -1 if unknown), returns the number of nodes read
     GGML_API int    ggml_numa_free_bytes(int64_t * free_per_node, int max_nodes);
 
+    // NUMA device-local placement: the host memory a device reads (the host experts of the layers it computes) is put on the
+    // device's node, so its DMA does not cross the socket link. GGML_NUMA_DEVICE_LOCAL=1 (auto): bind when the node's free memory
+    // + page cache hold the allocation with room to spare, else preferred; =bind / =preferred force one
+    // switched on by GGML_NUMA_DEVICE_LOCAL or ggml_numa_set_device_local(true); turns interleave off; Linux, >1 node
+    GGML_API void   ggml_numa_set_device_local(bool enable);
+    GGML_API bool   ggml_numa_device_local_enabled(void);
+    // node of a PCI device ("0000:84:00.0"), -1 if unknown
+    GGML_API int    ggml_numa_node_of_pci(const char * bus_id);
+    // place the pages the calling thread allocates from here on (about size bytes) on a node, until _end; false if not
+    // enabled or already begun
+    GGML_API bool   ggml_numa_thread_node_begin(int node, size_t size);
+    GGML_API void   ggml_numa_thread_node_end(void);
+    // node of the calling thread's ggml_numa_thread_node_begin, -1 if none
+    GGML_API int    ggml_numa_thread_node(void);
+    // a bound thread policy becomes preferred (after an allocation failed under the bind); false if it was not bound
+    GGML_API bool   ggml_numa_thread_node_relax(void);
+    // set the policy of an anonymous range to a node (pages already touched are migrated)
+    GGML_API bool   ggml_numa_bind_node(void * addr, size_t size, int node);
+    // the CPUs of a node (up to max_cpus), returns their number
+    GGML_API int    ggml_numa_node_cpus(int node, int * cpus, int max_cpus);
+
 #ifdef  __cplusplus
 }
 #endif

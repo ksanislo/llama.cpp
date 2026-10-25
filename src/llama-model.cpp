@@ -33,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1704,6 +1705,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
 
+    // NUMA device-local: the host experts of a layer go on the node of the device that computes it
+    ml.layer_numa_node.assign(n_layer_all, -1);
+    if (ggml_numa_device_local_enabled()) {
+        std::string nodes;
+        for (int il = 0; il < n_layer_all; ++il) {
+            ggml_backend_dev_t dev = pimpl->dev_layer[il].dev;
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            ml.layer_numa_node[il] = ggml_numa_node_of_pci(props.device_id);
+            if (il == 0 || dev != pimpl->dev_layer[il - 1].dev) {
+                nodes += format("%s%s node %d", nodes.empty() ? "" : ", ", ggml_backend_dev_name(dev), ml.layer_numa_node[il]);
+            }
+        }
+        if (!nodes.empty()) {
+            LLAMA_LOG_INFO("%s: NUMA device-local placement of host experts: %s\n", __func__, nodes.c_str());
+        }
+    }
+
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
@@ -1946,6 +1968,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
+            if (ctx_key.node >= 0) {
+                static std::once_flag once;
+                std::call_once(once, [] {
+                    LLAMA_LOG_WARN("load_tensors: NUMA device-local does not place experts read from the file mapping, use --load-mode none\n");
+                });
+            }
 
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // map the mmap regions that contain the tensors of this context
@@ -1972,10 +2000,40 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                // NUMA device-local: pinned pages are placed when they are allocated, by the allocating thread's policy
+                size_t numa_size = 0;
+                if (ctx_key.node >= 0) {
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        numa_size += ggml_backend_buft_get_alloc_size(buft, t);
+                    }
+                }
+                const bool numa_node = ctx_key.node >= 0 && ggml_numa_thread_node_begin(ctx_key.node, numa_size);
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (numa_node) {
+                    ggml_numa_thread_node_end();
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            // device-local CPU buffers: pages that malloc already touched are moved too
+            if (!ml.no_alloc && ctx_key.node >= 0) {
+                std::vector<ggml_backend_buffer_t> numa_bufs;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->buffer != nullptr && std::find(numa_bufs.begin(), numa_bufs.end(), t->buffer) == numa_bufs.end()) {
+                        numa_bufs.push_back(t->buffer);
+                    }
+                }
+                size_t size = 0;
+                for (ggml_backend_buffer_t numa_buf : numa_bufs) {
+                    ggml_backend_dev_t buf_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(numa_buf));
+                    if (buf_dev == nullptr || ggml_backend_dev_type(buf_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_numa_bind_node(ggml_backend_buffer_get_base(numa_buf), ggml_backend_buffer_get_size(numa_buf), ctx_key.node);
+                    }
+                    size += ggml_backend_buffer_get_size(numa_buf);
+                }
+                LLAMA_LOG_INFO("%s: %s host experts for NUMA node %d: %.2f MiB in %zu buffer(s)\n", __func__,
+                    ggml_backend_buft_name(buft), ctx_key.node, size/1024.0/1024.0, numa_bufs.size());
             }
             // interleave CPU buffers of expert weights before they are loaded
             // pinned buffers cannot move: the backend interleaves those when it allocates them

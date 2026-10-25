@@ -1156,7 +1156,13 @@ struct llama_moe_cache::impl {
     int32_t lane_timeout_ms = 2000;
     std::vector<ggml_backend_buffer_ptr> lane_bufs;   // the channels of each device, pinned host memory
     std::vector<ggml_backend_buffer_ptr> lane_mapped; // the same mapped to the device
-    std::unique_ptr<llama_moe_lane> lane;             // after the channels: stopped before they are freed
+    // NUMA device-local: a lane per node, its threads on that node's CPUs, for the layers of that node's devices
+    std::vector<std::unique_ptr<llama_moe_lane>> lanes; // after the channels: stopped before they are freed
+    std::vector<int32_t> lane_of;                       // [layer] index in lanes, -1: none
+
+    llama_moe_lane * lane_for(int32_t il) const {
+        return il >= 0 && (size_t) il < lane_of.size() && lane_of[il] >= 0 ? lanes[lane_of[il]].get() : nullptr;
+    }
 
     // --moe-cache-profile / LLAMA_MOE_CACHE_PROFILE: each device's cache starts with the hottest experts of its layers; the
     // routings of small batches are counted and saved back (blended with the loaded profile) at exit and periodically
@@ -2384,8 +2390,19 @@ struct llama_moe_cache::impl {
         return moe_cache_plan_adaptive(g.slru, g.tr, ad, ad_budget, il, ids_p, n_ids, fills, n_hit, stats_ad, ad_scratch);
     }
 
-    // one channel per device-path layer, in a pinned host buffer per device mapped to the device
+    static int numa_node_of(ggml_backend_dev_t dev) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        return ggml_numa_node_of_pci(props.device_id);
+    }
+
+    // one channel per device-path layer, in a pinned host buffer per device mapped to the device (on its node if device-local)
     void init_cpu_lane() {
+        // LLAMA_MOE_CPU_LANE_NUMA=0: one lane for all devices even under NUMA device-local
+        const char * env_numa = getenv("LLAMA_MOE_CPU_LANE_NUMA");
+        const bool numa_local = ggml_numa_device_local_enabled();
+        const bool numa_lanes = numa_local && !(env_numa && atoi(env_numa) == 0);
+        std::vector<std::pair<int32_t, int>> row_node; // (layer, node of its device)
         int64_t n_embd = 0; // an upper bound of the rows of the experts' input and output
         for (const layer & l : layers) {
             for (const ggml_tensor * w : l.experts) {
@@ -2417,7 +2434,12 @@ struct llama_moe_cache::impl {
             typedef ggml_backend_buffer_t (*from_mapped_t)(ggml_backend_dev_t, void *, size_t);
             auto from_mapped = (from_mapped_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_buffer_from_mapped_host_ptr");
             const size_t size = chan_size*dd.rows.size();
+            const int node = numa_local ? numa_node_of(dev) : -1;
+            const bool numa_node = node >= 0 && ggml_numa_thread_node_begin(node, size);
             ggml_backend_buffer_t hb = host_buft && from_mapped ? ggml_backend_buft_alloc_buffer(host_buft, size) : nullptr;
+            if (numa_node) {
+                ggml_numa_thread_node_end();
+            }
             ggml_backend_buffer_t mb = hb ? from_mapped(dev, ggml_backend_buffer_get_base(hb), size) : nullptr;
             if (mb == nullptr) {
                 if (hb) {
@@ -2433,6 +2455,7 @@ struct llama_moe_cache::impl {
                 layer & l = layers[dd.rows[r]];
                 l.lane_host = (uint8_t *) ggml_backend_buffer_get_base(hb) + r*chan_size;
                 l.lane_dev  = (uint8_t *) ggml_backend_buffer_get_base(mb) + r*chan_size;
+                row_node.emplace_back(dd.rows[r], node);
                 n_chan++;
             }
         }
@@ -2443,20 +2466,52 @@ struct llama_moe_cache::impl {
 
         int n_threads = std::max(1, (int) std::thread::hardware_concurrency()/2 - 1);
         int poll = 50;
-        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_THREADS")) {
-            n_threads = std::max(1, atoi(env));
+        const char * env_threads = getenv("LLAMA_MOE_CPU_LANE_THREADS");
+        if (env_threads) {
+            n_threads = std::max(1, atoi(env_threads));
         }
         if (const char * env = getenv("LLAMA_MOE_CPU_LANE_POLL")) {
             poll = atoi(env);
         }
-        lane = std::make_unique<llama_moe_lane>(layers.size(), n_threads, poll);
-        LLAMA_LOG_INFO("%s: MoE CPU lane: %zu layers, %.0f%% of the misses computed by %d CPU threads beside the device, "
-            "channels %.2f MiB pinned (LLAMA_MOE_CPU_LANE=%.2f)\n", __func__, n_chan, 100.0*lane_frac, n_threads,
+        lane_of.assign(layers.size(), -1);
+        std::string desc;
+        // per node: the layers of its devices read their experts from that node, so its CPUs compute them
+        std::vector<int> nodes;
+        for (const auto & [il, node] : row_node) {
+            const int key = numa_lanes ? node : -1;
+            if (std::find(nodes.begin(), nodes.end(), key) == nodes.end()) {
+                nodes.push_back(key);
+            }
+        }
+        for (const int node : nodes) {
+            std::vector<int> cpus;
+            int nt = n_threads;
+            if (node >= 0) {
+                cpus.resize(4096);
+                cpus.resize(ggml_numa_node_cpus(node, cpus.data(), (int) cpus.size()));
+                if (!env_threads && !cpus.empty()) {
+                    nt = std::max(1, (int) cpus.size()/2 - 1); // a thread per core of the node, less one, as without NUMA
+                }
+            }
+            size_t n_rows = 0;
+            for (const auto & [il, row_n] : row_node) {
+                if ((numa_lanes ? row_n : -1) == node) {
+                    lane_of[il] = (int32_t) lanes.size();
+                    n_rows++;
+                }
+            }
+            lanes.push_back(std::make_unique<llama_moe_lane>(layers.size(), nt, poll, cpus));
+            desc += node >= 0 ? format("%snode %d: %zu layers, %d threads on %zu CPUs", desc.empty() ? "" : "; ", node, n_rows, nt, cpus.size())
+                              : format("%s%zu layers, %d threads", desc.empty() ? "" : "; ", n_rows, nt);
+        }
+        LLAMA_LOG_INFO("%s: MoE CPU lane: %zu layers, %.0f%% of the misses computed by CPU threads beside the device (%s), "
+            "channels %.2f MiB pinned (LLAMA_MOE_CPU_LANE=%.2f)\n", __func__, n_chan, 100.0*lane_frac, desc.c_str(),
             chan_size*n_chan/1024.0/1024.0, lane_frac);
     }
 
     void * cpu_lane(int32_t il, int64_t n_tokens, int64_t n_used, const ggml_tensor * up, const ggml_tensor * gate,
             const ggml_tensor * down, const ggml_tensor * gate_up, float clamp) {
+        llama_moe_lane * lane = lane_for(il);
         if (!lane || !device_hits(il, n_tokens, n_used)) {
             return nullptr;
         }
@@ -5110,11 +5165,12 @@ struct llama_moe_cache::impl {
                 "fills = %zu (%.2f MiB), %zu dropped\n", ds.graphs, ds.hits, ds.misses, ds.bytes_miss/1024.0/1024.0,
                 100.0*ds.hits/(ds.hits + ds.misses), ds.fills, ds.bytes_fill/1024.0/1024.0, ds.dropped);
         }
-        if (lane) {
-            const llama_moe_lane::stats ls = lane->get_stats();
+        for (size_t i = 0; i < lanes.size(); ++i) {
+            const llama_moe_lane::stats ls = lanes[i]->get_stats();
             if (ls.requests > 0 || ls.timeouts > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache: CPU lane: %" PRIu64 " requests, %" PRIu64 " experts (%.2f per request), %" PRIu64 " rows, "
-                    "%.3f ms per request, %" PRIu64 " timeouts\n", ls.requests, ls.experts, (double) ls.experts/std::max<uint64_t>(1, ls.requests),
+                const std::string which = lanes.size() > 1 ? format(" %zu", i) : std::string();
+                LLAMA_LOG_INFO("llama_moe_cache: CPU lane%s: %" PRIu64 " requests, %" PRIu64 " experts (%.2f per request), %" PRIu64 " rows, "
+                    "%.3f ms per request, %" PRIu64 " timeouts\n", which.c_str(), ls.requests, ls.experts, (double) ls.experts/std::max<uint64_t>(1, ls.requests),
                     ls.rows, ls.busy_ms/std::max<uint64_t>(1, ls.requests), ls.timeouts);
             }
         }

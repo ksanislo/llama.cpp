@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 // the host side of the MoE CPU lane (ggml_moe_doorbell / ggml_moe_join): one thread polls the channels of the layers and
 // computes the experts a device handed to the CPU with ggml-cpu's MUL_MAT_ID on a thread pool of its own, then writes their
@@ -25,8 +26,9 @@ struct llama_moe_lane_layer {
 
 class llama_moe_lane {
 public:
-    // n_slots channels, served by a pool of n_threads (the polling thread included), ggml threadpool polling level poll
-    llama_moe_lane(size_t n_slots, int n_threads, int poll);
+    // n_slots channels, served by a pool of n_threads (the polling thread included), ggml threadpool polling level poll;
+    // cpus not empty: every thread of the lane runs on these CPUs (one NUMA node's, for the devices of that node)
+    llama_moe_lane(size_t n_slots, int n_threads, int poll, const std::vector<int> & cpus = {});
     ~llama_moe_lane();
 
     // sets slot i, once (later calls are ignored); the thread polls its channel from then on
