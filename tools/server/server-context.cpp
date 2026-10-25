@@ -135,6 +135,17 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
+// tokens between the context checkpoint before the prompt tail and the one 4 tokens before the end
+// a checkpoint synchronizes the context: with pipeline parallelism the batch after it runs alone on the devices,
+// so the earlier one moves close to the end there; LLAMA_CKPT_PRE_END=N sets it (0 = only the one 4 tokens before the end)
+static int32_t server_ckpt_pre_end(int32_t n_ubatch, bool pipeline_parallel) {
+    static const char * env = getenv("LLAMA_CKPT_PRE_END");
+    if (env != nullptr) {
+        return std::max(0, atoi(env));
+    }
+    return pipeline_parallel ? std::min(n_ubatch, 512) : n_ubatch;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -3925,6 +3936,8 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        const int32_t n_ckpt_pre = server_ckpt_pre_end(n_ubatch, llama_pipeline_parallel(ctx_tgt));
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -4509,11 +4522,11 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
+                        //  - 4 + n_ckpt_pre (n_ubatch, 512 with pipeline parallelism, see server_ckpt_pre_end)
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + n_ckpt_pre, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -4534,7 +4547,8 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // the batch ends at the checkpoint before the tail or later
+                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + std::max(n_ckpt_pre, 5);
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
