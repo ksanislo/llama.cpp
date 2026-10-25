@@ -1893,19 +1893,21 @@ private:
     bool try_clear_idle_slots() {
         bool res = false;
 
-        if (!params_base.kv_unified) {
+        if (!params_base.kv_unified && !params_base.kv_elastic) {
             return res;
         }
 
-        for (auto & slot : slots) {
-            if (slot.is_processing()) {
-                continue;
-            }
+        // with an elastic KV cache, a cleared slot gives its device memory back
+        // the least recently used slot goes first, and it is kept in the prompt cache when there is one
+        for (auto * slot : get_free_slots(slots.size(), -1)) {
+            if (slot->prompt.n_tokens() > 0) {
+                SRV_WRN("purging slot %d with %zu tokens\n", slot->id, slot->prompt.tokens.size());
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                if (params_base.kv_elastic && prompt_cache && slot->prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
 
-                slot.prompt_clear();
+                slot->prompt_clear();
 
                 res = true;
 

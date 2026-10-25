@@ -1750,6 +1750,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_PREFIX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-elastic"},
+        {"--no-kv-elastic"},
+        string_format("reserve the KV cache address space only and back it with device memory as each sequence grows, so every slot can reach the full context; idle slots go to the prompt cache when memory runs short (CUDA only, needs flash attention for full effect) (default: %s)", params.kv_elastic ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_elastic = value;
+        }
+    ).set_env("LLAMA_ARG_KV_ELASTIC").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

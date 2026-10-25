@@ -276,16 +276,25 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    if (llama_kv_elastic_requested() && !other) {
+        elastic = std::make_unique<llama_kv_elastic>(n_stream, kv_size);
+    }
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
+        ggml_backend_buffer_t buf = nullptr;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            if (elastic) {
+                buf = elastic->alloc(ctx.get(), buft); // address space only
+            }
+            if (!buf) {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -295,6 +304,10 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (elastic && !hparams.no_alloc) {
+        elastic_init();
     }
 
     {
@@ -397,6 +410,10 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    if (elastic) {
+        elastic_trim();
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -468,6 +485,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 head = new_head;
             }
         }
+    }
+
+    if (elastic) {
+        elastic_trim();
     }
 
     return true;
@@ -591,6 +612,10 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+
+    if (elastic) {
+        elastic_trim();
+    }
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -713,13 +738,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
+        size_t size;
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            size = ggml_backend_buffer_get_size(buf.get());
         }
+
+        ret[buft] += elastic ? elastic->memory_size(buf.get(), buft, size, hparams.no_alloc) : size;
     }
 
     return ret;
@@ -796,6 +824,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             break;
         }
 
+        if (elastic && !elastic_reserve(sinfo_new)) {
+            success = false;
+            break;
+        }
+
         // remember the position that we found
         res.push_back(sinfo_new);
 
@@ -865,6 +898,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             LLAMA_LOG_DEBUG("%s: copying KV buffer: stream %d to stream %d\n", __func__, ssrc, sdst);
 
             assert(ssrc != sdst);
+
+            if (elastic && !elastic_copy_prepare(ssrc, sdst)) {
+                GGML_ABORT("%s: kv_elastic: out of device memory to copy stream %d to stream %d\n", __func__, ssrc, sdst);
+            }
 
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
@@ -1132,6 +1169,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+
+    // prepare() has backed the cells already, this catches callers that skip it
+    if (elastic && !elastic_reserve(sinfo)) {
+        GGML_ABORT("%s: kv_elastic: out of device memory\n", __func__);
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch
@@ -2571,6 +2613,7 @@ const slot_info_vec_t *   sinfos_in) {
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && (!elastic || elastic_reserve(sinfo));
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2843,6 +2886,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
             }
+        }
+
+        if (elastic && !elastic_reserve(sinfo)) {
+            LLAMA_LOG_ERROR("%s: kv_elastic: failed to back %d cells\n", __func__, cell_count);
+            return false;
         }
 
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
