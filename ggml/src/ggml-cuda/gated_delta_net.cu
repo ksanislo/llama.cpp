@@ -9,7 +9,30 @@ struct gdn_gates_raw {
     const float * dt;
     const float * a;
     bool          beta_raw;
+    // gdnl2: l2[0] (q) / l2[1] (k) non-null: the raw rows (strides l2_s*), normalized here as RMS_NORM(eps) -> SCALE(scale)
+    // would, i.e. rms_norm_f32's one-warp float4 path: the same per-lane sums and warp reduction
+    const float * l2[2];
+    int64_t       l2_s1[2];
+    int64_t       l2_s2[2];
+    int64_t       l2_s3[2];
+    float         l2_eps[2];
+    float         l2_scale[2];
 };
+
+// the rms_norm_f32 factor of a row of ncols = 4*n4 floats (n4 <= 32), one warp of 32 lanes; see rms_norm_f32 (do_vec, vpt 1)
+template <int ncols>
+static __device__ __forceinline__ float gdn_l2_row_scale(const float * x, const float eps) {
+    static_assert(ncols % 4 == 0 && ncols / 4 <= 32, "one float4 per lane");
+    const int      tid = threadIdx.x;
+    const float4 * x4  = (const float4 *) x;
+    float tmp = 0.0f;
+    if (tid < ncols / 4) {
+        const float4 xs = x4[tid];
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    }
+    tmp = warp_reduce_sum<32>(tmp);
+    return rsqrtf(tmp / ncols + eps);
+}
 
 #include <cstdint>
 
@@ -107,8 +130,31 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * lanes_per_col + lane_in_col;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            k_reg[r] = gates.l2[1] == nullptr ? k_t[i] : 0.0f;
+            q_reg[r] = gates.l2[0] == nullptr ? q_t[i] : 0.0f;
+        }
+        if constexpr (S_v >= 32) {
+            // gdnl2: the l2 norms of q and k from their raw rows (the skipped norms never wrote q_t/k_t)
+            if (gates.l2[0] != nullptr) {
+                const float * x  = gates.l2[0] + iq3 * gates.l2_s3[0] + t * gates.l2_s2[0] + iq1 * gates.l2_s1[0];
+                const float   sc = gdn_l2_row_scale<S_v>(x, gates.l2_eps[0]);
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * lanes_per_col + lane_in_col;
+                    q_reg[r] = sc * x[i];
+                    q_reg[r] *= gates.l2_scale[0];
+                }
+            }
+            if (gates.l2[1] != nullptr) {
+                const float * x  = gates.l2[1] + iq3 * gates.l2_s3[1] + t * gates.l2_s2[1] + iq1 * gates.l2_s1[1];
+                const float   sc = gdn_l2_row_scale<S_v>(x, gates.l2_eps[1]);
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * lanes_per_col + lane_in_col;
+                    k_reg[r] = sc * x[i];
+                    k_reg[r] *= gates.l2_scale[1];
+                }
+            }
         }
 
         if constexpr (!KDA) {
@@ -390,7 +436,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     }
 
-    gdn_gates_raw gates = { nullptr, nullptr, false };
+    gdn_gates_raw gates = {};
     if (!ctx.gdn_gate_remap.empty()) {
         const auto it = ctx.gdn_gate_remap.find(dst);
         if (it != ctx.gdn_gate_remap.end()) {
@@ -407,7 +453,22 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     }
 
-    if (state_ids == nullptr && gates.dt == nullptr && !gates.beta_raw) {
+    if (!ctx.gdn_l2_remap.empty()) {
+        const auto it = ctx.gdn_l2_remap.find(dst);
+        if (it != ctx.gdn_l2_remap.end()) {
+            GGML_ASSERT(!kda && S_v >= 32 && neq0 == S_v);
+            for (int j = 0; j < 2; ++j) {
+                gates.l2[j]       = it->second.raw[j];
+                gates.l2_s1[j]    = it->second.s1[j];
+                gates.l2_s2[j]    = it->second.s2[j];
+                gates.l2_s3[j]    = it->second.s3[j];
+                gates.l2_eps[j]   = it->second.eps[j];
+                gates.l2_scale[j] = it->second.scale[j];
+            }
+        }
+    }
+
+    if (state_ids == nullptr && gates.dt == nullptr && !gates.beta_raw && gates.l2[0] == nullptr && gates.l2[1] == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {

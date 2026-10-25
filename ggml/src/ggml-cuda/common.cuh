@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1620,6 +1621,33 @@ struct ggml_backend_cuda_context {
         const float * beta_raw = nullptr;
     };
     std::unordered_map<const ggml_tensor *, gdn_gate_src> gdn_gate_remap;
+
+    // GGML_CUDA_DECODE_FUSION gdnl2: skipped l2 norms (RMS_NORM(eps) -> SCALE) of q and/or k; the GDN normalizes the raw rows
+    struct gdn_l2_src {
+        const float * raw[2]   = { nullptr, nullptr }; // q, k
+        int64_t       s1[2]    = { 0, 0 };             // head, token, sequence strides in floats
+        int64_t       s2[2]    = { 0, 0 };
+        int64_t       s3[2]    = { 0, 0 };
+        float         eps[2]   = { 0.0f, 0.0f };
+        float         scale[2] = { 1.0f, 1.0f };
+    };
+    std::unordered_map<const ggml_tensor *, gdn_l2_src> gdn_l2_remap;
+
+    // GGML_CUDA_DECODE_FUSION convstate: skipped GET_ROWS -> CONCAT -> CONT -> CPY of a conv state; the SSM_CONV reads the state
+    // row ids[0] of the cache and the new columns from x itself, and writes the tails into the cache rows
+    struct conv_state_src {
+        const float *   rows       = nullptr; // cache, row ids[0] is the [d_conv - 1, nr] state
+        const int32_t * ids        = nullptr;
+        int64_t         row_stride = 0;       // floats
+        const float *   x          = nullptr; // column t, channel c at x + t*x_st + c*x_sc (floats)
+        int64_t         x_st       = 0;
+        int64_t         x_sc       = 0;
+        int             n_tail     = 0;
+        int64_t         tail_col[4] = { 0, 0, 0, 0 }; // first column of each tail in the concatenated input
+        float *         tail_dst[4] = { nullptr, nullptr, nullptr, nullptr };
+    };
+    std::unordered_map<const ggml_tensor *, conv_state_src> conv_state_remap;
+    std::unordered_set<const ggml_tensor *> df_skip; // nodes a later fused kernel does the work of
 };
 
 struct ggml_cuda_mm_fusion_args_host {
