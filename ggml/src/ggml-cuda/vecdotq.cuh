@@ -559,6 +559,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 }
 
 #define VDR_Q5_K_Q8_1_MMVQ 2
+
+// Turing: the Q5_K mat-vec issues fewer, wider loads (the result is unchanged)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+#define GGML_CUDA_Q5_K_HDR_LOAD16
+#endif
 #define VDR_Q5_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -1041,13 +1046,32 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[1] = qh[4] >> bq8_offset;
 
     // same as q4_K
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     const int j  = bq8_offset/2;
     const int jm = j & 1;
 
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
+    uint32_t s0;
+    uint32_t s2;
+    uint32_t s4;
+    half2    dm5;
+
+#if defined(GGML_CUDA_Q5_K_HDR_LOAD16)
+    // 176-byte blocks are 16-byte aligned whenever the tensor is: dm + scales in one 16-byte load.
+    // s0/s2/s4 keep the upper half-word, every use below masks it off.
+    if ((((uintptr_t) bq5_K) & 15) == 0) {
+        const int4 hdr = *(const int4 *) bq5_K;
+        ggml_cuda_memcpy_1<sizeof(dm5)>(&dm5, &hdr.x);
+        s0 = (uint32_t) hdr.y >> (16*jm);
+        s2 = (uint32_t) hdr.z >> (16*jm);
+        s4 = (uint32_t) hdr.w >> (16*jm);
+    } else
+#endif // defined(GGML_CUDA_Q5_K_HDR_LOAD16)
+    {
+        const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+        s0  = scales[jm + 0];
+        s2  = scales[jm + 2];
+        s4  = scales[jm + 4];
+        dm5 = bq5_K->dm;
+    }
 
     const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
 
@@ -1068,7 +1092,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, dm5, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
