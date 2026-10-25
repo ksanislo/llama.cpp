@@ -27,6 +27,14 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// device buffer with address space reserved for the whole size, memory backed on demand (VMM)
+// unbacked ranges read as zeros and must not be written; alloc returns NULL when VMM is not available
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size);
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_release(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_get_backed_size(ggml_backend_buffer_t buffer);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_get_granularity(ggml_backend_buffer_type_t buft);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

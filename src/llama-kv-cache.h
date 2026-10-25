@@ -2,9 +2,11 @@
 
 #include "llama-batch.h"
 #include "llama-graph.h"
+#include "llama-kv-cache-elastic.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -319,6 +321,14 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // --kv-elastic: K/V memory backed as the streams grow, see llama-kv-cache-elastic.cpp
+    std::unique_ptr<llama_kv_elastic> elastic;
+
+    void elastic_init();
+    bool elastic_reserve(const slot_info & sinfo);
+    void elastic_trim();
+    bool elastic_copy_prepare(uint32_t ssrc, uint32_t sdst);
 
     size_t total_size() const;
 
