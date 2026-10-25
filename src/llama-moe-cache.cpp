@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "llama-moe-lane.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -392,6 +394,11 @@ struct llama_moe_cache::impl {
         ggml_tensor * dh_map = nullptr;      // I32 [1, n_expert] on the device: the slot of a cached expert, -1 - e for the others
         ggml_tensor * dh_log = nullptr;      // I32 [dh_log_cap] on the device: the experts selected by the last graph, -1 after them
         std::vector<ggml_tensor *> dh_alias; // the host experts as tensors of the device (mapped pinned memory), in the order of the banks
+
+        // LLAMA_MOE_CPU_LANE
+        uint8_t * lane_host = nullptr;       // the channel of the layer in pinned host memory
+        void    * lane_dev  = nullptr;       // its address on the device
+        bool      lane_warned = false;
     };
 
     struct binding {
@@ -528,6 +535,17 @@ struct llama_moe_cache::impl {
     std::unordered_set<int32_t> dh_inflight;                          // il*n_expert + e of the pending and queued fills
     std::vector<int32_t> dh_cand;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> dh_alias_of; // host experts -> mapped
+
+    // LLAMA_MOE_CPU_LANE=f (needs LLAMA_MOE_DEVICE_HITS): of the misses of a device-path layer, the first round(f * misses) in
+    // routing order are computed by the CPU (llama_moe_lane, a thread pool of its own) while the device computes the hits and
+    // reads the other misses over PCIe. The graph meets the CPU through a channel per layer in pinned host memory mapped to
+    // the device: ggml_moe_doorbell (after the slot lookup) publishes x and the plan and rings, ggml_moe_join (after the down
+    // projection) spins on the done word and copies the CPU's rows in. No host step, no stream sync, CUDA graphs stay on.
+    float   lane_frac       = 0.0f;
+    int32_t lane_timeout_ms = 2000;
+    std::vector<ggml_backend_buffer_ptr> lane_bufs;   // the channels of each device, pinned host memory
+    std::vector<ggml_backend_buffer_ptr> lane_mapped; // the same mapped to the device
+    std::unique_ptr<llama_moe_lane> lane;             // after the channels: stopped before they are freed
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -826,9 +844,130 @@ struct llama_moe_cache::impl {
         if (const char * env = getenv("LLAMA_MOE_DEVICE_HITS_FILLS")) {
             dh_fill_max = std::max(0, atoi(env));
         }
+        if (const char * env = getenv("LLAMA_MOE_CPU_LANE")) {
+            lane_frac = std::clamp((float) atof(env), 0.0f, 1.0f);
+        }
+        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_TIMEOUT_MS")) {
+            lane_timeout_ms = std::max(1, atoi(env));
+        }
         if (dh_mode > 0 && !model.hparams.no_alloc) {
             init_device_hits();
+            if (lane_frac > 0.0f) {
+                init_cpu_lane();
+            }
+        } else if (lane_frac > 0.0f) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_CPU_LANE needs LLAMA_MOE_DEVICE_HITS, it is off\n", __func__);
+            lane_frac = 0.0f;
         }
+    }
+
+    // one channel per device-path layer, in a pinned host buffer per device mapped to the device
+    void init_cpu_lane() {
+        int64_t n_embd = 0; // an upper bound of the rows of the experts' input and output
+        for (const layer & l : layers) {
+            for (const ggml_tensor * w : l.experts) {
+                n_embd = std::max({ n_embd, w->ne[0], w->ne[1] });
+            }
+        }
+        const size_t chan_size = ggml_moe_lane_layout(n_embd, n_expert_used, dh_max, nullptr, nullptr, nullptr);
+
+        size_t n_chan = 0;
+        for (size_t id = 0; id < dh_devs.size(); ++id) {
+            const dh_device & dd = dh_devs[id];
+            if (dd.rows.empty()) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+            {
+                ggml_context_ptr sctx = llama_moe_cache_init_ctx(8);
+                ggml_tensor * ids = ggml_new_tensor_2d(sctx.get(), GGML_TYPE_I32, n_expert_used, dh_max);
+                ggml_tensor * x   = ggml_new_tensor_3d(sctx.get(), GGML_TYPE_F32, n_embd, 1, dh_max);
+                ggml_tensor * a   = ggml_new_tensor_3d(sctx.get(), GGML_TYPE_F32, n_embd, n_expert_used, dh_max);
+                ggml_tensor * db  = ggml_moe_doorbell(sctx.get(), ids, x, nullptr, 1, (int) dh_max, lane_frac);
+                if (!ggml_backend_supports_op(devices[id].backend, db) ||
+                    !ggml_backend_supports_op(devices[id].backend, ggml_moe_join(sctx.get(), a, db, nullptr, 1, (int) dh_max, 1))) {
+                    LLAMA_LOG_WARN("%s: %s does not support the MoE CPU lane ops, LLAMA_MOE_CPU_LANE is off there\n", __func__, ggml_backend_name(devices[id].backend));
+                    continue;
+                }
+            }
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+            typedef ggml_backend_buffer_t (*from_mapped_t)(ggml_backend_dev_t, void *, size_t);
+            auto from_mapped = (from_mapped_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_buffer_from_mapped_host_ptr");
+            const size_t size = chan_size*dd.rows.size();
+            ggml_backend_buffer_t hb = host_buft && from_mapped ? ggml_backend_buft_alloc_buffer(host_buft, size) : nullptr;
+            ggml_backend_buffer_t mb = hb ? from_mapped(dev, ggml_backend_buffer_get_base(hb), size) : nullptr;
+            if (mb == nullptr) {
+                if (hb) {
+                    ggml_backend_buffer_free(hb);
+                }
+                LLAMA_LOG_WARN("%s: %s cannot map pinned host memory, LLAMA_MOE_CPU_LANE is off there\n", __func__, ggml_backend_name(devices[id].backend));
+                continue;
+            }
+            ggml_backend_buffer_clear(hb, 0);
+            lane_bufs.emplace_back(hb);
+            lane_mapped.emplace_back(mb);
+            for (size_t r = 0; r < dd.rows.size(); ++r) {
+                layer & l = layers[dd.rows[r]];
+                l.lane_host = (uint8_t *) ggml_backend_buffer_get_base(hb) + r*chan_size;
+                l.lane_dev  = (uint8_t *) ggml_backend_buffer_get_base(mb) + r*chan_size;
+                n_chan++;
+            }
+        }
+        if (n_chan == 0) {
+            lane_frac = 0.0f;
+            return;
+        }
+
+        int n_threads = std::max(1, (int) std::thread::hardware_concurrency()/2 - 1);
+        int poll = 50;
+        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_THREADS")) {
+            n_threads = std::max(1, atoi(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_POLL")) {
+            poll = atoi(env);
+        }
+        lane = std::make_unique<llama_moe_lane>(layers.size(), n_threads, poll);
+        LLAMA_LOG_INFO("%s: MoE CPU lane: %zu layers, %.0f%% of the misses computed by %d CPU threads beside the device, "
+            "channels %.2f MiB pinned (LLAMA_MOE_CPU_LANE=%.2f)\n", __func__, n_chan, 100.0*lane_frac, n_threads,
+            chan_size*n_chan/1024.0/1024.0, lane_frac);
+    }
+
+    void * cpu_lane(int32_t il, int64_t n_tokens, int64_t n_used, const ggml_tensor * up, const ggml_tensor * gate,
+            const ggml_tensor * down, const ggml_tensor * gate_up, float clamp) {
+        if (!lane || !device_hits(il, n_tokens, n_used)) {
+            return nullptr;
+        }
+        layer & l = layers[il];
+        if (l.lane_dev == nullptr) {
+            return nullptr;
+        }
+        if (!lane->is_set(il)) {
+            const ggml_tensor * w_in = gate_up ? gate_up : up;
+            bool ok = w_in != nullptr && down != nullptr && (gate_up != nullptr || gate != nullptr);
+            for (const ggml_tensor * w : { up, gate, down, gate_up }) {
+                ok = ok && (w == nullptr || (w->buffer && ggml_backend_buffer_is_host(w->buffer) && ggml_is_contiguous(w)));
+            }
+            if (!ok) {
+                if (!l.lane_warned) {
+                    LLAMA_LOG_WARN("%s: the experts of layer %d are not readable by the CPU, no CPU lane there\n", __func__, il);
+                    l.lane_warned = true;
+                }
+                return nullptr;
+            }
+            llama_moe_lane_layer ll;
+            ll.chan       = l.lane_host;
+            ll.n_expert   = (int32_t) w_in->ne[2];
+            ll.n_used     = (int32_t) n_used;
+            ll.max_tokens = (int32_t) dh_max;
+            ll.n_embd     = w_in->ne[0];
+            ll.up         = up;
+            ll.gate       = gate;
+            ll.down       = down;
+            ll.gate_up    = gate_up;
+            ll.clamp      = clamp;
+            lane->set(il, ll);
+        }
+        return l.lane_dev;
     }
 
     void init_device_hits() {
@@ -2053,6 +2192,14 @@ struct llama_moe_cache::impl {
                 "fills = %zu (%.2f MiB), %zu dropped\n", ds.graphs, ds.hits, ds.misses, ds.bytes_miss/1024.0/1024.0,
                 100.0*ds.hits/(ds.hits + ds.misses), ds.fills, ds.bytes_fill/1024.0/1024.0, ds.dropped);
         }
+        if (lane) {
+            const llama_moe_lane::stats ls = lane->get_stats();
+            if (ls.requests > 0 || ls.timeouts > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: CPU lane: %" PRIu64 " requests, %" PRIu64 " experts (%.2f per request), %" PRIu64 " rows, "
+                    "%.3f ms per request, %" PRIu64 " timeouts\n", ls.requests, ls.experts, (double) ls.experts/std::max<uint64_t>(1, ls.requests),
+                    ls.rows, ls.busy_ms/std::max<uint64_t>(1, ls.requests), ls.timeouts);
+            }
+        }
     }
 };
 
@@ -2118,6 +2265,23 @@ ggml_tensor * llama_moe_cache::get_device_log(int32_t il) const {
     return il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].dh_log : nullptr;
 }
 
+void * llama_moe_cache::cpu_lane(int32_t il, int64_t n_tokens, int64_t n_expert_used, const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * down, const ggml_tensor * gate_up, float clamp) {
+    return pimpl->cpu_lane(il, n_tokens, n_expert_used, up, gate, down, gate_up, clamp);
+}
+
+float llama_moe_cache::cpu_lane_frac() const {
+    return pimpl->lane_frac;
+}
+
+int32_t llama_moe_cache::cpu_lane_max_tokens() const {
+    return (int32_t) pimpl->dh_max;
+}
+
+int32_t llama_moe_cache::cpu_lane_timeout_ms() const {
+    return pimpl->lane_timeout_ms;
+}
+
 ggml_tensor * llama_moe_cache::get_mapped_experts(const ggml_tensor * w, int64_t n_tokens, int64_t n_expert_used) const {
     return pimpl->get_mapped_experts(w, n_tokens, n_expert_used);
 }
@@ -2147,6 +2311,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     }
     if (pimpl->buf_host) {
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
+    }
+    for (const auto & b : pimpl->lane_bufs) {
+        res[ggml_backend_buffer_get_type(b.get())] += ggml_backend_buffer_get_size(b.get());
     }
     return res;
 }

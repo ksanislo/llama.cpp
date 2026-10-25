@@ -54,6 +54,7 @@
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
+#include "ggml-cuda/moe-lane.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -2793,6 +2794,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
+            break;
+        case GGML_OP_MOE_DOORBELL:
+            ggml_cuda_op_moe_doorbell(ctx, dst);
+            break;
+        case GGML_OP_MOE_JOIN:
+            ggml_cuda_op_moe_join(ctx, dst);
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
@@ -6287,6 +6294,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_MOE_DOORBELL:
+            // the channel must be pinned host memory mapped to the device, which the caller ensures
+            return ggml_nelements(op->src[0]) <= MOE_LANE_MAX_IDS && ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_VOLTA;
+        case GGML_OP_MOE_JOIN:
+            return ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_VOLTA;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

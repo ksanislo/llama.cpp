@@ -602,6 +602,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_DOORBELL,
+        GGML_OP_MOE_JOIN,
+
         GGML_OP_COUNT,
     };
 
@@ -1523,7 +1526,7 @@ extern "C" {
             struct ggml_tensor  * ids);
 
     // ggml_mul_mat_id with the experts in two tensors of the same type and expert layout:
-    // an id >= 0 selects as[id], an id < 0 selects as_alt[-1 - id]
+    // an id >= 0 selects as[id], an id < 0 selects as_alt[-1 - id], an id < -as_alt->ne[2] computes zero (ggml_moe_doorbell)
     // (an expert cache: as holds the cached experts, as_alt all of them, e.g. host memory the device reads directly)
     GGML_API struct ggml_tensor * ggml_mul_mat_id_mapped(
             struct ggml_context * ctx,
@@ -1531,6 +1534,44 @@ extern "C" {
             struct ggml_tensor  * as_alt,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // MoE CPU lane: a host thread computes part of the experts of a MUL_MAT_ID while the backend computes the others.
+    // They meet in a channel: host memory that both the backend and the host thread read and write (pinned memory mapped to
+    // a GPU), laid out by ggml_moe_lane_layout, passed by address (for a GPU: its address on the device, the same on UVA).
+    //
+    // ggml_moe_doorbell: ids [n_used, n_tokens] as for ggml_mul_mat_id_mapped (>= 0 an expert in the bank, -1 - e expert e
+    // of the n_expert others). The first round(frac * n) of the n distinct experts e < n_expert with negative ids, in the
+    // order of ids, go to the lane: their ids become -1 - n_expert - e, for which ggml_mul_mat_id_mapped computes zero.
+    // Writes x [n_embd, 1, n_tokens] and the new ids to the channel and increments its sequence word, returns the new ids.
+    // ggml_moe_join: a [n_embd, n_used, n_tokens], the result for these ids; waits until the host set the done word of the
+    // channel to its sequence word and returns a with the rows of the lane experts read from the channel. After timeout_ms
+    // these rows stay as in a (zero) and the error word of the channel is incremented.
+#define GGML_MOE_LANE_SEQ   0 // uint32 words of the channel header: written by the backend
+#define GGML_MOE_LANE_NTOK  1 // tokens of the last doorbell
+#define GGML_MOE_LANE_NLANE 2 // lane experts of the last doorbell
+#define GGML_MOE_LANE_DONE 16 // written by the host: the sequence word of the last request it completed
+#define GGML_MOE_LANE_ERR  32 // joins that timed out
+
+    // size of a channel for up to max_tokens tokens, and the offsets of its ids, x and rows
+    GGML_API size_t ggml_moe_lane_layout(int64_t n_embd, int64_t n_used, int64_t max_tokens, size_t * off_ids, size_t * off_x, size_t * off_rows);
+
+    GGML_API struct ggml_tensor * ggml_moe_doorbell(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            void                * chan,
+            int                   n_expert,
+            int                   max_tokens,
+            float                 frac);
+
+    GGML_API struct ggml_tensor * ggml_moe_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * ids,
+            void                * chan,
+            int                   n_expert,
+            int                   max_tokens,
+            int                   timeout_ms);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

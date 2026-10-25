@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -12610,6 +12613,114 @@ void ggml_compute_forward_lightning_indexer(
                 }
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_moe_doorbell, ggml_compute_forward_moe_join (MoE CPU lane, see ggml.h)
+
+// the channel words are shared with another thread (or a device), accessed as atomics
+static uint32_t ggml_moe_lane_load(const uint8_t * chan, int word) {
+    return reinterpret_cast<const std::atomic<uint32_t> *>(chan)[word].load(std::memory_order_acquire);
+}
+
+static void ggml_moe_lane_store(uint8_t * chan, int word, uint32_t v) {
+    reinterpret_cast<std::atomic<uint32_t> *>(chan)[word].store(v, std::memory_order_release);
+}
+
+void ggml_compute_forward_moe_doorbell(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * ids = dst->src[0];
+    const ggml_tensor * x   = dst->src[1];
+
+    uint8_t * chan;
+    memcpy(&chan, dst->op_params, sizeof(chan));
+    const int32_t n_expert   = ggml_get_op_params_i32(dst, 2);
+    const int32_t max_tokens = ggml_get_op_params_i32(dst, 3);
+    const float   frac       = ggml_get_op_params_f32(dst, 4);
+
+    size_t off_ids, off_x;
+    ggml_moe_lane_layout(x->ne[0], ids->ne[0], max_tokens, &off_ids, &off_x, nullptr);
+
+    const int64_t n = ggml_nelements(ids);
+    const int32_t * in  = (const int32_t *) ids->data;
+    int32_t       * out = (int32_t *) dst->data;
+    auto is_miss = [&](int32_t v) { return v < 0 && v >= -n_expert; };
+    auto first_of = [&](int64_t i) { int64_t j = 0; while (in[j] != in[i]) { ++j; } return j; };
+
+    // rank the distinct misses in the order of ids, the first n_lane of them go to the lane
+    std::vector<int32_t> rank(n, -1);
+    int32_t n_miss = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (is_miss(in[i]) && first_of(i) == i) {
+            rank[i] = n_miss++;
+        }
+    }
+    const int32_t n_lane = std::min(n_miss, (int32_t) floorf(n_miss*frac + 0.5f));
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t v = in[i];
+        out[i] = is_miss(v) && rank[first_of(i)] < n_lane ? -1 - n_expert - (-1 - v) : v;
+    }
+
+    memcpy(chan + off_ids, out, n*sizeof(int32_t));
+    if (n_lane > 0) {
+        memcpy(chan + off_x, x->data, ggml_nbytes(x));
+    }
+    const uint32_t seq = ggml_moe_lane_load(chan, GGML_MOE_LANE_SEQ) + 1;
+    ggml_moe_lane_store(chan, GGML_MOE_LANE_NTOK,  (uint32_t) ids->ne[1]);
+    ggml_moe_lane_store(chan, GGML_MOE_LANE_NLANE, (uint32_t) n_lane);
+    if (n_lane == 0) {
+        ggml_moe_lane_store(chan, GGML_MOE_LANE_DONE, seq);
+    }
+    ggml_moe_lane_store(chan, GGML_MOE_LANE_SEQ, seq);
+}
+
+void ggml_compute_forward_moe_join(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * a   = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+
+    uint8_t * chan;
+    memcpy(&chan, dst->op_params, sizeof(chan));
+    const int32_t n_expert   = ggml_get_op_params_i32(dst, 2);
+    const int32_t max_tokens = ggml_get_op_params_i32(dst, 3);
+    const int32_t timeout_ms = ggml_get_op_params_i32(dst, 4);
+
+    const int64_t n_embd = a->ne[0];
+    size_t off_rows;
+    ggml_moe_lane_layout(n_embd, ids->ne[0], max_tokens, nullptr, nullptr, &off_rows);
+
+    const int64_t n = ggml_nelements(ids);
+    const int32_t * v = (const int32_t *) ids->data;
+    const bool lane = std::any_of(v, v + n, [&](int32_t id) { return id < -n_expert; });
+
+    bool ok = true;
+    if (lane) {
+        const uint32_t seq = ggml_moe_lane_load(chan, GGML_MOE_LANE_SEQ);
+        const int64_t t0 = ggml_time_us();
+        while (ggml_moe_lane_load(chan, GGML_MOE_LANE_DONE) != seq) {
+            if (ggml_time_us() - t0 > 1000*(int64_t) timeout_ms) {
+                ggml_moe_lane_store(chan, GGML_MOE_LANE_ERR, ggml_moe_lane_load(chan, GGML_MOE_LANE_ERR) + 1);
+                ok = false;
+                break;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    if (dst->data != a->data) {
+        memcpy(dst->data, a->data, ggml_nbytes(a));
+    }
+    if (lane && ok) {
+        const float * rows = (const float *) (chan + off_rows);
+        for (int64_t i = 0; i < n; ++i) {
+            if (v[i] < -n_expert) {
+                memcpy((float *) dst->data + i*n_embd, rows + i*n_embd, n_embd*sizeof(float));
             }
         }
     }

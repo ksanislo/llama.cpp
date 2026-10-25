@@ -15,6 +15,7 @@ struct llama_model;
 // with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
 // with LLAMA_MOE_DEVICE_HITS=1|2 small batches look the slots up on the device and read the misses straight from the pinned host experts,
 // so their graph has no host step; the experts they select are logged on the device and the next graph fills the cache from the log
+// with LLAMA_MOE_CPU_LANE=f in addition, a share f of their misses is computed by a CPU thread pool while the device computes the rest
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
@@ -54,6 +55,15 @@ public:
 
     // the host experts of w as a device tensor (mapped pinned memory), for ggml_mul_mat_id_mapped; nullptr without device hits
     ggml_tensor * get_mapped_experts(const ggml_tensor * w, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // LLAMA_MOE_CPU_LANE: the channel (device address) for ggml_moe_doorbell/ggml_moe_join if a share of the misses of layer il
+    // is computed by the CPU lane beside the device for n_tokens tokens, nullptr otherwise; registers the layer's host experts
+    // (up, gate and down, or gate_up and down) and activation (swiglu, or swiglu_clamp if clamp > 0) with the lane
+    void * cpu_lane(int32_t il, int64_t n_tokens, int64_t n_expert_used, const ggml_tensor * up, const ggml_tensor * gate,
+            const ggml_tensor * down, const ggml_tensor * gate_up, float clamp);
+    float   cpu_lane_frac() const;
+    int32_t cpu_lane_max_tokens() const;
+    int32_t cpu_lane_timeout_ms() const;
 
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     ggml_tensor * get_cpu_map(int32_t il) const;
