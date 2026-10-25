@@ -1622,40 +1622,66 @@ struct llama_moe_cache::impl {
         }
         const size_t total = GGML_PAD(std::max<size_t>(cur, 1), G);
 
-        // the slots [first, n_slots) of a group are lent, k = n_slots - first as small as the granules of the tails allow
-        size_t lent_total = 0;
-        for (group & g : groups) {
-            if (g.id != (int32_t) id || g.n_slots == 0 || g.lend <= 0.0) {
+        // the slots [first, n_slots) of a group are lent, k = n_slots - first as small as the granules of the tails allow; a group
+        // keeps at least a layer's experts and its transient slots, so a small group (one layer) may lend little or nothing and
+        // the groups with room take over its share
+        auto released = [&](const group & g, int32_t first) {
+            size_t res = 0;
+            for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                const size_t nb = g.banks[ip]->nb[2];
+                const size_t lo = GGML_PAD(g.bank_offs[ip] + (size_t) first*nb, G);
+                const size_t hi = (g.bank_offs[ip] + (size_t) g.n_slots*nb)/G*G;
+                res += hi > lo ? hi - lo : 0;
+            }
+            return res;
+        };
+        auto min_first = [](const group & g) { return (int32_t) g.ref[0]->ne[2] + g.n_slots/8; };
+        std::vector<double> want(groups.size(), 0.0);
+        std::vector<double> room(groups.size(), 0.0);
+        double short_sum = 0.0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            if (g.id != (int32_t) id || g.n_slots == 0) {
                 continue;
             }
-            const int32_t n_expert  = (int32_t) g.ref[0]->ne[2];
-            const int32_t min_first = n_expert + g.n_slots/8; // a layer's experts, the transient slots
-            auto released = [&](int32_t first) {
-                size_t res = 0;
-                for (size_t ip = 0; ip < g.banks.size(); ++ip) {
-                    const size_t nb = g.banks[ip]->nb[2];
-                    const size_t lo = GGML_PAD(g.bank_offs[ip] + (size_t) first*nb, G);
-                    const size_t hi = (g.bank_offs[ip] + (size_t) g.n_slots*nb)/G*G;
-                    res += hi > lo ? hi - lo : 0;
+            const double cap = g.n_slots > min_first(g) ? (double) released(g, min_first(g)) : 0.0;
+            want[ig]   = std::min(g.lend, cap);
+            room[ig]   = cap - want[ig];
+            short_sum += g.lend - want[ig];
+        }
+        while (short_sum > 0.0) {
+            int32_t best = -1;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (room[ig] > 0.0 && (best < 0 || room[ig] > room[best])) {
+                    best = (int32_t) ig;
                 }
-                return res;
-            };
+            }
+            if (best < 0) {
+                break;
+            }
+            const double add = std::min(short_sum, room[best]);
+            want[best] += add;
+            room[best] -= add;
+            short_sum  -= add;
+        }
+
+        size_t lent_total = 0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.id != (int32_t) id || g.n_slots == 0 || want[ig] <= 0.0) {
+                continue;
+            }
             size_t per_slot = 0;
             for (const ggml_tensor * bank : g.banks) {
                 per_slot += bank->nb[2];
             }
-            int32_t first = std::max(min_first, g.n_slots - (int32_t) (g.lend/(double) per_slot));
-            while (first > min_first && (double) released(first) < g.lend) {
+            const int32_t lo_first = min_first(g);
+            int32_t first = std::max(lo_first, g.n_slots - (int32_t) (want[ig]/(double) per_slot));
+            while (first > lo_first && (double) released(g, first) < want[ig]) {
                 first--;
             }
-            if (first >= g.n_slots || released(first) == 0) {
-                LLAMA_LOG_WARN("%s: %s: a group of %zu layers is too small to lend memory to large batches\n", __func__,
-                    ggml_backend_name(d.backend), g.layers.size());
+            if (first >= g.n_slots || released(g, first) == 0) {
                 continue;
-            }
-            if ((double) released(first) < g.lend) {
-                LLAMA_LOG_WARN("%s: %s: a group of %zu layers lends only %.2f of %.2f MiB to large batches\n", __func__,
-                    ggml_backend_name(d.backend), g.layers.size(), released(first)/1024.0/1024.0, g.lend/1024.0/1024.0);
             }
             g.lend_first = first;
             g.lend_ranges.clear();
@@ -1669,7 +1695,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        if (lent_total + 16*G < dm.lend) {
+        if (lent_total < dm.lend) {
             LLAMA_LOG_WARN("%s: %s lends %.2f MiB of the %.2f MiB the large batches need beside the small ones, the compute buffer may not fit\n",
                 __func__, ggml_backend_name(d.backend), lent_total/1024.0/1024.0, dm.lend/1024.0/1024.0);
         }
