@@ -2587,6 +2587,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--batch-beside"}, "N",
+        string_format("max prompt tokens added to a batch while other slots are generating, so their tokens keep flowing during a long prompt read;\n"
+                      "prompts of at most N tokens are read before longer ones (default: %d, 0 = disabled)", params.n_batch_beside),
+        [](common_params & params, int value) {
+            params.n_batch_beside = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BATCH_BESIDE"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
