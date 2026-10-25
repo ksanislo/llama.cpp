@@ -49,8 +49,8 @@ public:
     // its output is copied to the device without waiting on the host
     void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * output);
 
-    // called before each graph compute
-    void begin();
+    // called before each graph compute, prev_in_flight if the previous graph may still run (no synchronization since)
+    void begin(bool prev_in_flight);
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map, the staging map of a layer or an input of the CPU part
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
