@@ -2852,6 +2852,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-cache-profile"}, "FILE",
+        "expert usage profile for the MoE cache: at load each GPU's cache is filled with the hottest experts of its layers, "
+        "and the usage of this run is saved back (LLAMA_MOE_CACHE_PROFILE_SAVE); reads its own format and Strata's expert-profile.bin",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile = value;
+        }
+    ).set_env("LLAMA_MOE_CACHE_PROFILE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
