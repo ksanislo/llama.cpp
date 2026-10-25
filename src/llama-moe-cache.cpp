@@ -80,6 +80,57 @@ struct moe_cache_slru {
         n_protected += int(protect) - int(from);
     }
 
+    // take slot s out of the lists, it is no longer a victim
+    void unlink(int32_t s) {
+        const bool from = is_protected[s];
+        if (prev[s] >= 0) {
+            next[prev[s]] = next[s];
+        } else {
+            head[from] = next[s];
+        }
+        if (next[s] >= 0) {
+            prev[next[s]] = prev[s];
+        } else {
+            tail[from] = prev[s];
+        }
+        prev[s] = next[s] = -1;
+        is_protected[s] = false;
+        n_protected -= int(from);
+    }
+
+    // put the unlinked slot d at the place of slot s in the lists, s is unlinked
+    void replace(int32_t s, int32_t d) {
+        const bool seg = is_protected[s];
+        prev[d] = prev[s];
+        next[d] = next[s];
+        if (prev[s] >= 0) {
+            next[prev[s]] = d;
+        } else {
+            head[seg] = d;
+        }
+        if (next[s] >= 0) {
+            prev[next[s]] = d;
+        } else {
+            tail[seg] = d;
+        }
+        is_protected[d] = seg;
+        prev[s] = next[s] = -1;
+        is_protected[s] = false;
+    }
+
+    // put the unlinked slot s at the least recently used end of probation, it is the next victim
+    void push_front(int32_t s) {
+        prev[s] = -1;
+        next[s] = head[0];
+        if (head[0] >= 0) {
+            prev[head[0]] = s;
+        } else {
+            tail[0] = s;
+        }
+        head[0] = s;
+        is_protected[s] = false;
+    }
+
     void touch(int32_t s) {
         move(s, true);
         if (n_protected > n_slots/2) {
@@ -221,7 +272,12 @@ struct llama_moe_cache::impl {
         int32_t last_slot = -1;                       // the slot of the last upload, -1 if the compute stream already waited for it
         size_t slot_size = 0;
         ggml_context_ptr ctx_stage;
-        ggml_backend_buffer_ptr buf_stage;
+        ggml_backend_buffer_ptr buf_stage;            // nullptr if the slots borrow the cache
+
+        // LLAMA_MOE_ASYNC_BORROW: the slots lie in the bank tails of the lender group, from its slot borrow_first on
+        int32_t lender = -1;
+        int32_t borrow_first = 0;
+        bool borrowed = false;                        // the cache slots under the staging slots are out of the SLRU
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -264,6 +320,9 @@ struct llama_moe_cache::impl {
         size_t prefetches        = 0;
         size_t bytes_host        = 0;
         size_t bytes_cache       = 0;
+        size_t borrows           = 0;
+        size_t experts_moved     = 0; // kept by moving them out of the borrowed slots
+        size_t experts_evicted   = 0;
     };
 
     static constexpr int64_t max_batch = 32;
@@ -276,6 +335,7 @@ struct llama_moe_cache::impl {
 
     int32_t n_stage  = 0; // staging slots per device, 0 if the batches that the cache does not serve use op offload
     int64_t full_ids = 8; // ids per expert from which a batch stages all the experts of a layer without reading the ids back
+    bool    borrow   = false; // the staging slots take cache slots during large batches instead of their own memory
     stage_stats stats_stage;
     std::unordered_map<const ggml_tensor *, int32_t> stage_layer_of;              // staging map -> layer
     std::unordered_map<const ggml_tensor *, ggml_tensor *> stage_bindings;       // host experts -> their staging slot
@@ -324,6 +384,9 @@ struct llama_moe_cache::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_ASYNC_FULL")) {
             full_ids = std::max<int64_t>(1, atoll(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_ASYNC_BORROW")) {
+            borrow = atoi(env) != 0;
         }
         for (const device & d : devices) {
             ggml_backend_dev_props props;
@@ -546,6 +609,11 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("%s: %10s MoE staging   = %8.2f MiB, %d slots for %zu layers (LLAMA_MOE_ASYNC, all experts from %" PRId64 " ids per expert)\n", __func__,
                     ggml_backend_buft_name(d.buft), n_stage*d.slot_size/1024.0/1024.0, n_stage, d.layers.size(), full_ids);
             }
+            if (d.lender >= 0) {
+                const group & g = groups[d.lender];
+                LLAMA_LOG_INFO("%s: %10s MoE staging borrows %d of the %d %s slots during large batches (LLAMA_MOE_ASYNC_BORROW)\n", __func__,
+                    ggml_backend_buft_name(d.buft), g.n_slots - d.borrow_first, g.n_slots, ggml_type_name(g.ref.back()->type));
+            }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
@@ -579,6 +647,7 @@ struct llama_moe_cache::impl {
             ggml_context * ctx = d.ctx_stage.get();
 
             const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
+            std::vector<size_t> sec; // [expert tensor] the largest staging tensor of the device, the slot spacing in a borrowed bank tail
             for (size_t ig = 0; ig < groups.size(); ++ig) {
                 group & g = groups[ig];
                 if (g.id != (int32_t) id || g.n_slots == 0) {
@@ -587,34 +656,52 @@ struct llama_moe_cache::impl {
                 g.stage.resize(n_stage);
                 for (int32_t is = 0; is < n_stage; ++is) {
                     size_t size = 0;
-                    for (const ggml_tensor * t : g.ref) {
+                    for (size_t ip = 0; ip < g.ref.size(); ++ip) {
+                        const ggml_tensor * t = g.ref[ip];
                         // one extra expert at the end, CUDA MMQ can read past the last expert
                         ggml_tensor * st = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], t->ne[2] + 1);
                         GGML_ASSERT(st->nb[2] == t->nb[2]);
                         ggml_format_name(st, "moe_stage.%d.%zu.%s", is, ig, t->name);
                         g.stage[is].push_back(st);
-                        size += GGML_PAD(ggml_backend_buft_get_alloc_size(d.buft, st), alignment);
+                        const size_t st_size = GGML_PAD(ggml_backend_buft_get_alloc_size(d.buft, st), alignment);
+                        size += st_size;
+                        sec.resize(std::max(sec.size(), ip + 1), 0);
+                        sec[ip] = std::max(sec[ip], st_size);
                     }
                     d.slot_size = std::max(d.slot_size, size);
                 }
             }
 
-            d.buf_stage.reset(ggml_backend_buft_alloc_buffer(d.buft, no_alloc ? 0 : n_stage*d.slot_size));
-            if (!d.buf_stage) {
-                throw std::runtime_error("failed to allocate the MoE staging buffers");
+            std::vector<size_t> start; // [expert tensor] offset of the staging slots in the banks of the lender
+            if (borrow && !plan_borrow(d, (int32_t) id, sec, start)) {
+                LLAMA_LOG_WARN("%s: %s: the MoE cache is too small to lend %d staging slots, they are allocated separately\n", __func__, ggml_backend_buft_name(d.buft), n_stage);
             }
-            uint8_t * base = no_alloc ? nullptr : (uint8_t *) ggml_backend_buffer_get_base(d.buf_stage.get());
+
+            if (d.lender < 0) {
+                d.buf_stage.reset(ggml_backend_buft_alloc_buffer(d.buft, no_alloc ? 0 : n_stage*d.slot_size));
+                if (!d.buf_stage) {
+                    throw std::runtime_error("failed to allocate the MoE staging buffers");
+                }
+            }
+            ggml_backend_buffer_t buf = d.lender >= 0 ? d.buf.get() : d.buf_stage.get();
+            uint8_t * base = no_alloc ? nullptr : (uint8_t *) ggml_backend_buffer_get_base(buf);
             for (group & g : groups) {
                 if (g.stage.empty() || g.id != (int32_t) id) {
                     continue;
                 }
                 for (int32_t is = 0; is < n_stage; ++is) {
                     size_t offset = is*d.slot_size;
-                    for (ggml_tensor * st : g.stage[is]) {
+                    for (size_t ip = 0; ip < g.stage[is].size(); ++ip) {
+                        ggml_tensor * st = g.stage[is][ip];
+                        uint8_t * addr = nullptr;
                         if (no_alloc) {
-                            st->buffer = d.buf_stage.get();
-                        } else if (ggml_backend_tensor_alloc(d.buf_stage.get(), st, base + offset) != GGML_STATUS_SUCCESS) {
-                            throw std::runtime_error("failed to allocate the MoE staging buffers");
+                            st->buffer = buf;
+                        } else {
+                            // borrowed: slot is of every tensor position starts at the same place for all groups of the device
+                            addr = d.lender >= 0 ? (uint8_t *) groups[d.lender].banks[ip]->data + start[ip] + is*sec[ip] : base + offset;
+                            if (ggml_backend_tensor_alloc(buf, st, addr) != GGML_STATUS_SUCCESS) {
+                                throw std::runtime_error("failed to allocate the MoE staging buffers");
+                            }
                         }
                         offset += GGML_PAD(ggml_backend_buft_get_alloc_size(d.buft, st), alignment);
                     }
@@ -639,12 +726,16 @@ struct llama_moe_cache::impl {
             }
 
             // as weights, the ops that read the slots run on the device
-            ggml_backend_buffer_set_usage(d.buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (d.buf_stage) {
+                ggml_backend_buffer_set_usage(d.buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
 
             if (no_alloc) {
                 continue;
             }
-            ggml_backend_buffer_clear(d.buf_stage.get(), 0);
+            if (d.buf_stage) {
+                ggml_backend_buffer_clear(d.buf_stage.get(), 0);
+            }
 
             ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
             d.copy.reset(ggml_backend_dev_init(dev, nullptr));
@@ -669,6 +760,142 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+    }
+
+    // place the staging slots of device id in the bank tails of its largest group, slot is of tensor position ip at start[ip] + is*sec[ip]
+    bool plan_borrow(device & d, int32_t id, const std::vector<size_t> & sec, std::vector<size_t> & start) {
+        int32_t best = -1;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            if (g.id != id || g.n_slots == 0) {
+                continue;
+            }
+            if (g.ref.size() != sec.size()) {
+                return false;
+            }
+            if (best < 0 || g.n_slots > groups[best].n_slots) {
+                best = (int32_t) ig;
+            }
+        }
+        if (best < 0) {
+            return false;
+        }
+        const group & g = groups[best];
+        const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
+        int32_t k = 1; // bank slots under the staging slots, including the extra one at the end
+        for (size_t ip = 0; ip < sec.size(); ++ip) {
+            k = std::max(k, (int32_t) ((n_stage*sec[ip] + g.banks[ip]->nb[2] - 1)/g.banks[ip]->nb[2]));
+        }
+        for (; k <= g.n_slots; ++k) {
+            const int32_t first = g.n_slots + 1 - k;
+            bool fits = true;
+            start.assign(sec.size(), 0);
+            for (size_t ip = 0; ip < sec.size(); ++ip) {
+                start[ip] = GGML_PAD((size_t) first*g.banks[ip]->nb[2], alignment);
+                fits = fits && start[ip] + n_stage*sec[ip] <= ggml_nbytes(g.banks[ip]);
+            }
+            if (fits) {
+                d.lender       = best;
+                d.borrow_first = first;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // take the lender's slots under the staging slots out of the SLRU, called on the compute stream before the first staging of a batch
+    // the coldest experts of the lender leave the cache, the hotter ones under the staging slots move to their slots
+    void borrow_slots(device & d) {
+        group & g = groups[d.lender];
+        moe_cache_slru & c = g.slru;
+        const int32_t first = d.borrow_first;
+
+        // the slot maps of earlier graphs are uploaded and no stream reads the banks any more
+        ggml_backend_synchronize(d.copy.get());
+        ggml_backend_synchronize(d.backend);
+        d.last_slot = -1;
+
+        std::vector<bool> drop(g.n_slots, false);
+        int32_t n_drop = 0;
+        for (int seg = 0; seg < 2; ++seg) {
+            for (int32_t s = c.head[seg]; s >= 0 && n_drop < g.n_slots - first; s = c.next[s]) {
+                drop[s] = true;
+                n_drop++;
+            }
+        }
+        GGML_ASSERT(n_drop == g.n_slots - first);
+
+        std::vector<int32_t> src;
+        std::vector<int32_t> dst;
+        for (int32_t s = first; s < g.n_slots; ++s) {
+            if (!drop[s]) {
+                src.push_back(s);
+            }
+        }
+        for (int32_t s = 0; s < first; ++s) {
+            if (drop[s]) {
+                dst.push_back(s);
+            }
+        }
+        GGML_ASSERT(src.size() == dst.size());
+
+        auto evict = [&](int32_t s) {
+            if (c.key_of[s] >= 0) {
+                c.slot_map[c.key_of[s] / c.n_expert][c.key_of[s] % c.n_expert] = -1;
+                c.key_of[s] = -1;
+                stats_stage.experts_evicted++;
+            }
+        };
+        for (int32_t s : dst) {
+            evict(s);
+            c.unlink(s);
+        }
+        for (size_t i = 0; i < src.size(); ++i) {
+            const int32_t key = c.key_of[src[i]];
+            c.slot_map[key / c.n_expert][key % c.n_expert] = dst[i];
+            c.key_of[dst[i]] = key;
+            c.key_of[src[i]] = -1;
+            c.replace(src[i], dst[i]);
+        }
+        for (int32_t s = first; s < g.n_slots; ++s) {
+            if (drop[s]) {
+                evict(s);
+                c.unlink(s);
+            }
+        }
+
+        // the moves stay on the compute stream, the staging copies wait for it
+        for (size_t i = 0; i < src.size(); ) {
+            size_t n = 1;
+            while (i + n < src.size() && src[i + n] == src[i] + (int32_t) n && dst[i + n] == dst[i] + (int32_t) n) {
+                n++;
+            }
+            for (ggml_tensor * bank : g.banks) {
+                ggml_reset(ctx_views.get());
+                ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], src[i]*bank->nb[2]);
+                ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], dst[i]*bank->nb[2]);
+                ggml_backend_view_init(src_view);
+                ggml_backend_view_init(dst_view);
+                ggml_backend_tensor_copy_async(d.backend, d.backend, src_view, dst_view);
+            }
+            i += n;
+        }
+
+        stats_stage.experts_moved += src.size();
+        stats_stage.borrows++;
+        d.borrowed = true;
+    }
+
+    // give the borrowed slots back to the cache as free slots, before a batch that the cache serves fills it
+    // the compute stream already waited for the last upload of the copy stream
+    void return_slots(device & d) {
+        moe_cache_slru & c = groups[d.lender].slru;
+        for (int32_t s = groups[d.lender].n_slots - 1; s >= d.borrow_first; --s) {
+            GGML_ASSERT(c.key_of[s] < 0);
+            c.push_front(s);
+        }
+        std::fill(d.slot_layer.begin(), d.slot_layer.end(), -1);
+        d.borrowed = false;
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -858,6 +1085,10 @@ struct llama_moe_cache::impl {
         const int64_t n_expert = l.stage_map->ne[1];
         const bool full = ggml_nelements(lookup->src[1]) >= full_ids*n_expert;
 
+        if (d.lender >= 0 && !d.borrowed) {
+            borrow_slots(d);
+        }
+
         // the copy stream does not overwrite a slot or read a bank before the compute stream is done with them
         // the slot of this layer was last read by an earlier layer, and with 2+ slots the slot of the next one too
         ggml_backend_event_record(d.ev_compute.get(), backend);
@@ -922,6 +1153,9 @@ struct llama_moe_cache::impl {
             ggml_backend_event_wait(backend, d.ev_ready[d.last_slot].get());
             d.last_slot = -1;
         }
+        if (d.borrowed) {
+            return_slots(d);
+        }
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
@@ -974,6 +1208,9 @@ struct llama_moe_cache::impl {
         if (ss.layers_prefetched + ss.layers_waited + ss.layers_partial > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: staged layers: %zu prefetched, %zu waited for, %zu partial, %zu prefetches, %.2f MiB uploaded, %.2f MiB from the cache\n",
                 ss.layers_prefetched, ss.layers_waited, ss.layers_partial, ss.prefetches, ss.bytes_host/1024.0/1024.0, ss.bytes_cache/1024.0/1024.0);
+        }
+        if (ss.borrows > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: staging borrowed the cache %zu times: %zu experts moved, %zu evicted\n", ss.borrows, ss.experts_moved, ss.experts_evicted);
         }
     }
 };

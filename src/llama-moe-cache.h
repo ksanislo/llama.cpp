@@ -12,6 +12,7 @@ struct llama_model;
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 // with LLAMA_MOE_ASYNC=n, the batches the cache does not serve read the experts of a layer from one of n staging slots per device instead,
 // filled on a separate stream of the device; large batches stage all the experts of the next layer while the current one computes
+// with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
