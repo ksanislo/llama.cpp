@@ -1688,7 +1688,8 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 };
 
 template<ggml_type compute_type>
-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        bool force_f32_output = false) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -1791,7 +1792,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) || force_f32_output;
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
@@ -2194,6 +2195,48 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+// Turing (sm_75): a quantized 2D weight times a prompt-sized batch as an FP16 tensor-core GEMM (weight dequantized per
+// call, activations saturated to FP16, FP32 sums and output) instead of MMQ, like Strata's prompt GEMMs (BF16_TC).
+// GGML_CUDA_SM75_DENSE_F16=<min batch columns>; unset or 0 = off. MUL_MAT_ID (experts) keeps MMQ.
+static int64_t ggml_cuda_sm75_dense_f16_min() {
+    static const int64_t v = [] {
+        const char * e = getenv("GGML_CUDA_SM75_DENSE_F16");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : (int64_t) 0;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_use_sm75_dense_f16(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    const int64_t min_cols = ggml_cuda_sm75_dense_f16_min();
+    return min_cols > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE &&
+        ggml_is_quantized(src0->type) && ggml_get_to_fp16_cuda(src0->type) != nullptr &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[1] >= min_cols &&
+        ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+}
+
+static __global__ void k_f32_to_f16_sat(const float * __restrict__ x, half * __restrict__ y, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = __float2half_rn(fminf(fmaxf(x[i], -65504.0f), 65504.0f));
+    }
+}
+
+static void ggml_cuda_mul_mat_sm75_dense_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(src1);
+    ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(), n);
+    k_f32_to_f16_sat<<<(n + 255) / 256, 256, 0, ctx.stream()>>>((const float *) src1->data, src1_f16.get(), n);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_tensor src1_h = *src1;
+    src1_h.type  = GGML_TYPE_F16;
+    src1_h.data  = src1_f16.get();
+    src1_h.nb[0] = sizeof(half);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        src1_h.nb[i] = src1_h.nb[i - 1]*src1_h.ne[i - 1];
+    }
+    ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, &src1_h, dst, /*force_f32_output =*/ true);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2240,6 +2283,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_use_sm75_dense_f16(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_sm75_dense_f16(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
