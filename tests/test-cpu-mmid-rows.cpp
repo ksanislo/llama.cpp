@@ -1,6 +1,6 @@
 // MUL_MAT_ID with a few rows per expert on the CPU backend: the default path (on AVX1 CPUs the
 // multi-row dots of ggml-cpu/arch/x86/quants.c) must match the reference per-row vec_dot path
-// (use_ref) bit for bit
+// (use_ref) bit for bit; and a single row (MUL_MAT, vec_dot) must match the multi-row dots
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -159,6 +159,71 @@ static bool test_case(ggml_backend_t backend, ggml_type type, int64_t K, int64_t
     return n_diff == 0;
 }
 
+// one activation row: MUL_MAT with n = 1 (vec_dot) against MUL_MAT_ID with the row routed twice to one
+// expert (2 rows, on AVX1 the multi-row dots, which hold the decode of the previous vec_dot bodies): the
+// single-row vec_dot must give those results bit for bit
+static bool test_one_row(ggml_backend_t backend, ggml_type type, int64_t K, int64_t N) {
+    struct ggml_init_params ip = { 64*1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    struct ggml_tensor * as  = ggml_new_tensor_3d(ctx, type,          K, N, 1);
+    struct ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, 2);
+    struct ggml_tensor * idt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 2);
+    struct ggml_tensor * out_id = ggml_mul_mat_id(ctx, as, b, idt);
+    struct ggml_tensor * out_mm = ggml_mul_mat(ctx, ggml_view_2d(ctx, as, K, N, as->nb[1], 0), ggml_view_2d(ctx, b, K, 1, b->nb[1], 0));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out_id);
+    ggml_build_forward_expand(gf, out_mm);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    {
+        std::vector<float> w(N*K);
+        for (auto & v : w) {
+            v = rng_f32();
+        }
+        std::vector<float> im;
+        if (ggml_quantize_requires_imatrix(type)) {
+            im.assign(K, 1.0f);
+        }
+        std::vector<uint8_t> q(ggml_nbytes(as));
+        ggml_quantize_chunk(type, w.data(), q.data(), 0, N, K, im.empty() ? nullptr : im.data());
+        ggml_backend_tensor_set(as, q.data(), 0, q.size());
+
+        std::vector<float> x(2*K);
+        for (int64_t i = 0; i < K; ++i) {
+            x[i] = x[K + i] = rng_f32();
+        }
+        ggml_backend_tensor_set(b, x.data(), 0, ggml_nbytes(b));
+        const int32_t ids[2] = { 0, 0 };
+        ggml_backend_tensor_set(idt, ids, 0, sizeof(ids));
+    }
+
+    cpu_set_use_ref(backend, false);
+    ggml_backend_graph_compute(backend, gf);
+    std::vector<float> got_id(ggml_nelements(out_id)), got_mm(ggml_nelements(out_mm));
+    ggml_backend_tensor_get(out_id, got_id.data(), 0, ggml_nbytes(out_id));
+    ggml_backend_tensor_get(out_mm, got_mm.data(), 0, ggml_nbytes(out_mm));
+
+    int64_t n_diff = 0;
+    for (int64_t t = 0; t < 2; ++t) {
+        for (int64_t i = 0; i < N; ++i) {
+            n_diff += memcmp(&got_id[t*N + i], &got_mm[i], sizeof(float)) != 0;
+        }
+    }
+    printf("%-8s K=%5lld N=%4lld one row: MUL_MAT vs MUL_MAT_ID x2: %s", ggml_type_name(type), (long long) K, (long long) N,
+           n_diff == 0 ? "OK (bit-identical)" : "FAIL");
+    if (n_diff) {
+        printf(" (%lld of %lld differ)", (long long) n_diff, (long long) (2*N));
+    }
+    printf("\n");
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return n_diff == 0;
+}
+
 int main(void) {
     // the tiled path is not what is tested here (on AVX1 it takes over at 12+ rows for Q4_K, 16+ otherwise)
 #if defined(_WIN32)
@@ -190,6 +255,11 @@ int main(void) {
             n_fail += !test_case(backend, type, 768, 33, 2, { 2, 3, 7, 5, 4, 6, 1, 2 });
             // 8..11 rows (a group of 8 + a rest) also take the multi-row dots, before the tiled path
             n_fail += !test_case(backend, type, 512, 21, 1, { 8, 9, 11, 10, 3 });
+            // one row per expert (single-stream decode): vec_dot in both paths, and vec_dot against the multi-row dots
+            n_fail += !test_case(backend, type, 1024, 37, 4, { 1, 1, 1, 1, 1, 1, 1, 1 });
+            n_fail += !test_case(backend, type, 2304, 50, 6, { 1, 1, 1, 1, 1, 1 });
+            n_fail += !test_one_row(backend, type, 2304, 77);
+            n_fail += !test_one_row(backend, type, 5120, 40);
         }
         // Q8_0 / Q5_1 have no tiled path: their multi-row dots run at any row count; an odd count of
         // 32-value blocks covers the q8_0 tail
