@@ -1555,9 +1555,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_expert         (hparams.n_expert),
     n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
     freq_base        (cparams.rope_freq_base),
-    freq_scale       (cparams.rope_freq_scale),
-    ext_factor       (cparams.yarn_ext_factor),
-    attn_factor      (cparams.yarn_attn_factor),
+    // elastic YaRN: the ubatch holds sequences of one rope level, see llama_batch_allocr::set_seq_rope_levels
+    freq_scale       (cparams.rope_elastic ? cparams.rope_levels[ubatch.rope_level].freq_scale  : cparams.rope_freq_scale),
+    ext_factor       (cparams.rope_elastic ? cparams.rope_levels[ubatch.rope_level].ext_factor  : cparams.yarn_ext_factor),
+    attn_factor      (cparams.rope_elastic ? cparams.rope_levels[ubatch.rope_level].attn_factor : cparams.yarn_attn_factor),
     beta_fast        (cparams.yarn_beta_fast),
     beta_slow        (cparams.yarn_beta_slow),
     norm_eps         (hparams.f_norm_eps),

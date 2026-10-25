@@ -388,6 +388,8 @@ extern "C" {
         float    yarn_beta_fast;   // YaRN low correction dim
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
+        int32_t  yarn_elastic_thr; // elastic YaRN: plain RoPE per sequence until it reaches this position, then YaRN
+                                   // < 0 = off (default), 0 = at the YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
         ggml_backend_sched_eval_callback cb_eval;

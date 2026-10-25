@@ -79,6 +79,10 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // elastic YaRN: pick the rope level of every sequence of the batch in balloc, queue the moves of the
+    // sequences that change level (done by the next memory_update) and tell balloc the levels
+    void rope_elastic_prepare(uint32_t n_seq_max);
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();

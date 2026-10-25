@@ -146,6 +146,14 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // elastic YaRN
+
+    bool rope_level_enable() override;
+
+    int32_t                   seq_rope_level    (llama_seq_id seq_id) const override;
+    std::vector<llama_seq_id> seq_rope_group    (llama_seq_id seq_id) const override;
+    void                      seq_rope_level_set(llama_seq_id seq_id, int32_t level) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -154,6 +162,21 @@ public:
     //
     // llama_kv_cache specific API
     //
+
+    // whether the cached keys can be moved between rope levels: one rope per layer, no partial (MLA) keys
+    bool get_can_rope_level() const;
+
+    // a seq_rope_level_set() waits for the next update
+    bool get_has_rope_level() const;
+
+    // one batch of cells moving between two rope levels
+    struct rope_move {
+        uint32_t from;
+        uint32_t to;
+
+        std::vector<int32_t>   idxs; // global cell index (stream*size + cell)
+        std::vector<llama_pos> pos;  // n_pos sections, section-major: pos[j*n + i]
+    };
 
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
@@ -315,6 +338,11 @@ private:
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 
+    // elastic YaRN: per-cell rope levels are tracked, and the level each sequence moves to in the next update (-1: none)
+    bool rope_lvl_on = false;
+
+    std::vector<int8_t> rope_lvl_pending;
+
     std::vector<kv_layer> layers;
 
     // model layer id -> KV cache layer id
@@ -339,6 +367,16 @@ private:
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
                   llama_context * lctx) const;
+
+    // re-rotate the cached keys of mv.idxs from level mv.from to level mv.to: unrotate with the old
+    // parameters (rotation by -pos), rotate with the new ones, in place
+    ggml_cgraph * build_graph_rope_level(
+               llm_graph_result * res,
+                  llama_context * lctx,
+                const rope_move & mv) const;
+
+    // apply the pending seq_rope_level_set() calls, false on failure
+    bool update_rope_level(llama_context * lctx);
 
     struct cell_ranges_t {
         uint32_t strm;
@@ -374,7 +412,8 @@ public:
             llama_kv_cache * kv,
             llama_context * lctx,
             bool do_shift,
-            stream_copy_info sc_info);
+            stream_copy_info sc_info,
+            bool do_rope_level = false);
 
     // used to create a batch processing context from a batch
     llama_kv_cache_context(

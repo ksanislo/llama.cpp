@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -305,6 +306,21 @@ llama_context::llama_context(
 
     cparams.yarn_attn_factor *= hparams.rope_attn_factor;
 
+    if (params.yarn_elastic_thr >= 0) {
+        if (cparams.rope_scaling_type != LLAMA_ROPE_SCALING_TYPE_YARN || cparams.rope_freq_scale >= 1.0f) {
+            LLAMA_LOG_WARN("%s: elastic YaRN needs YaRN scaling with a factor > 1 (from the model or --rope-scaling/--rope-scale), disabled\n", __func__);
+        } else if (!llm_arch_supports_rope_elastic(model.arch)) {
+            LLAMA_LOG_WARN("%s: elastic YaRN is not supported for %s, disabled\n", __func__, llm_arch_name(model.arch));
+        } else {
+            cparams.rope_elastic     = true;
+            cparams.rope_elastic_thr = params.yarn_elastic_thr > 0 ? (uint32_t) params.yarn_elastic_thr : cparams.n_ctx_orig_yarn;
+
+            // level 0 is what the scaling type NONE gives: no interpolation, no YaRN magnitude scaling
+            cparams.rope_levels[0] = { 1.0f, 0.0f, hparams.yarn_attn_factor*hparams.rope_attn_factor };
+            cparams.rope_levels[1] = { cparams.rope_freq_scale, cparams.yarn_ext_factor, cparams.yarn_attn_factor };
+        }
+    }
+
     if (cparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
         if (hparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
             cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -492,6 +508,16 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (cparams.rope_elastic && (!memory || !memory->rope_level_enable())) {
+            LLAMA_LOG_WARN("%s: the memory of this model cannot change the RoPE of a cached sequence, elastic YaRN disabled\n", __func__);
+            cparams.rope_elastic = false;
+        }
+
+        if (cparams.rope_elastic) {
+            LLAMA_LOG_INFO("%s: elastic YaRN: plain RoPE per sequence below position %u, then YaRN (freq_scale = %g)\n",
+                    __func__, cparams.rope_elastic_thr, cparams.rope_levels[1].freq_scale);
+        }
     }
 
     // init backends
@@ -1835,6 +1861,89 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// A sequence ropes plain until its batch reaches rope_elastic_thr, then moves to YaRN before any of that batch is
+// read: a prompt that crosses the line is read on YaRN as a whole, a reply moves at the token that crosses it.
+// One that was cut back well below the line (seq_rm) returns to the plain RoPE with its next batch. Sequences that
+// share cells (a unified cache after seq_cp) or tokens can only hold one level, the highest any of them needs.
+void llama_context::rope_elastic_prepare(uint32_t n_seq_max) {
+    const llama_pos thr = (llama_pos) cparams.rope_elastic_thr;
+
+    constexpr llama_pos rope_elastic_down_margin = 4096;
+
+    std::vector<int32_t> cur (LLAMA_MAX_SEQ, -1); // level of the cached cells, -1 = none
+    std::vector<int32_t> want(LLAMA_MAX_SEQ, -1); // level the sequence needs for this batch, -1 = not involved
+
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        cur[s] = memory->seq_rope_level(s);
+
+        const llama_pos p_batch = balloc->seq_pos_max(s);
+        if (p_batch >= 0) {
+            const llama_pos p_max = std::max(p_batch, memory->seq_pos_max(s));
+
+            // a sequence cut back just below the line (rejected drafts, a regenerated reply) stays on YaRN,
+            // so it does not move back and forth
+            want[s] = p_max >= thr || (cur[s] == 1 && p_max + rope_elastic_down_margin >= thr) ? 1 : 0;
+        } else {
+            want[s] = cur[s];
+        }
+    }
+
+    // the sequences that have to share a level
+    std::vector<llama_seq_id> parent(LLAMA_MAX_SEQ);
+    std::iota(parent.begin(), parent.end(), 0);
+
+    auto find = [&](llama_seq_id s) {
+        while (parent[s] != s) {
+            s = parent[s] = parent[parent[s]];
+        }
+        return s;
+    };
+    auto unite = [&](llama_seq_id a, llama_seq_id b) {
+        parent[find(a)] = find(b);
+    };
+
+    // a token decoded for several sequences
+    const llama_batch & batch = balloc->get_batch();
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t k = 1; k < batch.n_seq_id[i]; ++k) {
+            unite(batch.seq_id[i][0], batch.seq_id[i][k]);
+        }
+    }
+
+    // cells shared with other sequences, looked up only for a sequence that changes level
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (cur[s] >= 0 && want[s] != cur[s]) {
+            for (const llama_seq_id g : memory->seq_rope_group(s)) {
+                unite(s, g);
+            }
+        }
+    }
+
+    std::vector<int32_t> level(LLAMA_MAX_SEQ, -1);
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        level[find(s)] = std::max(level[find(s)], want[s]);
+    }
+
+    std::vector<uint8_t> levels(LLAMA_MAX_SEQ, 0);
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        const int32_t l = level[find(s)];
+        if (l < 0) {
+            continue;
+        }
+
+        levels[s] = (uint8_t) l;
+
+        if (cur[s] >= 0 && cur[s] != l) {
+            LLAMA_LOG_INFO("%s: seq %u moves to %s at position %d (threshold %d)\n", __func__, s,
+                    l ? "YaRN" : "the plain RoPE", std::max(balloc->seq_pos_max(s), memory->seq_pos_max(s)), thr);
+
+            memory->seq_rope_level_set(s, l);
+        }
+    }
+
+    balloc->set_seq_rope_levels(levels);
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1933,7 +2042,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
+    if (cparams.rope_elastic) {
+        rope_elastic_prepare(n_seq_max);
+    }
+
+    // handle any pending shifts/copies (and rope level moves)
     memory_update(false);
 
     llama_memory_context_ptr mctx;
@@ -4014,6 +4127,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_fast              =*/ -1.0f,
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
+        /*.yarn_elastic_thr            =*/ -1,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,

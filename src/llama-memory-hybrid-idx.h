@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid.h"
 
 #include <array>
+#include <bitset>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -67,6 +68,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // elastic YaRN: the attention cache moves its keys, the pooled indexer keys of a moved sequence are rebuilt
+    void seq_rope_level_set(llama_seq_id seq_id, int32_t level) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -106,6 +110,7 @@ public:
 
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
+    void mem_idx_stale_clear(llama_seq_id seq_id) { mem_idx_stale[seq_id] = POS_CLEAN; }
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -230,6 +235,10 @@ private:
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
 
-    // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
+    // Positions each sequence must re-pool from, cleared only after the ubatch that re-pools it succeeds:
+    // the first one, or with elastic YaRN the first one of the sequence's rope level
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
+
+    // the sequences the current ubatch re-pools
+    std::bitset<LLAMA_MAX_SEQ> stale_used;
 };

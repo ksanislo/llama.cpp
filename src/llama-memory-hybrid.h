@@ -71,6 +71,14 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // elastic YaRN: only the attention cache holds roped keys
+
+    bool rope_level_enable() override;
+
+    int32_t                   seq_rope_level    (llama_seq_id seq_id) const override;
+    std::vector<llama_seq_id> seq_rope_group    (llama_seq_id seq_id) const override;
+    void                      seq_rope_level_set(llama_seq_id seq_id, int32_t level) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

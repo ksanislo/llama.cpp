@@ -2343,12 +2343,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
     add_opt(common_arg(
-        {"--rope-scaling"}, "{none,linear,yarn}",
-        "RoPE frequency scaling method, defaults to linear unless specified by the model",
+        {"--rope-scaling"}, "{none,linear,yarn,yarn-elastic}",
+        "RoPE frequency scaling method, defaults to linear unless specified by the model\n"
+        "yarn-elastic: YaRN per sequence, each one ropes plain until it passes the YaRN original context,\n"
+        "then its cache is re-rotated once and it continues on YaRN (supported models only, e.g. qwen4exp)",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "none") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE; }
             else if (value == "linear") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR; }
             else if (value == "yarn") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN; }
+            else if (value == "yarn-elastic") {
+                params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+                params.yarn_elastic_thr  = std::max(params.yarn_elastic_thr, 0);
+            }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_ROPE_SCALING_TYPE"));
@@ -2380,6 +2386,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.yarn_orig_ctx = value;
         }
     ).set_env("LLAMA_ARG_YARN_ORIG_CTX"));
+    add_opt(common_arg(
+        {"--yarn-elastic-thr"}, "N",
+        "elastic YaRN: the position a sequence moves to YaRN at (default: 0 = the YaRN original context size),\n"
+        "implies --rope-scaling yarn-elastic",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("must be >= 0");
+            }
+            params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+            params.yarn_elastic_thr  = value;
+        }
+    ).set_env("LLAMA_ARG_YARN_ELASTIC_THR"));
     add_opt(common_arg(
         {"--yarn-ext-factor"}, "N",
         string_format("YaRN: extrapolation mix factor (default: %.2f, 0.0 = full interpolation)", (double)params.yarn_ext_factor),
