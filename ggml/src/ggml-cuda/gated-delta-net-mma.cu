@@ -3,19 +3,39 @@
 
 #include <climits>
 #include <mutex>
+#include <type_traits>
 
 namespace ggml_cuda_gated_delta_net_mma {
 constexpr int D = 128;
 using bf16      = nv_bfloat16;
 
-template <int R, int C> struct matrix {
-    bf16 hi[R * C], lo[R * C];
+// Operand element: BF16 on Ampere+/RDNA3, FP16 on Turing (no BF16 MMA there).
+template <typename T> struct elem;
+template <> struct elem<bf16> {
+    using T2 = nv_bfloat162;
+    static __device__ __forceinline__ bf16   from(float x) { return __float2bfloat16(x); }
+    static __device__ __forceinline__ float  to(bf16 x) { return __bfloat162float(x); }
+    static __device__ __forceinline__ T2     from2(float2 x) { return __float22bfloat162_rn(x); }
+    static __device__ __forceinline__ float2 to2(T2 x) { return __bfloat1622float2(x); }
+};
+template <> struct elem<half> {
+    using T2 = half2;
+    static __device__ __forceinline__ half   from(float x) { return __float2half_rn(x); }
+    static __device__ __forceinline__ float  to(half x) { return __half2float(x); }
+    static __device__ __forceinline__ T2     from2(float2 x) { return __float22half2_rn(x); }
+    static __device__ __forceinline__ float2 to2(T2 x) { return __half22float2(x); }
+};
+
+template <typename T, int R, int C> struct matrix {
+    using E  = elem<T>;
+    using T2 = typename E::T2;
+    T hi[R * C], lo[R * C];
 
     static __device__ __forceinline__ int index(int r, int c) {
 #ifdef GGML_USE_HIP
         return r * C + c;
 #else
-        return 2 * ggml_cuda_mma::swizzle<C / 2, nv_bfloat162>(r * (C / 2) + c / 2, r) + c % 2;
+        return 2 * ggml_cuda_mma::swizzle<C / 2, T2>(r * (C / 2) + c / 2, r) + c % 2;
 #endif // GGML_USE_HIP
     }
 
@@ -24,31 +44,30 @@ template <int R, int C> struct matrix {
         store(r, c, x.x);
         store(r, c + 1, x.y);
 #else
-        const int    i                            = index(r, c);
-        const auto   h                            = __float22bfloat162_rn(x);
-        const float2 rounded                      = __bfloat1622float2(h);
-        *reinterpret_cast<nv_bfloat162 *>(hi + i) = h;
-        *reinterpret_cast<nv_bfloat162 *>(lo + i) =
-            __float22bfloat162_rn(make_float2(x.x - rounded.x, x.y - rounded.y));
+        const int    i                  = index(r, c);
+        const T2     h                  = E::from2(x);
+        const float2 rounded            = E::to2(h);
+        *reinterpret_cast<T2 *>(hi + i) = h;
+        *reinterpret_cast<T2 *>(lo + i) = E::from2(make_float2(x.x - rounded.x, x.y - rounded.y));
 #endif // GGML_USE_MUSA
     }
 
     __device__ __forceinline__ void store(int r, int c, float x) {
-        const int  i = index(r, c);
-        const bf16 h = __float2bfloat16(x);
-        hi[i]        = h;
-        lo[i]        = __float2bfloat16(x - __bfloat162float(h));
+        const int i = index(r, c);
+        const T   h = E::from(x);
+        hi[i]       = h;
+        lo[i]       = E::from(x - E::to(h));
     }
 };
 
-template <int C, int V> struct alignas(128) shared {
-    matrix<C, D> q, k;
-    matrix<C, C> p, inverse;
-    matrix<C, V> delta;
+template <typename T, int C, int V> struct alignas(128) shared {
+    matrix<T, C, D> q, k;
+    matrix<T, C, C> p, inverse;
+    matrix<T, C, V> delta;
 
     union {
-        matrix<D, V> state;
-        matrix<C, V> solved;
+        matrix<T, D, V> state;
+        matrix<T, C, V> solved;
     } scratch;
 
     float lower[C * C], prefix[C], beta[C];
@@ -56,32 +75,45 @@ template <int C, int V> struct alignas(128) shared {
     static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
 };
 
+// The operand type a device build implements: BF16 for sm_80+/RDNA3, FP16 for Turing only.
+template <typename T> static constexpr __device__ bool compiled() {
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+    return std::is_same_v<T, bf16>;
+#elif defined(TURING_MMA_AVAILABLE)
+    return std::is_same_v<T, half>;
+#else
+    return false;
+#endif
+}
+
+#if defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#define GGML_CUDA_GDN_MMA_DEVICE
 using namespace ggml_cuda_mma;
 #ifdef GGML_USE_HIP
-using acc    = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
-using a_tile = tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED>;
-using b_tile = a_tile;
+using acc = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
+template <typename T> using a_tile = tile<16, 8, typename elem<T>::T2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+template <typename T> using b_tile = a_tile<T>;
 #else
-using acc    = tile<16, 8, float>;
-using a_tile = tile<16, 8, nv_bfloat162>;
-using b_tile = tile<8, 8, nv_bfloat162>;
+using acc = tile<16, 8, float>;
+template <typename T> using a_tile = tile<16, 8, typename elem<T>::T2>;
+template <typename T> using b_tile = tile<8, 8, typename elem<T>::T2>;
 #endif // GGML_USE_HIP
 
-template <class tile_t, bool TRANS, int R, int C>
-__device__ __forceinline__ tile_t load(const matrix<R, C> & m, int row, int col, bool low) {
-    tile_t       t;
-    const bf16 * data = low ? m.lo : m.hi;
+template <class tile_t, bool TRANS, typename T, int R, int C>
+__device__ __forceinline__ tile_t load(const matrix<T, R, C> & m, int row, int col, bool low) {
+    using E = elem<T>;
+    tile_t    t;
+    const T * data = low ? m.lo : m.hi;
 #ifdef GGML_USE_HIP
 #pragma unroll
     for (int i = 0; i < tile_t::ne; ++i) {
         const int  r = row + tile_t::get_i(i), c = col + 2 * tile_t::get_j(i);
-        const bf16 x = data[TRANS ? m.index(c, r) : m.index(r, c)];
-        const bf16 y = data[TRANS ? m.index(c + 1, r) : m.index(r, c + 1)];
-        t.x[i]       = __float22bfloat162_rn(make_float2(__bfloat162float(x), __bfloat162float(y)));
+        const T   x = data[TRANS ? m.index(c, r) : m.index(r, c)];
+        const T   y = data[TRANS ? m.index(c + 1, r) : m.index(r, c + 1)];
+        t.x[i]      = E::from2(make_float2(E::to(x), E::to(y)));
     }
 #else
-    const auto * packed = reinterpret_cast<const nv_bfloat162 *>(data);
+    const auto * packed = reinterpret_cast<const typename E::T2 *>(data);
     if constexpr (TRANS) {
         load_ldmatrix_trans_swizzled<C / 2>(t, packed, col * (C / 2) + row / 2);
     } else {
@@ -91,22 +123,24 @@ __device__ __forceinline__ tile_t load(const matrix<R, C> & m, int row, int col,
     return t;
 }
 
-// B is addressed as B-transpose. Preserve both BF16 first-order residual terms.
-template <int K, bool TA = false, bool TB = false, int AR, int AC, int BR, int BC>
-__device__ __forceinline__ void product(acc & c, const matrix<AR, AC> & a, const matrix<BR, BC> & b, int row, int col) {
+// B is addressed as B-transpose. Preserve both first-order residual terms.
+template <int K, bool TA = false, bool TB = false, typename T, int AR, int AC, int BR, int BC>
+__device__ __forceinline__ void product(acc & c, const matrix<T, AR, AC> & a, const matrix<T, BR, BC> & b, int row,
+                                        int col) {
 #pragma unroll
     for (int k = 0; k < K; k += 16) {
-        const auto ah = load<a_tile, TA>(a, row, k, false);
-        const auto al = load<a_tile, TA>(a, row, k, true);
-        const auto bh = load<b_tile, TB>(b, col, k, false);
-        const auto bl = load<b_tile, TB>(b, col, k, true);
+        const auto ah = load<a_tile<T>, TA>(a, row, k, false);
+        const auto al = load<a_tile<T>, TA>(a, row, k, true);
+        const auto bh = load<b_tile<T>, TB>(b, col, k, false);
+        const auto bl = load<b_tile<T>, TB>(b, col, k, true);
         mma(c, al, bh);
         mma(c, ah, bl);
         mma(c, ah, bh);
     }
 }
 
-template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, const acc & x, int r, int c) {
+template <typename T, int R, int C>
+__device__ __forceinline__ void store(matrix<T, R, C> & m, const acc & x, int r, int c) {
 #pragma unroll
 #ifdef GGML_USE_HIP
     for (int i = 0; i < acc::ne; ++i) {
@@ -118,13 +152,11 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
     }
 #endif // GGML_USE_HIP
 }
-#endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 
 // Each block owns V independent value columns and advances by C tokens.
-// Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
-template <int C, int V, int BLOCKS = 1>
-static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
-#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+// Keep recurrent state, gates and decays in FP32; pack high/residual 16-bit operands inside the block.
+template <typename T, int C, int V>
+static __device__ __forceinline__ void gdn_single_body(const ggml_cuda_gdn_mma_args & a) {
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
     constexpr int WARPS = 8;
 #ifdef GGML_USE_HIP
@@ -134,7 +166,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #endif // GGML_USE_HIP
     static_assert(C >= 16 && (C & (C - 1)) == 0 && V % N == 0 && D % V == 0, "invalid GDN tile");
     extern __shared__ __align__(128) unsigned char bytes[];
-    auto &                                         s    = *reinterpret_cast<shared<C, V> *>(bytes);
+    auto &                                         s    = *reinterpret_cast<shared<T, C, V> *>(bytes);
     const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
     const int                                      slice = blockIdx.x % (D / V);
     const int                                      h     = (blockIdx.x / (D / V)) % a.H;
@@ -333,7 +365,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         // S = decay(chunk) * S + K^T * (solved * decay to chunk end)
         for (int i = tid; i < C * V; i += 256) {
             const int   t = i / V, v = i % V, j = s.scratch.solved.index(t, v);
-            const float x = __bfloat162float(s.scratch.solved.hi[j]) + __bfloat162float(s.scratch.solved.lo[j]);
+            const float x = elem<T>::to(s.scratch.solved.hi[j]) + elem<T>::to(s.scratch.solved.lo[j]);
             s.delta.store(t, v, x * expf(s.prefix[valid - 1] - s.prefix[t]));
         }
         __syncthreads();
@@ -357,22 +389,34 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             a.state_out[soff + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)] = state[j].x[i];
         }
     }
+}
+#endif // defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+
+template <typename T, int C, int V, int BLOCKS = 1>
+static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
+#ifdef GGML_CUDA_GDN_MMA_DEVICE
+    if constexpr (compiled<T>()) {
+        gdn_single_body<T, C, V>(a);
+    } else {
+        GGML_UNUSED_VARS(a);
+        NO_DEVICE_CODE;
+    }
 #else
     GGML_UNUSED_VARS(a);
     NO_DEVICE_CODE;
-#endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#endif // GGML_CUDA_GDN_MMA_DEVICE
 }
 
-template <int C, int V, int BLOCKS = 1> bool init(int device) {
+template <typename T, int C, int V, int BLOCKS = 1> bool init(int device) {
     static std::once_flag once[GGML_CUDA_MAX_DEVICES];
     static bool           available[GGML_CUDA_MAX_DEVICES] = {};
     std::call_once(once[device], [device] {
         ggml_cuda_set_device(device);
-        if (sizeof(shared<C, V>) > ggml_cuda_info().devices[device].smpbo) {
+        if (sizeof(shared<T, C, V>) > ggml_cuda_info().devices[device].smpbo) {
             return;
         }
-        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V>));
+        const auto status = cudaFuncSetAttribute((const void *) gdn_single<T, C, V, BLOCKS>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<T, C, V>));
         available[device] = status == cudaSuccess;
         if (status != cudaSuccess) {
             (void) cudaGetLastError();
@@ -381,7 +425,7 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
     return available[device];
 }
 
-enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
+enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head, turing_slice64 };
 
 static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
@@ -394,11 +438,16 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
     if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || a.n_tokens < 2048) {
         return gdn_path::ar;
     }
-    return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+    return init<bf16, 16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
 #elif defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(info);
     return gdn_path::ar;
 #else
+    if (info.cc == GGML_CUDA_CC_TURING && turing_mma_available(info.cc)) {
+        // FP16 operands. 64 KiB of shared memory per SM: no whole-head tile and one block per SM,
+        // so half-head slices give fewer waves than 32-wide ones for every eligible H.
+        return init<half, 16, 64>(device) ? gdn_path::turing_slice64 : gdn_path::ar;
+    }
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
     if (!ampere_mma_available(info.cc) ||
         (info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE &&
@@ -409,11 +458,11 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
     if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
         if (a.H * a.n_seqs * 4 <= info.nsm) {
-            return init<16, 32, 1>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
+            return init<bf16, 16, 32, 1>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
         }
-        return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+        return init<bf16, 16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
     }
-    return init<16, 128>(device) ? gdn_path::whole_head : gdn_path::ar;
+    return init<bf16, 16, 128>(device) ? gdn_path::whole_head : gdn_path::ar;
 #endif // GGML_USE_HIP
 }
 }  // namespace
@@ -428,14 +477,16 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
         return false;
     }
 #ifdef GGML_USE_HIP
-    gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+    gdn_single<bf16, 16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<bf16, 16, 64>), stream>>>(a);
 #else
-    if (path == gdn_path::slice32_two_blocks) {
-        gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+    if (path == gdn_path::turing_slice64) {
+        gdn_single<half, 16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<half, 16, 64>), stream>>>(a);
+    } else if (path == gdn_path::slice32_two_blocks) {
+        gdn_single<bf16, 16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<bf16, 16, 32>), stream>>>(a);
     } else if (path == gdn_path::slice32_one_block) {
-        gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+        gdn_single<bf16, 16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<bf16, 16, 32>), stream>>>(a);
     } else {
-        gdn_single<16, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
+        gdn_single<bf16, 16, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<bf16, 16, 128>), stream>>>(a);
     }
 #endif // GGML_USE_HIP
     CUDA_CHECK(cudaGetLastError());
