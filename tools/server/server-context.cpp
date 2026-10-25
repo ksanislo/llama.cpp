@@ -365,8 +365,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool prefer_prefix) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, prefer_prefix);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1866,7 +1866,13 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // a state that needs a checkpoint to be truncated is replaced by an equally long prefix entry
+                const bool prefer_prefix =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                    n_swa > 0;
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens, prefer_prefix)) {
                     ret->prompt_clear();
                 }
 
@@ -2665,6 +2671,60 @@ private:
         }
 
         return true;
+    }
+
+    // whether to keep the state at n, the end of the system prompt, as a prefix entry of the prompt cache
+    bool want_prefix(const server_slot & slot, int32_t n) const {
+        if (!params_base.cache_prefix || !prompt_cache || n <= 0) {
+            return false;
+        }
+
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_stateless()) {
+            return false;
+        }
+
+        // a short system prompt is cheap to process again
+        if (n < (int32_t) llama_n_ubatch(ctx_tgt)) {
+            return false;
+        }
+
+        // the cache is not keyed by the adapters or the media
+        if (!lora_get_enabled_ids(slot.lora).empty()) {
+            return false;
+        }
+
+        const auto & tokens = slot.task->tokens;
+        const auto media = tokens.find_next_media_chunk(0);
+        if (media.first != nullptr && media.second < (size_t) n) {
+            return false;
+        }
+
+        return !prompt_cache->has_prefix(tokens, n);
+    }
+
+    // save the current state of the slot, which holds the first n tokens of its prompt, as a prefix entry
+    void prompt_save_prefix(const server_slot & slot, int32_t n) {
+        server_prompt prefix;
+        prefix.tokens = slot.prompt.tokens.clone();
+        prefix.tokens.keep_first(n);
+
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        auto * cur = prompt_cache->alloc(prefix, size_tgt, size_dft, true);
+        if (cur == nullptr) {
+            return;
+        }
+
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        SLT_INF(slot, "saved the system prompt to the prompt cache (n_tokens = %d, size = %.3f MiB)\n",
+                n, (float) (size_tgt + size_dft) / 1024 / 1024);
+
+        prompt_cache->update();
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -4350,6 +4410,10 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // the end of the system prompt, kept in the prompt cache if it is reached here
+                    const int32_t first_user_pos = spans.first_user_message_pos();
+                    const int32_t n_sys_prompt = slot.prompt.n_tokens() <= first_user_pos && want_prefix(slot, first_user_pos) ? first_user_pos : -1;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4388,6 +4452,11 @@ private:
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        // break at the end of the system prompt, its state is saved before the next batch
+                        if (slot.prompt.n_tokens() == n_sys_prompt) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4475,6 +4544,11 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // same for the prefix entry: the memory holds the system prompt, the current batch is not processed yet
+                    if (n_tokens_start == n_sys_prompt && !has_mtmd) {
+                        prompt_save_prefix(slot, n_sys_prompt);
                     }
                 }
 
