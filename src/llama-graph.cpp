@@ -1715,10 +1715,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * slots) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    // the experts in the MoE cache are selected by their slots
+    // the experts in the MoE cache or a staging slot are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w, slots->ne[1], slots->ne[0]), cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2619,6 +2619,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
+    // or, for a staging map (LLAMA_MOE_ASYNC), it waits for the staged experts and stages the next layer
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
         return nullptr;
