@@ -443,6 +443,9 @@ private:
     bool     worst_case_reserved = false;
     uint32_t n_seqs_worst_case   = 1;
 
+    // with pipeline parallelism, large batches copy the experts in the MoE cache from device memory
+    bool pp_cache_copy = true;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

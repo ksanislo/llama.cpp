@@ -574,6 +574,14 @@ llama_context::llama_context(
             }
         }
 
+        // LLAMA_PIPELINE_PARALLEL=0 turns it off, LLAMA_MOE_CACHE_PP_COPY=0 uploads all the experts of a large batch from the host
+        if (const char * env = getenv("LLAMA_PIPELINE_PARALLEL")) {
+            pipeline_parallel = pipeline_parallel && atoi(env) != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_PP_COPY")) {
+            pp_cache_copy = atoi(env) != 0;
+        }
+
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
@@ -813,7 +821,8 @@ void llama_context::sched_reserve() {
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
-                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism%s\n", __func__,
+                    moe_cache ? " (the MoE cache is allocated first, a smaller --moe-cache-mib leaves room for it)" : "");
                 cparams.pipeline_parallel = false;
                 sched_new(max_nodes, false);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
@@ -2862,7 +2871,27 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
         st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : full_batch && n_ids >= 64*n_expert);
         if (st.upload_all) {
-            return false;
+            // the experts in the MoE cache of this device are still copied from device memory, without reading the ids
+            if (!lctx->moe_cache || !lctx->pp_cache_copy || lctx->moe_cache->get_experts(src) == nullptr) {
+                return false;
+            }
+            int64_t next = 0;
+            for (int64_t e = 0; e < n_expert; ) {
+                const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, n_expert - 1);
+                if (n == 0) {
+                    e++;
+                    continue;
+                }
+                if (next < e) {
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                }
+                e   += n;
+                next = e;
+            }
+            if (next < n_expert) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (n_expert - next)*expert_size);
+            }
+            return true;
         }
     }
 
