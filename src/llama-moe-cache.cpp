@@ -850,13 +850,22 @@ struct llama_moe_cache::impl {
             evict(s);
             c.unlink(s);
         }
+        size_t n_move = 0;
         for (size_t i = 0; i < src.size(); ++i) {
             const int32_t key = c.key_of[src[i]];
+            c.replace(src[i], dst[i]);
+            if (key < 0) {
+                continue; // an empty slot (cache not full yet): the free slot takes its place, nothing to move
+            }
             c.slot_map[key / c.n_expert][key % c.n_expert] = dst[i];
             c.key_of[dst[i]] = key;
             c.key_of[src[i]] = -1;
-            c.replace(src[i], dst[i]);
+            src[n_move] = src[i];
+            dst[n_move] = dst[i];
+            n_move++;
         }
+        src.resize(n_move);
+        dst.resize(n_move);
         for (int32_t s = first; s < g.n_slots; ++s) {
             if (drop[s]) {
                 evict(s);
