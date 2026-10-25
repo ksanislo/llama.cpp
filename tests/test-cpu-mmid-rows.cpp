@@ -160,7 +160,7 @@ static bool test_case(ggml_backend_t backend, ggml_type type, int64_t K, int64_t
 }
 
 int main(void) {
-    // the tiled path is not what is tested here (it takes >= 8 rows when enabled)
+    // the tiled path is not what is tested here (on AVX1 it takes over at 12+ rows for Q4_K, 16+ otherwise)
 #if defined(_WIN32)
     _putenv("GGML_CPU_TILED_MM=0");
 #else
@@ -188,11 +188,13 @@ int main(void) {
             // 1..7 rows per expert, src0 rows not a multiple of the 16-row block
             n_fail += !test_case(backend, type, 512, 70, 1, { 1, 2, 3, 4, 5, 6, 7 });
             n_fail += !test_case(backend, type, 768, 33, 2, { 2, 3, 7, 5, 4, 6, 1, 2 });
+            // 8..11 rows (a group of 8 + a rest) also take the multi-row dots, before the tiled path
+            n_fail += !test_case(backend, type, 512, 21, 1, { 8, 9, 11, 10, 3 });
         }
-        // Q8_0 / Q5_1 have no tiled path: their multi-row dots also run at >= 8 rows; an odd count of
+        // Q8_0 / Q5_1 have no tiled path: their multi-row dots run at any row count; an odd count of
         // 32-value blocks covers the q8_0 tail
-        n_fail += !test_case(backend, GGML_TYPE_Q8_0, 544, 40, 1, { 9, 13, 3 });
-        n_fail += !test_case(backend, GGML_TYPE_Q5_1, 544, 40, 2, { 9, 13, 21, 3 });
+        n_fail += !test_case(backend, GGML_TYPE_Q8_0, 544, 40, 1, { 9, 13, 3, 23 });
+        n_fail += !test_case(backend, GGML_TYPE_Q5_1, 544, 40, 2, { 9, 13, 21, 3, 30 });
     }
 
     ggml_backend_free(backend);

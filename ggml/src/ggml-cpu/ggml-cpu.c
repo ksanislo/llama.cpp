@@ -1724,8 +1724,15 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // tiled takes over if profitable for this expert (see tiled.h); on AVX1 the multi-row dots
+        // are faster for fewer rows
+#if defined(GGML_VEC_DOT_MR_MAX)
+        const bool mr_rows = !params->use_ref && ggml_cpu_get_vec_dot_mr(src0->type) != NULL &&
+                             cne1 < ggml_cpu_vec_dot_mr_tiled_min(src0->type);
+#else
+        const bool mr_rows = false;
+#endif
+        if (!mr_rows && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 

@@ -104,9 +104,10 @@ void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)) && defined(__AVX__) && !defined(__AVX2__)
 // AVX1 (no AVX2) multi-row dot: one src0 row vx against nr (1..GGML_VEC_DOT_MR_MAX) vec_dot_type rows vy[r],
 // s[r*bs] = vec_dot(vx, vy[r]) bit for bit; each weight block is decoded once for all nr rows
-#define GGML_VEC_DOT_MR_MAX 4
+#define GGML_VEC_DOT_MR_MAX 8
 typedef void (*ggml_vec_dot_mr_t)(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * const * vy, int nr);
 ggml_vec_dot_mr_t ggml_cpu_get_vec_dot_mr(enum ggml_type type); // NULL when the type has none
+int ggml_cpu_vec_dot_mr_tiled_min(enum ggml_type type);          // experts with fewer rows skip the tiled path
 #endif
 
 #ifdef __cplusplus
