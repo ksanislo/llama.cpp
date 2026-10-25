@@ -3932,7 +3932,38 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // with --batch-beside, the prompt tokens of a batch that carries generating slots are limited to
+            // n_batch_beside, so that a long prompt does not stall the other conversations for a full n_batch step
+            const int32_t n_beside = params_base.n_batch_beside;
+            const int32_t n_batch_pp = n_beside > 0 && batch.size() > 0 ? std::min(n_batch, batch.size() + n_beside) : n_batch;
+
+            std::vector<server_slot *> slots_pp;
+            slots_pp.reserve(slots.size());
+            for (auto & slot : slots) {
+                slots_pp.push_back(&slot);
+            }
+
+            // with --batch-beside, read the prompts with the fewest remaining tokens first,
+            // so a short prompt is admitted in the next batch instead of waiting behind a long one
+            if (n_beside > 0) {
+                std::vector<std::pair<int32_t, server_slot *>> order;
+                order.reserve(slots.size());
+                for (auto * slot : slots_pp) {
+                    int32_t n_left = 0;
+                    if (slot->state == SLOT_STATE_PROCESSING_PROMPT) {
+                        n_left = slot->task->n_tokens() - slot->prompt.n_tokens();
+                    } else if (slot->state == SLOT_STATE_STARTED && slot->task) {
+                        n_left = slot->task->n_tokens() - (int32_t) slot->prompt.tokens.get_common_prefix(slot->task->tokens);
+                    }
+                    order.emplace_back(n_left, slot);
+                }
+                std::stable_sort(order.begin(), order.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+                for (size_t i = 0; i < order.size(); i++) {
+                    slots_pp[i] = order[i].second;
+                }
+            }
+
+            iterate(slots_pp, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -3960,6 +3991,12 @@ private:
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
+
+                    // a prompt that must be read in one batch, or a decision, is not limited by --batch-beside
+                    const int32_t n_batch_cur = slot.can_split() && slot.task->type != SERVER_TASK_TYPE_DECISION ? n_batch_pp : n_batch;
+                    if (batch.size() >= n_batch_cur) {
+                        return; // no room left for this prompt in the current batch
+                    }
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -4417,7 +4454,7 @@ private:
                     const int32_t n_sys_prompt = slot.prompt.n_tokens() <= first_user_pos && want_prefix(slot, first_user_pos) ? first_user_pos : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_cur) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
