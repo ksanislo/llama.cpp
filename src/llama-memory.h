@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -118,6 +119,23 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    //
+    // elastic YaRN (llama_cparams::rope_elastic): every cached cell remembers the rope level its key was
+    // rotated with, and a sequence can move its cached keys to another level
+    //
+
+    // track the rope levels; false if this memory cannot re-rotate its cached keys
+    virtual bool rope_level_enable() { return false; }
+
+    // the rope level of the cells of seq_id, -1 if it has none
+    virtual int32_t seq_rope_level(llama_seq_id /*seq_id*/) const { return -1; }
+
+    // seq_id plus every sequence sharing a cell with it, directly or through others: they can only move together
+    virtual std::vector<llama_seq_id> seq_rope_group(llama_seq_id seq_id) const { return { seq_id }; }
+
+    // move the cached keys of seq_id to level, done by the next init_update(); pass a whole seq_rope_group()
+    virtual void seq_rope_level_set(llama_seq_id /*seq_id*/, int32_t /*level*/) {}
 
     //
     // state write/read

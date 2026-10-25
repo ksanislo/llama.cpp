@@ -1293,6 +1293,18 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+// elastic YaRN (llama_cparams::rope_elastic): add an arch once its graph takes the rope params from
+// llm_graph_context and every roped key it caches is moved by llama_kv_cache::build_graph_rope_level
+// (or, like the qwen4exp pooled indexer keys, rebuilt after a move)
+bool llm_arch_supports_rope_elastic(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // these models pick weights, routing or input meaning per ubatch based on token vs embd input
 bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     switch (arch) {

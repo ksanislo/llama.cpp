@@ -906,4 +906,6 @@ bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
+// the graph ropes with llm_graph_context's rope members and every cache holding roped keys can re-rotate them
+bool llm_arch_supports_rope_elastic(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);

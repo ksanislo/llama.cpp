@@ -31,6 +31,17 @@ struct llama_kv_cell_ext {
     }
 };
 
+// elastic YaRN: how the cached key of a cell was rotated, see llama_cparams::rope_levels
+// the 4th M-RoPE position is kept here because llama_kv_cell_ext is part of the session format
+struct llama_kv_cell_rope {
+    llama_pos e     = 0; // 4th M-RoPE position (0 for text)
+    uint8_t   level = 0; // rope level of the cached key
+
+    void reset() {
+        *this = llama_kv_cell_rope{};
+    }
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -41,6 +52,7 @@ public:
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
+            rope[i].reset();
             shift[i] =  0;
             seq[i].reset();
         }
@@ -69,6 +81,7 @@ public:
     void resize(uint32_t n) {
         pos.resize(n);
         ext.resize(n);
+        rope.resize(n);
         shift.resize(n);
         seq.resize(n);
 
@@ -133,9 +146,10 @@ public:
         for (uint32_t j = 0; j < n; ++j) {
             const auto idx = i + j;
 
-            res.pos[j] = pos[idx];
-            res.ext[j] = ext[idx];
-            res.seq[j] = seq[idx];
+            res.pos[j]  = pos[idx];
+            res.ext[j]  = ext[idx];
+            res.rope[j] = rope[idx];
+            res.seq[j]  = seq[idx];
 
             assert(shift[idx] == 0);
         }
@@ -152,9 +166,10 @@ public:
         for (uint32_t j = 0; j < idxs.size(); ++j) {
             const auto idx = idxs[j];
 
-            res.pos[j] = pos[idx];
-            res.ext[j] = ext[idx];
-            res.seq[j] = seq[idx];
+            res.pos[j]  = pos[idx];
+            res.ext[j]  = ext[idx];
+            res.rope[j] = rope[idx];
+            res.seq[j]  = seq[idx];
 
             assert(shift[idx] == 0);
         }
@@ -181,9 +196,10 @@ public:
                 seq_pos_rm(i + j);
             }
 
-            pos[idx] = other.pos[j];
-            ext[idx] = other.ext[j];
-            seq[idx] = other.seq[j];
+            pos[idx]  = other.pos[j];
+            ext[idx]  = other.ext[j];
+            rope[idx] = other.rope[j];
+            seq[idx]  = other.seq[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -212,9 +228,10 @@ public:
                 seq_pos_rm(idx);
             }
 
-            pos[idx] = other.pos[j];
-            ext[idx] = other.ext[j];
-            seq[idx] = other.seq[j];
+            pos[idx]  = other.pos[j];
+            ext[idx]  = other.ext[j];
+            rope[idx] = other.rope[j];
+            seq[idx]  = other.seq[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -234,6 +251,7 @@ public:
 
         pos[i] = -1;
         ext[i].reset();
+        rope[i].reset();
         shift[i] = 0;
 
         used.erase(i);
@@ -253,6 +271,7 @@ public:
         if (seq[i].none()) {
             pos[i] = -1;
             ext[i].reset();
+            rope[i].reset();
             shift[i] = 0;
 
             used.erase(i);
@@ -283,6 +302,7 @@ public:
 
             pos[i] = -1;
             ext[i].reset();
+            rope[i].reset();
             shift[i] = 0;
 
             used.erase(i);
@@ -442,6 +462,16 @@ public:
         ext[i] = p;
     }
 
+    const llama_kv_cell_rope & rope_get(uint32_t i) const {
+        assert(i < rope.size());
+        return rope[i];
+    }
+
+    void rope_set(uint32_t i, llama_kv_cell_rope r) {
+        assert(i < rope.size());
+        rope[i] = r;
+    }
+
     // pos[i] = pos[i] + d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
@@ -500,6 +530,9 @@ private:
 
     // stores extra info per cell
     std::vector<llama_kv_cell_ext> ext;
+
+    // elastic YaRN state per cell, all zero unless llama_kv_cache::rope_level_enable()
+    std::vector<llama_kv_cell_rope> rope;
 
     // this array accumulates any applied shifts to the pos array since the last reset_shift() call
     // this is used to queue multiple updates to the pos array, which in the end can be applied in one go:

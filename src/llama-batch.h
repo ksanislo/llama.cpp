@@ -43,6 +43,7 @@ struct llama_ubatch {
     uint32_t n_seqs;       // sequence sets in the ubatch
     uint32_t n_seqs_unq;   // unique sequence ids in the ubatch
     uint32_t n_pos;        // number of position inputs for each token/embedding
+    uint32_t rope_level;   // elastic YaRN: the rope level of every sequence in the ubatch, see llama_cparams::rope_levels
 
     // seq_id_unq: unique sequence ids in the ubatch
     // seq_idx:    indices of the unique sequence ids in the ubatch in [0, n_seqs_unq)
@@ -174,6 +175,10 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const;
     llama_pos seq_pos_max(llama_seq_id seq_id) const;
 
+    // elastic YaRN: the rope level of each sequence, the splits keep sequences of different levels apart
+    // levels[s] for every sequence in the batch, cleared by init(), so without it every ubatch is level 0
+    void set_seq_rope_levels(const std::vector<uint8_t> & levels);
+
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
@@ -232,6 +237,12 @@ private:
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
     std::vector<int32_t>        decision_order; // empty if no entry has one
+    std::vector<uint8_t>        seq_rope_lvl;   // [LLAMA_MAX_SEQ] or empty, see set_seq_rope_levels()
+
+    // rope level of batch token i, all the sequences of a token share it
+    uint32_t tok_rope_level(int32_t i) const {
+        return seq_rope_lvl.empty() ? 0 : seq_rope_lvl[batch.seq_id[i][0]];
+    }
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

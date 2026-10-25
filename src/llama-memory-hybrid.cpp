@@ -135,6 +135,22 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::rope_level_enable() {
+    return mem_attn->rope_level_enable();
+}
+
+int32_t llama_memory_hybrid::seq_rope_level(llama_seq_id seq_id) const {
+    return mem_attn->seq_rope_level(seq_id);
+}
+
+std::vector<llama_seq_id> llama_memory_hybrid::seq_rope_group(llama_seq_id seq_id) const {
+    return mem_attn->seq_rope_group(seq_id);
+}
+
+void llama_memory_hybrid::seq_rope_level_set(llama_seq_id seq_id, int32_t level) {
+    mem_attn->seq_rope_level_set(seq_id, level);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

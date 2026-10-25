@@ -241,6 +241,18 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     }
 }
 
+void llama_memory_hybrid_idx::seq_rope_level_set(llama_seq_id seq_id, int32_t level) {
+    const int32_t level_old = seq_rope_level(seq_id);
+
+    llama_memory_hybrid::seq_rope_level_set(seq_id, level);
+
+    // a pooled key is rotated at pooling time, so re-pool the sequence: the first ubatch of its new level
+    // does it from the raw keys, which carry no rotation (see kpool_build_state)
+    if (mem_idx && level_old >= 0 && level_old != level) {
+        mem_idx_stale_set(seq_id, 0);
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = llama_memory_hybrid::memory_breakdown();
 
@@ -524,8 +536,17 @@ llama_memory_hybrid_idx_context::~llama_memory_hybrid_idx_context() = default;
 
 bool llama_memory_hybrid_idx_context::next() {
     // Clear only after a successful ubatch.
-    if (i_cur == 0 && mem != nullptr) {
-        mem->mem_idx_stale_clear();
+    if (mem != nullptr) {
+        if (kpool_track()) {
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (stale_used.test(s)) {
+                    mem->mem_idx_stale_clear(s);
+                }
+            }
+            stale_used.reset();
+        } else if (i_cur == 0) {
+            mem->mem_idx_stale_clear();
+        }
     }
 
     if (ctx_idx) {
@@ -664,11 +685,20 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         ip += (uint32_t) sq.pools.size();
 
         // A sequence edit invalidates only pools ending after the edited position.
-        const llama_pos stale_from = i_cur == 0 ?
-            mem_idx_stale_batch[s] : llama_memory_hybrid_idx::POS_CLEAN;
+        const llama_pos stale_from = mem_idx_stale_batch[s];
         if (stale_from == llama_memory_hybrid_idx::POS_CLEAN) {
             continue;
         }
+
+        // the graph rotates the pooled keys with the ubatch's rope level, so a sequence of another
+        // level (elastic YaRN) re-pools in a ubatch of its own level, here or in a later batch
+        const int32_t level = mem->get_mem_attn()->seq_rope_level(s);
+        if (level >= 0 && (uint32_t) level != ubatch.rope_level) {
+            continue;
+        }
+
+        mem_idx_stale_batch[s] = llama_memory_hybrid_idx::POS_CLEAN;
+        stale_used.set(s);
 
         auto first = std::lower_bound(sq.pools.begin(), sq.pools.end(), stale_from,
                 [&](uint32_t j, llama_pos p) { return sq.cells[j + kpool - 1].first < p; });
