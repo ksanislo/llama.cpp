@@ -616,12 +616,6 @@ llama_context::llama_context(
             pp_cache_copy = atoi(env) != 0;
         }
 
-        // the CPU part of the MoE cache copies its result from host memory that the next graph in flight may overwrite
-        if (pipeline_parallel && cparams.moe_cache_size > 0 && cparams.moe_cache_cpu_share > 0.0f) {
-            LLAMA_LOG_WARN("%s: pipeline parallelism disabled: --moe-cache-cpu-share needs one graph in flight\n", __func__);
-            pipeline_parallel = false;
-        }
-
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
@@ -2961,7 +2955,7 @@ ggml_status llama_context::graph_compute(
     copy_experts.prev_in_flight = copy_experts.in_flight;
     copy_experts.in_flight      = true;
     if (moe_cache) {
-        moe_cache->begin();
+        moe_cache->begin(copy_experts.prev_in_flight);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

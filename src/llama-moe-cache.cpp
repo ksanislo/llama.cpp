@@ -330,6 +330,11 @@ struct llama_moe_cache::impl {
         int32_t lender = -1;
         int32_t borrow_first = 0;
         bool borrowed = false;                        // the cache slots under the staging slots are out of the SLRU
+
+        // CPU part results while an earlier graph may still run: copied to the device from here, not from the CPU compute buffer
+        ggml_backend_buffer_ptr buf_out;
+        bool out_idle   = true;  // no copy from buf_out is queued (the device was synchronized after the last one)
+        bool out_direct = false; // a copy from the CPU compute buffer may be queued
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -432,6 +437,9 @@ struct llama_moe_cache::impl {
     // the device data read with the selected experts of the last slot lookup, in host memory that the device can copy to asynchronously
     std::vector<stash_entry> stash;
     ggml_backend_buffer_ptr stash_buf;
+
+    // the graph may start before the previous one is done (pipeline parallelism, or ubatches without a synchronization)
+    bool out_buffered = false;
 
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
@@ -1167,19 +1175,57 @@ struct llama_moe_cache::impl {
         }
     }
 
+    device * device_of(ggml_backend_t backend) {
+        const auto it = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
+        return it != devices.end() ? &*it : nullptr;
+    }
+
     // the result of a CPU part, the device copies it after the work queued on it, without waiting on the host
-    // the next CPU part runs after the next slot lookup, which synchronizes the device, so the result is not overwritten before it is copied
-    bool copy_cpu_output(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) const {
+    // in one graph, the next CPU part runs after the next slot lookup, which synchronizes its device (and through the activations,
+    // the earlier devices), so the result is not overwritten in the CPU compute buffer before it is copied
+    // a later graph in flight would not wait for the other devices: then the result goes through buf_out of the device, which is
+    // only written again after the next slot lookup of the same device has synchronized it
+    bool copy_cpu_output(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
         if (cpu_outputs.count(src) == 0 || src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) ||
             dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
             return false;
         }
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        device * d = device_of(backend);
+        if (d == nullptr) {
+            return false; // the scheduler copies it synchronously
+        }
+        const size_t size = ggml_nbytes(src);
+        if (!out_buffered) {
+            ggml_backend_tensor_set_async(backend, dst, src->data, 0, size);
+            d->out_direct = true;
+            return true;
+        }
+        if (!d->out_idle) {
+            ggml_backend_synchronize(backend);
+        }
+        if (!d->buf_out || ggml_backend_buffer_get_size(d->buf_out.get()) < size) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+            d->buf_out.reset(ggml_backend_buft_alloc_buffer(buft ? buft : ggml_backend_cpu_buffer_type(), size));
+            GGML_ASSERT(d->buf_out);
+        }
+        void * data = ggml_backend_buffer_get_base(d->buf_out.get());
+        memcpy(data, src->data, size);
+        ggml_backend_tensor_set_async(backend, dst, data, 0, size);
+        d->out_idle = false;
         return true;
     }
 
-    void begin() {
+    void begin(bool prev_in_flight) {
         stash.clear();
+        // a direct copy of the previous graph reads the CPU compute buffer, which this graph's CPU parts overwrite
+        out_buffered = prev_in_flight;
+        for (device & d : devices) {
+            if (d.out_direct && prev_in_flight) {
+                ggml_backend_synchronize(d.backend);
+                d.out_idle = true;
+            }
+            d.out_direct = false;
+        }
     }
 
     // the get_rows that looks up the slots of the selected experts
@@ -1397,6 +1443,7 @@ struct llama_moe_cache::impl {
         const cpu_part * part = read_cpu_inputs(backend, graph, lookup, l);
         const bool has_cpu = part != nullptr;
         read_ids(backend, graph, lookup, il);
+        d.out_idle = true; // read_ids synchronized the device
 
         // the fills below may replace experts that the copy stream still reads
         if (d.last_slot >= 0) {
@@ -1534,8 +1581,8 @@ void llama_moe_cache::set_cpu_part(const ggml_tensor * lookup, int32_t n_used, s
     pimpl->set_cpu_part(lookup, n_used, std::move(inputs), output);
 }
 
-void llama_moe_cache::begin() {
-    pimpl->begin();
+void llama_moe_cache::begin(bool prev_in_flight) {
+    pimpl->begin(prev_in_flight);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
