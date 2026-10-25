@@ -351,6 +351,7 @@ endif()
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp  LABEL "main behavior"  LINK ggml)
+    llama_build_and_test(test-sched-submit.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-quantize-fns.cpp  LABEL "main behavior"  LINK ggml)
     llama_build_and_test(test-quantize-perf.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-rope.cpp  LABEL "main behavior backend"  LINK ggml)

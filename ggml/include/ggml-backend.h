@@ -378,6 +378,20 @@ extern "C" {
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
+    // Submit threads: one host thread per backend queues that backend's splits; graphs are prepared on the calling thread
+    // into the pipeline copies. Off waits until the threads have queued everything. false if not possible (eval callback)
+    GGML_API bool                 ggml_backend_sched_set_submit_threads(ggml_backend_sched_t sched, bool enable);
+    // hand the prepared graph to the threads (graph_compute_async only prepares it while the threads are on, so that
+    // ggml_backend_sched_tensor_get_async can still add reads of its outputs); no-op if nothing is prepared
+    GGML_API void                 ggml_backend_sched_flush(ggml_backend_sched_t sched);
+    // wait until the copy that the next graph allocates in is no longer used, returns that copy
+    GGML_API int                  ggml_backend_sched_wait_next_copy(ggml_backend_sched_t sched);
+    // the pipeline copy of the graph being computed: on a submit thread its slot, else the current copy
+    GGML_API int                  ggml_backend_sched_get_copy(ggml_backend_sched_t sched);
+    // ggml_backend_tensor_get_async of an output of the last graph: with submit threads queued by the thread of `backend`
+    // after the splits of that graph, else directly
+    GGML_API void                 ggml_backend_sched_tensor_get_async(ggml_backend_sched_t sched, ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
     //
     // Meta backend
     //

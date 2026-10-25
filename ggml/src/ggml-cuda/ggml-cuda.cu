@@ -2935,6 +2935,40 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
+// for the scheduler's submit threads: the copy queued on the source stream only; the thread of the destination orders its
+// stream after it with an event of its own (the source thread must not queue waits on another thread's stream)
+static bool ggml_backend_cuda_cpy_tensor_src_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst) ||
+        !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
+    ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+    if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx_src->device);
+    const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
+    const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+    if (src_physical == dst_physical) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+    } else {
+#ifdef GGML_CUDA_NO_PEER_COPY
+        return false;
+#else
+        CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+#endif // GGML_CUDA_NO_PEER_COPY
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
@@ -6614,6 +6648,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_gather_blocks_async") == 0) {
         return (void *)ggml_backend_cuda_gather_blocks_async;
+    }
+    if (strcmp(name, "ggml_backend_cpy_tensor_src_async") == 0) {
+        return (void *)ggml_backend_cuda_cpy_tensor_src_async;
     }
 #if defined(GGML_CUDA_VMM_BUFFER)
     if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -599,6 +600,12 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
+    // per device for copy_experts: with submit threads each device's copies are queued by its own thread
+    std::vector<ggml_context_ptr> ctx_views_dev;
+
+    // with submit threads: the paths that change shared state (slot lookups, CPU parts, predictions) run under this lock;
+    // the large-batch copies (cached_expert, copy_experts) only read the slot maps of their own device
+    std::mutex mtx_shared;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
@@ -765,6 +772,9 @@ struct llama_moe_cache::impl {
         }
         ctx_host  = llama_moe_cache_init_ctx(n_tensors_host);
         ctx_views = llama_moe_cache_init_ctx(2);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            ctx_views_dev.push_back(llama_moe_cache_init_ctx(2));
+        }
 
         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
@@ -1786,15 +1796,16 @@ struct llama_moe_cache::impl {
         }
 
         ggml_tensor * bank = g.banks[b.ip];
-        ggml_reset(ctx_views.get());
-        ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], slots[e]*bank->nb[2]);
-        ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
+        ggml_context * ctx_v = ctx_views_dev[g.id].get();
+        ggml_reset(ctx_v);
+        ggml_tensor * src_view = ggml_view_3d(ctx_v, bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], slots[e]*bank->nb[2]);
+        ggml_tensor * dst_view = ggml_view_3d(ctx_v, dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
         ggml_backend_view_init(src_view);
         ggml_backend_view_init(dst_view);
         ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
 
-        stats_copy.hits  += n;
-        stats_copy.bytes += ggml_nbytes(src_view);
+        __atomic_fetch_add(&stats_copy.hits,  (size_t) n, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_copy.bytes, ggml_nbytes(src_view), __ATOMIC_RELAXED);
 
         return n;
     }
@@ -1816,8 +1827,8 @@ struct llama_moe_cache::impl {
         const ggml_tensor * bank = g.banks[b.ip];
         GGML_ASSERT(bank->nb[1] == w->nb[1] && size <= bank->nb[2]);
 
-        stats_copy.hits  += 1;
-        stats_copy.bytes += size;
+        __atomic_fetch_add(&stats_copy.hits,  (size_t) 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_copy.bytes, size, __ATOMIC_RELAXED);
 
         return (const uint8_t *) bank->data + (size_t) slots[e]*bank->nb[2];
     }
@@ -1847,6 +1858,7 @@ struct llama_moe_cache::impl {
     }
 
     void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * output) {
+        std::lock_guard<std::mutex> lock(mtx_shared);
         cpu_parts[lookup] = { n_used, std::move(inputs) };
         if (output != nullptr) {
             cpu_outputs.insert(output);
@@ -1933,7 +1945,9 @@ struct llama_moe_cache::impl {
         const auto it_cpu = cpu_parts.find(lookup);
         const bool has_cpu = l.cpu_map != nullptr && it_cpu != cpu_parts.end() && !it_cpu->second.inputs.empty();
 
-        stash.clear();
+        if (!stash.empty()) {
+            stash.clear();
+        }
         size_t stash_size = 0;
         if (has_cpu) {
             for (const ggml_tensor * t : it_cpu->second.inputs) {
@@ -2111,6 +2125,7 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             const auto it_stage = stage_layer_of.find(src);
             if (it_stage != stage_layer_of.end()) {
+                std::lock_guard<std::mutex> lock(mtx_shared);
                 return copy_stage(backend, it_stage->second, src, dst, graph);
             }
             return copy_cpu_input(src, dst) || copy_cpu_output(backend, src, dst);
@@ -2125,9 +2140,12 @@ struct llama_moe_cache::impl {
         const ggml_tensor * lookup = find_lookup(graph, dst);
         if (ggml_nelements(lookup) == 0) {
             // no experts selected: nothing to read back or upload, and no synchronization of the graphs in flight
-            stash.clear();
+            if (!stash.empty()) {
+                stash.clear();
+            }
             return true;
         }
+        std::lock_guard<std::mutex> lock(mtx_shared);
         const cpu_part * part = read_cpu_inputs(backend, graph, lookup, l);
         const bool has_cpu = part != nullptr;
         const bool has_pred = read_prediction(backend, graph, lookup, il);
@@ -2367,7 +2385,19 @@ struct llama_moe_cache::impl {
     }
 
     void set_prediction(const ggml_tensor * lookup, const ggml_tensor * pred) {
+        std::lock_guard<std::mutex> lock(mtx_shared);
         predictions[lookup] = { pred };
+    }
+
+    // submit threads: the large-batch path is safe from several threads (one per device); the features that queue work on
+    // other streams from the scheduler's thread or keep per-graph state across devices are not
+    bool submit_threads_ok(std::string & why) const {
+        if (n_stage > 0)          { why = "LLAMA_MOE_ASYNC";             return false; }
+        if (n_pref > 0)           { why = "LLAMA_MOE_PREFETCH";          return false; }
+        if (cpu_share_q > 0)      { why = "--moe-cache-cpu-share";       return false; }
+        if (!dh_devs.empty())     { why = "LLAMA_MOE_DEVICE_HITS";       return false; }
+        if (trace != nullptr)     { why = "LLAMA_MOE_CACHE_TRACE";       return false; }
+        return true;
     }
 
     void log_stats() const {
@@ -2410,6 +2440,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+bool llama_moe_cache::submit_threads_ok(std::string & why) const {
+    return pimpl->submit_threads_ok(why);
+}
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);

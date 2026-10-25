@@ -404,11 +404,30 @@ private:
 
     copy_experts_info copy_experts;
 
-    // LLAMA_MOE_GATHER: per backend the gather function of its device, per (device, host buffer) its address in the device
+    // LLAMA_MOE_GATHER: per backend the gather function of its device, per host buffer its address in the device
     using gather_blocks_t = void (*)(ggml_backend_t, void *, size_t, const void * const *, int, size_t);
-    std::map<ggml_backend_t, gather_blocks_t> gather_fns;
-    std::map<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>, const uint8_t *> gather_host_bases;
-    std::vector<const void *> gather_srcs;
+
+    // the state of the copy callback per backend: with submit threads each backend's copies run on its own thread
+    struct copy_dev_state {
+        ggml_backend_t  backend     = nullptr;
+        bool            gather_init = false;
+        gather_blocks_t gather_fn   = nullptr;
+        std::map<ggml_backend_buffer_t, const uint8_t *> host_bases;
+        std::vector<const void *> srcs;
+        // sched_copy_experts state per pipeline copy, used instead of copy_experts with submit threads
+        std::array<copy_experts_info, 4> slots;
+    };
+    std::vector<copy_dev_state> copy_devs; // [backend_ptrs], set with the scheduler
+    copy_dev_state * copy_dev(ggml_backend_t backend);
+
+    // LLAMA_SUBMIT_THREADS=1: the chunks of a piped prompt batch are queued by one host thread per backend
+    // (ggml_backend_sched_set_submit_threads); each pipeline copy keeps its own graph while the threads queue it
+    bool submit_threads = false;
+    bool submit_active  = false;
+    std::array<llm_graph_result_ptr, 4> gf_res_pipe;
+    bool submit_threads_ok(std::string & why) const;
+    void submit_end();
+    void set_compute_threads(bool batched);
 
     // copy every expert of the host weight src to its copy dst with one gather (the cached experts from the MoE cache)
     bool gather_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst);

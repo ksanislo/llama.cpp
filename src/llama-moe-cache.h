@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -79,6 +80,9 @@ public:
 
     // called before each graph compute, prev_in_flight if the previous graph may still run (no synchronization since)
     void begin(bool prev_in_flight, ggml_cgraph * graph);
+
+    // whether the copy callback may run on the scheduler's submit threads (one per device), else why not
+    bool submit_threads_ok(std::string & why) const;
 
     // called after the graph is queued
     void launched();
