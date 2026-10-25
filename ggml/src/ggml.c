@@ -3467,6 +3467,22 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_mapped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * as_alt,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(as_alt->type == as->type);
+    GGML_ASSERT(as_alt->ne[0] == as->ne[0] && as_alt->ne[1] == as->ne[1] && as_alt->ne[3] == 1);
+    GGML_ASSERT(as_alt->nb[0] == as->nb[0] && as_alt->nb[1] == as->nb[1] && as_alt->nb[2] == as->nb[2]);
+
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
+    result->src[3] = as_alt;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

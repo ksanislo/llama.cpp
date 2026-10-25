@@ -668,6 +668,13 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    // ggml_mul_mat_id_mapped: a negative id reads expert -1 - id of x_alt, same layout, only the pointer differs
+    const bool use_alt = ncols_dst == 1 && ids && !shared_expert && fusion.x_alt && int32_t(channel_x) < 0;
+    if (use_alt) {
+        vx        = fusion.x_alt;
+        channel_x = uint32_t(-1 - int32_t(channel_x));
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -688,7 +695,7 @@ static __global__ void mul_mat_vec_q(
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
-        vgate         = shared_expert ? fusion.shared_gate : fusion.gate;
+        vgate         = shared_expert ? fusion.shared_gate : use_alt ? fusion.gate_alt : fusion.gate;
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
@@ -944,8 +951,17 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    // ggml_mul_mat_id_mapped: a negative id reads expert -1 - id of x_alt, same layout, only the pointer differs
+    if (!shared_expert && fusion.x_alt && int32_t(channel_x) < 0) {
+        vx        = fusion.x_alt;
+        channel_x = uint32_t(-1 - int32_t(channel_x));
+        if constexpr (has_fusion) {
+            vgate = fusion.gate_alt;
+        }
+    }
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
@@ -1539,6 +1555,20 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+    }
+
+    // ggml_mul_mat_id_mapped: the experts of negative ids
+    const ggml_tensor * x_alt = dst->op == GGML_OP_MUL_MAT_ID ? dst->src[3] : (fusion ? fusion->x_alt : nullptr);
+    if (x_alt) {
+        GGML_ASSERT(ids);
+        GGML_ASSERT(x_alt->type == src0->type && x_alt->nb[1] == src0->nb[1] && x_alt->nb[2] == src0->nb[2]);
+        fusion_local.x_alt = x_alt->data;
+        if (fusion && fusion->gate) {
+            GGML_ASSERT(fusion->gate_alt && fusion->gate_alt->type == src0->type && fusion->gate_alt->nb[2] == src0->nb[2]);
+            fusion_local.gate_alt = fusion->gate_alt->data;
+        }
+    } else {
+        GGML_ASSERT(!fusion || !fusion->gate_alt);
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

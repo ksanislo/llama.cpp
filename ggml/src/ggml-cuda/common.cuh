@@ -1573,6 +1573,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // ggml_mul_mat_id_mapped (src[3]): the experts of negative ids, of the up/x and of the gate projection
+    const ggml_tensor * x_alt = nullptr;
+    const ggml_tensor * gate_alt = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1586,6 +1589,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // MUL_MAT_ID: an id < 0 reads expert -1 - id from these instead of vx / gate (e.g. mapped host memory)
+    const void * x_alt = nullptr;
+    const void * gate_alt = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -15,6 +15,8 @@ struct llama_model;
 // with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
 // with LLAMA_MOE_PREFETCH=k the router of the next layer is applied to the input of the current one, and the missing experts among its top k
 // are uploaded on a second stream while the current layer and the attention of the next one compute (decode, cached batches only)
+// with LLAMA_MOE_DEVICE_HITS=1|2 small batches look the slots up on the device and read the misses straight from the pinned host experts,
+// so their graph has no host step; the experts they select are logged on the device and the next graph fills the cache from the log
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
@@ -43,6 +45,18 @@ public:
     // the share of the misses that the CPU computes while the device uploads the others, 0 if all misses are uploaded
     float cpu_share() const;
 
+    // LLAMA_MOE_DEVICE_HITS: whether layer il looks up its slots on the device for n_tokens tokens
+    bool device_hits(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // the device slot map of layer il: I32 [1, n_expert], the slot of a cached expert, -1 - e for the others
+    ggml_tensor * get_device_map(int32_t il) const;
+
+    // the device log of layer il: I32 [cap], the graph copies the selected experts to its start
+    ggml_tensor * get_device_log(int32_t il) const;
+
+    // the host experts of w as a device tensor (mapped pinned memory), for ggml_mul_mat_id_mapped; nullptr without device hits
+    ggml_tensor * get_mapped_experts(const ggml_tensor * w, int64_t n_tokens, int64_t n_expert_used) const;
+
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     ggml_tensor * get_cpu_map(int32_t il) const;
 
@@ -64,7 +78,10 @@ public:
     void set_prediction(const ggml_tensor * lookup, const ggml_tensor * pred);
 
     // called before each graph compute, prev_in_flight if the previous graph may still run (no synchronization since)
-    void begin(bool prev_in_flight);
+    void begin(bool prev_in_flight, ggml_cgraph * graph);
+
+    // called after the graph is queued
+    void launched();
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map, the staging map of a layer or an input of the CPU part
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

@@ -1522,6 +1522,16 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // ggml_mul_mat_id with the experts in two tensors of the same type and expert layout:
+    // an id >= 0 selects as[id], an id < 0 selects as_alt[-1 - id]
+    // (an expert cache: as holds the cached experts, as_alt all of them, e.g. host memory the device reads directly)
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_mapped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * as_alt,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

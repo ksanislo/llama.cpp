@@ -1720,8 +1720,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache or a staging slot are selected by their slots
+    // with LLAMA_MOE_DEVICE_HITS the misses (negative slots) are read from the host experts mapped to the device
+    ggml_tensor * mapped = slots != nullptr && cached ? moe_cache->get_mapped_experts(w, slots->ne[1], slots->ne[0]) : nullptr;
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+        mapped != nullptr ?
+        ggml_mul_mat_id_mapped(ctx0, moe_cache->get_experts(w, slots->ne[1], slots->ne[0]), mapped, cur_mm, slots) :
         ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w, slots->ne[1], slots->ne[0]) : w, cur_mm, slots);
 
     if (prec_policy) {
@@ -2672,6 +2676,24 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         ids = ggml_cont(ctx0, ids);
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+
+    if (moe_cache->device_hits(il, selected_experts->ne[1], selected_experts->ne[0])) {
+        // LLAMA_MOE_DEVICE_HITS: the slots are looked up in the device map, a miss reads the host experts (-1 - e), no host step
+        // the selected experts are logged on the device, the cache reads the log before the next graph and fills the misses
+        ggml_backend_t backend = moe_cache->backend(il);
+        ggml_tensor * slots = ggml_get_rows(ctx0, moe_cache->get_device_map(il), ids); // [1, n_expert_used*n_tokens]
+        ggml_backend_sched_set_tensor_backend(sched, slots, backend);
+        cb(slots, "ffn_moe_slots", il);
+        ggml_build_forward_expand(gf, slots);
+
+        ggml_tensor * log = moe_cache->get_device_log(il);
+        log = ggml_view_1d(ctx0, log, ggml_nelements(ids), 0);
+        ggml_tensor * logged = ggml_cpy(ctx0, ids, log);
+        ggml_backend_sched_set_tensor_backend(sched, logged, backend);
+        ggml_build_forward_expand(gf, logged);
+
+        return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+    }
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map

@@ -2008,6 +2008,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // ggml_mul_mat_id_mapped: both projections read their experts the same way
+    if (is_mul_mat_id && ((ffn_up->src[3] == nullptr) != (ffn_gate->src[3] == nullptr))) {
+        return false;
+    }
+
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
     const ggml_tensor * ffn_up_bias_src   = has_scale ? ffn_up_scale   : ffn_up;
     const ggml_tensor * ffn_gate_bias_src = has_scale ? ffn_gate_scale : ffn_gate;
@@ -2082,6 +2087,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const ggml_tensor * dst  = tensor;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+
+    if (is_mul_mat_id && tensor->src[3] != nullptr) {
+        return false; // ggml_mul_mat_id_mapped is MMVQ only
+    }
 
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
@@ -2248,6 +2257,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
+    if (dst->src[3] != nullptr) {
+        return false; // ggml_mul_mat_id_mapped: always MMVQ
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -2285,6 +2298,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    // ggml_mul_mat_id_mapped: the experts of negative ids are read from src[3], only MMVQ supports it (see supports_op)
+    if (dst->src[3] != nullptr) {
+        GGML_ASSERT(ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc));
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -4028,6 +4048,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * up = routed->src[1];
             ggml_cuda_mm_fusion_args_host fusion{};
             fusion.gate = routed->src[0]->src[0];
+            fusion.x_alt = up->src[3];
+            fusion.gate_alt = routed->src[0]->src[3];
             fusion.glu_op = ggml_get_glu_op(routed);
             fusion.glu_limit = ggml_get_op_params_f32(routed, 3);
             fusion.shared_up = shared->src[1]->src[0];
@@ -4373,6 +4395,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate       = gate_n->src[0];
+                fusion_data.x_alt     = up_n->src[3];
+                fusion_data.gate_alt  = gate_n->src[3];
                 fusion_data.x_bias     = up_bias;
                 fusion_data.gate_bias  = gate_bias;
                 fusion_data.x_scale    = up_scale;
@@ -4467,6 +4491,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate       = gate_n->src[0];
+                fusion_data.x_alt     = up_n->src[3];
+                fusion_data.gate_alt  = gate_n->src[3];
                 fusion_data.x_bias     = up_bias;
                 fusion_data.gate_bias  = gate_bias;
                 fusion_data.x_scale    = up_scale;
@@ -4526,6 +4552,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
+                fusion_data.x_alt     = up_n->src[3];
+                fusion_data.gate_alt  = gate_n->src[3];
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4540,6 +4568,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
+                fusion_data.x_alt     = up_n->src[3];
+                fusion_data.gate_alt  = gate_n->src[3];
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4569,6 +4599,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
+                fusion_data.x_alt     = up->src[3];
+                fusion_data.gate_alt  = gate->src[3];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
@@ -4581,6 +4613,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
+                fusion_data.x_alt     = up->src[3];
+                fusion_data.gate_alt  = gate->src[3];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
@@ -4670,6 +4704,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mm_fusion_args_host fusion_data{};
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
+            fusion_data.x_alt   = mm_node->src[3];
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
@@ -4728,6 +4763,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.x_bias = bias_tensor;
+        fusion_data.x_alt  = mm_node->src[3];
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
@@ -5868,6 +5904,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
                 }
+                if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != nullptr) {
+                    // ggml_mul_mat_id_mapped: only MMVQ reads the experts by pointer, so small batches of quantized experts
+                    const ggml_tensor * alt = op->src[3];
+                    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    return ggml_is_quantized(a->type) && a->type != GGML_TYPE_Q8_K && alt->type == a->type &&
+                        alt->nb[1] == a->nb[1] && alt->nb[2] == a->nb[2] &&
+                        b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        b->ne[2] <= MMVQ_MAX_BATCH_SIZE && b->ne[2] <= get_mmvq_mmid_max_batch(a->type, cc);
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -6417,6 +6462,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// pinned host memory seen as a buffer of a device: the device reads it directly over PCIe (zero-copy)
+// the buffer type is the device's, so the scheduler treats tensors in it as device tensors and never copies them
+// the memory stays owned by its host buffer, which must outlive this one
+struct ggml_backend_cuda_mapped_buffer_context {
+    int device;
+    void * dev_ptr;
+};
+
+static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    delete (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+}
+
+static void * ggml_backend_cuda_mapped_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return ((ggml_backend_cuda_mapped_buffer_context *) buffer->context)->dev_ptr;
+}
+
+static void ggml_backend_cuda_mapped_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_cuda_set_device(((ggml_backend_cuda_mapped_buffer_context *) buffer->context)->device);
+    CUDA_CHECK(cudaMemcpy((char *) tensor->data + offset, data, size, cudaMemcpyDefault));
+}
+
+static void ggml_backend_cuda_mapped_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_cuda_set_device(((ggml_backend_cuda_mapped_buffer_context *) buffer->context)->device);
+    CUDA_CHECK(cudaMemcpy(data, (const char *) tensor->data + offset, size, cudaMemcpyDefault));
+}
+
+static void ggml_backend_cuda_mapped_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    GGML_ABORT("a mapped host buffer is not cleared, it belongs to its host buffer");
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(value);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_mapped_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_mapped_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_mapped_buffer_get_base,
+    /* .init_tensor     = */ NULL, // no padding is written: the memory past a tensor belongs to the next one
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_cuda_mapped_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_mapped_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_cuda_mapped_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+// returns nullptr if ptr is not pinned host memory the device can map (e.g. a plain mmap)
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_from_mapped_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    ggml_cuda_set_device(device);
+    void * dev_ptr = nullptr;
+    if (cudaHostGetDevicePointer(&dev_ptr, ptr, 0) != cudaSuccess || dev_ptr == nullptr) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_mapped_buffer_context { device, dev_ptr };
+    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_mapped_buffer_interface, ctx, size);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6436,6 +6540,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_from_mapped_host_ptr") == 0) {
+        return (void *)ggml_backend_cuda_buffer_from_mapped_host_ptr;
     }
 #if defined(GGML_CUDA_VMM_BUFFER)
     if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {
