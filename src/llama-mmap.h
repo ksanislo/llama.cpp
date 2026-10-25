@@ -49,8 +49,9 @@ struct llama_mmap {
     using ranges = std::vector<std::pair<size_t, size_t>>;
 
     llama_mmap(const llama_mmap &) = delete;
+    // interleave_ranges: faulted in with their pages interleaved over the NUMA nodes, see ggml_numa_interleave_mapped
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & lazy_ranges = {}, const ranges & interleave_ranges = {});
     ~llama_mmap();
 
     size_t size() const;

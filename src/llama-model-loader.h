@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -161,6 +162,9 @@ struct llama_model_loader {
     };
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
+
+    // MoE expert weights (used with MUL_MAT_ID), these are interleaved over the NUMA nodes when kept in host memory
+    std::unordered_set<const ggml_tensor *> expert_tensors;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
