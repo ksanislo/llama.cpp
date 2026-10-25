@@ -665,6 +665,7 @@ struct llama_moe_cache::impl {
     struct device {
         ggml_backend_t backend;
         ggml_backend_buffer_type_t buft;
+        size_t ib = 0;         // index in the backends of the context
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
 
@@ -707,6 +708,15 @@ struct llama_moe_cache::impl {
         std::vector<std::vector<ggml_tensor *>> stage; // [n_stage][expert tensor] staging slots, n_expert + 1 experts each
         std::vector<bool> dh_ok;                       // [dh_max + 1] the device supports the device-side path for n tokens
         moe_cache_transient tr;                        // LLAMA_MOE_CACHE_POLICY=adaptive
+
+        // LLAMA_MOE_DECODE_MEM: slots [lend_first, n_slots) are out of the cache while the device lends their memory
+        double  budget     = 0.0;
+        double  lend       = 0.0;                      // bytes this group lends
+        int32_t lend_first = 0;
+        std::vector<std::pair<size_t, size_t>> lend_ranges; // (offset, size) in the device buffer, whole granules
+        std::vector<size_t> bank_offs;                 // offset of each bank in the device buffer
+        std::vector<std::pair<int32_t, int32_t>> refill; // (layer, expert) hottest first, uploaded into the returned slots
+        size_t refill_pos = 0;
     };
 
     struct layer {
@@ -905,6 +915,56 @@ struct llama_moe_cache::impl {
     std::vector<std::pair<double, int32_t>> ad_victims;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> ad_cands_g; // [group]
 
+    // LLAMA_MOE_DECODE_MEM=1: the compute buffer of a device is VMM address space whose part beyond `small` is backed only while
+    // a graph uses it (large batches); meanwhile the same memory is released from the tails of the device's banks, whose
+    // coldest experts leave the cache (the hotter ones in the tails move down). After the batch the compute memory is released,
+    // the tails are backed again and refilled with the hottest experts missing (adaptive counts, then the profile)
+    struct dm_device {
+        size_t lend  = 0;     // bytes the banks give up for large batches, 0 if the device does not lend
+        size_t large = 0;     // measured compute buffer of the worst-case batch
+        size_t small = 0;     // compute bytes backed for small batches
+        size_t gran  = 0;
+        ggml_backend_buffer_type_t cbuft = nullptr; // compute buffer type (VMM address space)
+        ggml_backend_buffer_t cbuf = nullptr;       // the scheduler's compute buffer last seen
+        size_t committed = 0;                        // backed prefix of cbuf
+        bool   lent      = false;                    // the bank tails are released
+        int32_t n_small  = 0;                        // small graphs in a row while lent
+        size_t used_small_max = 0;
+        size_t used_large_max = 0;
+    };
+    struct dm_stats {
+        size_t  takes    = 0;
+        size_t  gives    = 0;
+        int64_t take_us  = 0;
+        int64_t give_us  = 0;
+        size_t  moved    = 0;
+        size_t  evicted  = 0;
+        size_t  released = 0; // bytes released from the banks, all takes
+        size_t  refilled = 0;
+        size_t  refill_bytes  = 0;
+        size_t  refill_graphs = 0;
+    };
+    typedef ggml_backend_buffer_t      (*vmm_alloc_t)(ggml_backend_buffer_type_t, size_t);
+    typedef bool                       (*vmm_commit_t)(ggml_backend_buffer_t, size_t, size_t);
+    typedef size_t                     (*vmm_release_t)(ggml_backend_buffer_t, size_t, size_t);
+    typedef size_t                     (*vmm_gran_t)(ggml_backend_buffer_type_t);
+    typedef ggml_backend_buffer_type_t (*vmm_cbuft_t)(ggml_backend_dev_t);
+    bool    dm_on           = false;
+    int32_t dm_return_after = 1;   // small graphs in a row before the tails come back
+    int32_t dm_refill_cap   = 256; // refills per device per graph, 0 = all at once
+    float   dm_compact      = 16.0f; // re-plan a small graph laid out by a large one (not one of a similar size: MTP windows)
+    vmm_alloc_t   vmm_alloc   = nullptr;
+    vmm_commit_t  vmm_commit  = nullptr;
+    vmm_release_t vmm_release = nullptr;
+    std::vector<dm_device> dm_devs;
+    dm_stats stats_dm;
+    bool dm_warned = false;
+
+    // LLAMA_MOE_CACHE_SPLIT=miss: the hottest profiled experts are cached first, on whichever device they are
+    bool split_miss  = false;
+    bool prof_loaded = false;
+    bool prof_exists = false;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -914,14 +974,16 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
-            const std::string & profile) :
+            const std::string & profile, const llama_moe_cache_compute & compute) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+        const bool no_alloc = model.hparams.no_alloc || compute.measure;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                d.ib      = i;
             }
         }
         if (devices.empty()) {
@@ -1032,12 +1094,28 @@ struct llama_moe_cache::impl {
             }
             write_trace_header(split_sum);
         }
+        n_expert_model = (int32_t) model.hparams.n_expert;
+        for (group & g : groups) {
+            const device & d = devices[g.id];
+            g.budget = (double) size*d.split/split_sum*g.host_bytes/d.host_bytes;
+        }
+        if (const char * env = getenv("LLAMA_MOE_CACHE_SPLIT")) {
+            split_miss = strcmp(env, "miss") == 0;
+            if (!split_miss && *env != '\0' && strcmp(env, "free") != 0) {
+                LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_SPLIT=%s (free or miss), using free\n", __func__, env);
+            }
+        }
+        if (split_miss && !compute.measure) {
+            load_profile(profile);
+            split_by_miss(size, compute, no_alloc);
+        }
+        dm_setup(compute, no_alloc);
+
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
         for (group & g : groups) {
-            const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+            const size_t  budget    = (size_t) (g.budget + g.lend);
             const int32_t max_slots = g.layers.size()*n_expert;
             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
                 g.n_slots++;
@@ -1048,6 +1126,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
+            g.lend_first = g.n_slots;
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(1 + (n_stage > 0 ? 1 : 0) + (n_zero > 0 ? 1 : 0)); // slot map, staging map, CPU map
         }
@@ -1107,7 +1186,7 @@ struct llama_moe_cache::impl {
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
 
-        if (model.hparams.no_alloc) {
+        if (no_alloc) {
             // only used to measure the memory use, see llama_context::memory_breakdown
             for (device & d : devices) {
                 if (!d.ctx) {
@@ -1123,8 +1202,13 @@ struct llama_moe_cache::impl {
                 t->buffer = buf_host.get();
             }
         } else {
-            for (device & d : devices) {
+            for (size_t id = 0; id < devices.size(); ++id) {
+                device & d = devices[id];
                 if (!d.ctx) {
+                    continue;
+                }
+                if (dm_on && dm_devs[id].lend > 0) {
+                    dm_alloc(id);
                     continue;
                 }
                 d.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft));
@@ -1158,11 +1242,10 @@ struct llama_moe_cache::impl {
             }
         }
 
-        n_expert_model = (int32_t) model.hparams.n_expert;
-        init_policy(profile, model.hparams.no_alloc);
+        init_policy(profile, no_alloc);
 
         if (n_stage > 0) {
-            init_stage(model.hparams.no_alloc);
+            init_stage(no_alloc);
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -1175,7 +1258,7 @@ struct llama_moe_cache::impl {
 
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
-            if (d.host_bytes == 0) {
+            if (d.host_bytes == 0 || compute.measure) {
                 continue;
             }
             LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
@@ -1193,7 +1276,25 @@ struct llama_moe_cache::impl {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    if (g.lend_first < g.n_slots) {
+                        LLAMA_LOG_INFO("%s:            %5d of them (%.1f%% of the layers' experts) lent to large batches\n", __func__,
+                            g.n_slots - g.lend_first, 100.0*(g.n_slots - g.lend_first)/(g.layers.size()*g.ref[0]->ne[2]));
+                    }
                 }
+            }
+            if (id < dm_devs.size() && dm_devs[id].lend > 0) {
+                const dm_device & dm = dm_devs[id];
+                size_t rel = 0;
+                for (const group & g : groups) {
+                    if (g.id == (int32_t) id) {
+                        for (const auto & r : g.lend_ranges) {
+                            rel += r.second;
+                        }
+                    }
+                }
+                LLAMA_LOG_INFO("%s: %10s MoE decode memory: %.2f MiB of the cache back the compute buffer during large batches "
+                    "(%.2f MiB measured, %.2f MiB kept for small ones; LLAMA_MOE_DECODE_MEM)\n", __func__,
+                    ggml_backend_buft_name(d.buft), rel/1024.0/1024.0, dm.large/1024.0/1024.0, dm.small/1024.0/1024.0);
             }
         }
 
@@ -1212,12 +1313,12 @@ struct llama_moe_cache::impl {
         if (const char * env = getenv("LLAMA_MOE_CPU_LANE_TIMEOUT_MS")) {
             lane_timeout_ms = std::max(1, atoi(env));
         }
-        if (dh_mode > 0 && !model.hparams.no_alloc) {
+        if (dh_mode > 0 && !no_alloc) {
             init_device_hits();
             if (lane_frac > 0.0f) {
                 init_cpu_lane();
             }
-        } else if (lane_frac > 0.0f) {
+        } else if (lane_frac > 0.0f && !no_alloc) {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_CPU_LANE needs LLAMA_MOE_DEVICE_HITS, it is off\n", __func__);
             lane_frac = 0.0f;
         }
@@ -1263,27 +1364,10 @@ struct llama_moe_cache::impl {
                 __func__, std::exp(-ad.k), ad.min_count, ad.gain, ad_fills_per_token, groups.empty() ? 0 : groups[0].tr.n);
         }
 
-        prof_path = profile_arg;
-        if (prof_path.empty()) {
-            if (const char * env = getenv("LLAMA_MOE_CACHE_PROFILE")) {
-                prof_path = env;
-            }
-        }
+        load_profile(profile_arg);
+        const bool exists = prof_exists;
         prof_keep     = std::clamp(env_f("LLAMA_MOE_CACHE_PROFILE_KEEP", 0.5), 0.0, 1.0);
         prof_save_min = std::max(0.0, env_f("LLAMA_MOE_CACHE_PROFILE_SAVE_MIN", 10.0));
-        bool exists = false;
-        if (!prof_path.empty()) {
-            FILE * f = fopen(prof_path.c_str(), "rb");
-            exists = f != nullptr;
-            if (f) {
-                fclose(f);
-            }
-            std::string err;
-            if (exists && !moe_cache_profile_read(prof_path, n_expert_model, prof, err)) {
-                LLAMA_LOG_WARN("%s: MoE cache profile not used: %s\n", __func__, err.c_str());
-                prof = moe_cache_profile();
-            }
-        }
         if (const char * env = getenv("LLAMA_MOE_CACHE_PROFILE_SAVE")) {
             prof_save = strcmp(env, "0") == 0 ? "" : env;
         } else if (!prof_path.empty()) {
@@ -1308,6 +1392,312 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: MoE cache profile: the routings of this run are saved to %s (every %.0f min and at exit, %.0f%% of the loaded profile kept)\n",
                 __func__, prof_save.c_str(), prof_save_min, 100.0*prof_keep);
         }
+    }
+
+    void load_profile(const std::string & profile_arg) {
+        if (prof_loaded) {
+            return;
+        }
+        prof_loaded = true;
+        prof_path = profile_arg;
+        if (prof_path.empty()) {
+            if (const char * env = getenv("LLAMA_MOE_CACHE_PROFILE")) {
+                prof_path = env;
+            }
+        }
+        if (!prof_path.empty()) {
+            FILE * f = fopen(prof_path.c_str(), "rb");
+            prof_exists = f != nullptr;
+            if (f) {
+                fclose(f);
+            }
+            std::string err;
+            if (prof_exists && !moe_cache_profile_read(prof_path, n_expert_model, prof, err)) {
+                LLAMA_LOG_WARN("%s: MoE cache profile not used: %s\n", __func__, err.c_str());
+                prof = moe_cache_profile();
+            }
+        }
+    }
+
+    // LLAMA_MOE_CACHE_SPLIT=miss: the budget goes to the experts with the highest profiled score first, whichever device holds
+    // their layer (a miss costs its bytes, a slot costs the same bytes, so the gain per byte is the routing probability), as far
+    // as each device has room beside its compute buffer; the rest (no profile, or experts without a score) by expert bytes
+    void split_by_miss(size_t size, const llama_moe_cache_compute & compute, bool no_alloc) {
+        const char * env_m = getenv("LLAMA_MOE_CACHE_SPLIT_MARGIN_MIB");
+        const double margin = (env_m ? std::max(0.0, atof(env_m)) : 512.0)*1024.0*1024.0;
+        std::vector<double> cap(devices.size(), 0.0);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
+            if (d.host_bytes == 0) {
+                continue;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
+            const double c = compute.large.size() > d.ib ? (double) compute.large[d.ib] : 0.0;
+            cap[id] = no_alloc || free == 0 ? 1e30 : std::max(0.0, (double) free - c - margin);
+        }
+        if (compute.large.empty() && !no_alloc) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_SPLIT=miss without measured compute buffers: the devices' free memory caps the split\n", __func__);
+        }
+
+        struct item {
+            float   score;
+            int32_t ig;
+            int32_t il;
+            int32_t e;
+        };
+        std::vector<item> items;
+        std::vector<double> bytes_g(groups.size(), 0.0);
+        std::vector<double> mass_dev(devices.size(), 0.0);
+        double mass_all = 0.0;
+        const bool have = prof.n_layer == (int32_t) layers.size();
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            for (const ggml_tensor * t : g.ref) {
+                bytes_g[ig] += (double) t->nb[2];
+            }
+            for (int32_t il : g.layers) {
+                for (int32_t e = 0; e < (int32_t) g.ref[0]->ne[2] && have; ++e) {
+                    const float sc = prof.get(il, e);
+                    if (sc > 0.0f) {
+                        items.push_back({ sc, (int32_t) ig, il, e });
+                        mass_all += sc;
+                    }
+                }
+            }
+        }
+        std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
+            return a.score != b.score ? a.score > b.score : (a.il != b.il ? a.il < b.il : a.e < b.e);
+        });
+
+        std::vector<double> got(groups.size(), 0.0);
+        std::vector<double> used(devices.size(), 0.0);
+        double left = (double) size;
+        for (const item & it : items) {
+            const double b  = bytes_g[it.ig];
+            const int32_t id = groups[it.ig].id;
+            if (b > left || used[id] + b > cap[id]) {
+                continue;
+            }
+            got[it.ig] += b;
+            used[id]   += b;
+            left       -= b;
+            mass_dev[id] += it.score;
+        }
+        // the rest by the bytes not cached yet, within the caps
+        for (int round = 0; round < 8 && left >= 1.0; ++round) {
+            double w_sum = 0.0;
+            std::vector<double> w(groups.size(), 0.0);
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                const int32_t id = groups[ig].id;
+                if (cap[id] - used[id] >= 1.0) {
+                    w[ig]  = std::max(0.0, (double) groups[ig].host_bytes - got[ig]);
+                    w_sum += w[ig];
+                }
+            }
+            if (w_sum <= 0.0) {
+                break;
+            }
+            double given = 0.0;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                const int32_t id = groups[ig].id;
+                const double add = std::min(left*w[ig]/w_sum, cap[id] - used[id]);
+                if (add > 0.0) {
+                    got[ig]  += add;
+                    used[id] += add;
+                    given    += add;
+                }
+            }
+            left -= given;
+            if (given < 1.0) {
+                break;
+            }
+        }
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            groups[ig].budget = got[ig];
+        }
+        for (size_t id = 0; id < devices.size(); ++id) {
+            if (devices[id].host_bytes == 0) {
+                continue;
+            }
+            LLAMA_LOG_INFO("%s: %10s MoE cache split by misses: %8.2f MiB (cap %.2f MiB), %.1f%% of the profiled score%s\n", __func__,
+                ggml_backend_buft_name(devices[id].buft), used[id]/1024.0/1024.0, cap[id] >= 1e29 ? 0.0 : cap[id]/1024.0/1024.0,
+                mass_all > 0.0 ? 100.0*mass_dev[id]/mass_all : 0.0, have ? "" : " (no profile: same share of each device's experts)");
+        }
+        if (left >= 1024.0*1024.0) {
+            LLAMA_LOG_WARN("%s: %.2f MiB of the MoE cache budget do not fit beside the compute buffers\n", __func__, left/1024.0/1024.0);
+        }
+    }
+
+    // LLAMA_MOE_DECODE_MEM: which devices lend, and how much (the part of the compute buffer that small batches do not use)
+    void dm_setup(const llama_moe_cache_compute & compute, bool no_alloc) {
+        dm_devs.assign(devices.size(), dm_device());
+        const char * env = getenv("LLAMA_MOE_DECODE_MEM");
+        if (env == nullptr || atoi(env) == 0 || no_alloc) {
+            return;
+        }
+        if (borrow) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_DECODE_MEM does not combine with LLAMA_MOE_ASYNC_BORROW, it is off\n", __func__);
+            return;
+        }
+        if (compute.large.empty()) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_DECODE_MEM needs the measured compute buffers, it is off\n", __func__);
+            return;
+        }
+        auto env_i = [](const char * name, int def) {
+            const char * v = getenv(name);
+            return v != nullptr && *v != '\0' ? atoi(v) : def;
+        };
+        dm_return_after = std::max(1, env_i("LLAMA_MOE_DECODE_MEM_RETURN", 1));
+        dm_refill_cap   = std::max(0, env_i("LLAMA_MOE_DECODE_MEM_REFILL", 256));
+        const size_t spare = (size_t) std::max(0, env_i("LLAMA_MOE_DECODE_MEM_SPARE_MIB", 64))*1024*1024;
+        if (const char * v = getenv("LLAMA_MOE_DECODE_MEM_COMPACT")) {
+            dm_compact = std::max(0.0f, (float) atof(v));
+        }
+
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            dm_device & dm = dm_devs[id];
+            if (d.host_bytes == 0 || compute.large.size() <= d.ib || compute.small.size() <= d.ib) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto alloc   = (vmm_alloc_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_alloc");
+            auto commit  = (vmm_commit_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_commit");
+            auto release = (vmm_release_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_release");
+            auto gran    = (vmm_gran_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_get_granularity");
+            auto cbuft   = (vmm_cbuft_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_vmm_compute_buffer_type");
+            ggml_backend_buffer_type_t cb = cbuft ? cbuft(dev) : nullptr;
+            const size_t g = gran ? gran(d.buft) : 0;
+            if (!alloc || !commit || !release || g == 0 || cb == nullptr) {
+                LLAMA_LOG_WARN("%s: %s has no virtual memory buffers, LLAMA_MOE_DECODE_MEM is off there\n", __func__, ggml_backend_name(d.backend));
+                continue;
+            }
+            vmm_alloc   = alloc;
+            vmm_commit  = commit;
+            vmm_release = release;
+            dm.gran  = g;
+            dm.cbuft = cb;
+            dm.large = compute.large[d.ib];
+            dm.small = GGML_PAD(compute.small[d.ib] + spare, g);
+            if (dm.large > dm.small + 16*g) {
+                dm.lend = GGML_PAD(dm.large - dm.small, g);
+            }
+            if (dm.lend == 0) {
+                continue;
+            }
+            dm_on = true;
+            // each group lends in proportion to its budget
+            double sum = 0.0;
+            for (const group & gr : groups) {
+                sum += gr.id == (int32_t) id ? gr.budget : 0.0;
+            }
+            for (group & gr : groups) {
+                if (gr.id == (int32_t) id) {
+                    gr.lend = sum > 0.0 ? (double) dm.lend*gr.budget/sum : (double) dm.lend*gr.host_bytes/d.host_bytes;
+                }
+            }
+        }
+    }
+
+    // the banks of a lending device in a VMM buffer: each bank on a granule, the tails lent in whole granules
+    void dm_alloc(size_t id) {
+        device & d = devices[id];
+        dm_device & dm = dm_devs[id];
+        const size_t G = dm.gran;
+
+        size_t cur = 0;
+        for (group & g : groups) {
+            if (g.id != (int32_t) id || g.n_slots == 0) {
+                continue;
+            }
+            g.bank_offs.clear();
+            for (ggml_tensor * bank : g.banks) {
+                const size_t off = GGML_PAD(cur, G);
+                g.bank_offs.push_back(off);
+                cur = off + ggml_backend_buft_get_alloc_size(d.buft, bank);
+            }
+        }
+        const size_t total = GGML_PAD(std::max<size_t>(cur, 1), G);
+
+        // the slots [first, n_slots) of a group are lent, k = n_slots - first as small as the granules of the tails allow
+        size_t lent_total = 0;
+        for (group & g : groups) {
+            if (g.id != (int32_t) id || g.n_slots == 0 || g.lend <= 0.0) {
+                continue;
+            }
+            const int32_t n_expert  = (int32_t) g.ref[0]->ne[2];
+            const int32_t min_first = n_expert + g.n_slots/8; // a layer's experts, the transient slots
+            auto released = [&](int32_t first) {
+                size_t res = 0;
+                for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                    const size_t nb = g.banks[ip]->nb[2];
+                    const size_t lo = GGML_PAD(g.bank_offs[ip] + (size_t) first*nb, G);
+                    const size_t hi = (g.bank_offs[ip] + (size_t) g.n_slots*nb)/G*G;
+                    res += hi > lo ? hi - lo : 0;
+                }
+                return res;
+            };
+            size_t per_slot = 0;
+            for (const ggml_tensor * bank : g.banks) {
+                per_slot += bank->nb[2];
+            }
+            int32_t first = std::max(min_first, g.n_slots - (int32_t) (g.lend/(double) per_slot));
+            while (first > min_first && (double) released(first) < g.lend) {
+                first--;
+            }
+            if (first >= g.n_slots || released(first) == 0) {
+                LLAMA_LOG_WARN("%s: %s: a group of %zu layers is too small to lend memory to large batches\n", __func__,
+                    ggml_backend_name(d.backend), g.layers.size());
+                continue;
+            }
+            if ((double) released(first) < g.lend) {
+                LLAMA_LOG_WARN("%s: %s: a group of %zu layers lends only %.2f of %.2f MiB to large batches\n", __func__,
+                    ggml_backend_name(d.backend), g.layers.size(), released(first)/1024.0/1024.0, g.lend/1024.0/1024.0);
+            }
+            g.lend_first = first;
+            g.lend_ranges.clear();
+            for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                const size_t nb = g.banks[ip]->nb[2];
+                const size_t lo = GGML_PAD(g.bank_offs[ip] + (size_t) first*nb, G);
+                const size_t hi = (g.bank_offs[ip] + (size_t) g.n_slots*nb)/G*G;
+                if (hi > lo) {
+                    g.lend_ranges.push_back({ lo, hi - lo });
+                    lent_total += hi - lo;
+                }
+            }
+        }
+        if (lent_total + 16*G < dm.lend) {
+            LLAMA_LOG_WARN("%s: %s lends %.2f MiB of the %.2f MiB the large batches need beside the small ones, the compute buffer may not fit\n",
+                __func__, ggml_backend_name(d.backend), lent_total/1024.0/1024.0, dm.lend/1024.0/1024.0);
+        }
+
+        d.buf.reset(vmm_alloc(d.buft, total));
+        if (!d.buf) {
+            throw std::runtime_error("failed to reserve the address space of the MoE cache");
+        }
+        if (!vmm_commit(d.buf.get(), 0, total)) {
+            throw std::runtime_error("failed to allocate the MoE cache buffers");
+        }
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(d.buf.get());
+        for (group & g : groups) {
+            if (g.id != (int32_t) id || g.n_slots == 0) {
+                continue;
+            }
+            for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                if (ggml_backend_tensor_alloc(d.buf.get(), g.banks[ip], base + g.bank_offs[ip]) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to place the MoE cache banks");
+                }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+            if (t->view_src != nullptr && t->buffer == nullptr) {
+                ggml_backend_view_init(t);
+            }
+        }
+        d.buf_size = total;
     }
 
     // fill each group's slots with the hottest experts of its layers by the profile, before the first graph
@@ -2373,6 +2763,422 @@ struct llama_moe_cache::impl {
         stats_ad.kept_out += n_miss_free - n_adm;
     }
 
+
+    // LLAMA_MOE_DECODE_MEM runtime
+
+    ggml_backend_buffer_type_t compute_buft(ggml_backend_t backend) const {
+        for (size_t id = 0; id < devices.size(); ++id) {
+            if (devices[id].backend == backend && id < dm_devs.size() && dm_devs[id].lend > 0) {
+                return dm_devs[id].cbuft;
+            }
+        }
+        return nullptr;
+    }
+
+    // after each graph allocation, before its tensors are written: back the compute memory it uses; a device whose graph
+    // needs more than the small part takes the memory from its bank tails, and gives it back after small graphs again
+    void on_alloc(ggml_backend_sched_t sched) {
+        if (!dm_on) {
+            return;
+        }
+        std::vector<size_t> take;
+        std::vector<size_t> give;
+        std::vector<size_t> need(devices.size(), 0);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            dm_device & dm = dm_devs[id];
+            if (dm.lend == 0) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = nullptr;
+            size_t used = ggml_backend_sched_get_buffer_used(sched, devices[id].backend, &buf);
+            if (buf != dm.cbuf) {
+                // a new compute buffer (reserve or reallocation): nothing of it is backed
+                dm.cbuf      = buf;
+                dm.committed = 0;
+            }
+            if (buf == nullptr) {
+                continue;
+            }
+            const size_t bsize = ggml_backend_buffer_get_size(buf);
+            used = std::min(used, bsize);
+            need[id] = used;
+            if (used <= dm.small) {
+                dm.used_small_max = std::max(dm.used_small_max, used);
+                if (dm.lent) {
+                    if (++dm.n_small >= dm_return_after) {
+                        give.push_back(id);
+                    }
+                } else if (dm.committed < std::min(dm.small, bsize)) {
+                    dm_commit_compute(id, std::min(dm.small, bsize));
+                }
+            } else {
+                dm.used_large_max = std::max(dm.used_large_max, used);
+                dm.n_small = 0;
+                if (!dm.lent) {
+                    if (used <= dm.large/4 && !dm_warned) {
+                        // a graph this far below the worst case is likely a decode graph: each one would switch
+                        LLAMA_LOG_WARN("%s: %s: a graph uses %.2f MiB of compute buffer, more than the %.2f MiB kept for small batches: "
+                            "raise LLAMA_MOE_DECODE_MEM_SPARE_MIB or LLAMA_MOE_DECODE_MEM_TOKENS\n", __func__,
+                            ggml_backend_name(devices[id].backend), used/1024.0/1024.0, dm.small/1024.0/1024.0);
+                        dm_warned = true;
+                    }
+                    take.push_back(id);
+                } else if (used > dm.committed) {
+                    dm_commit_compute(id, used);
+                }
+            }
+        }
+        if (!take.empty() || !give.empty()) {
+            dm_switch(sched, take, give, need);
+        }
+    }
+
+    void dm_commit_compute(size_t id, size_t end) {
+        dm_device & dm = dm_devs[id];
+        if (end <= dm.committed) {
+            return;
+        }
+        if (!vmm_commit(dm.cbuf, dm.committed, end - dm.committed)) {
+            GGML_ABORT("%s: cannot back %.2f MiB of the compute buffer of %s (LLAMA_MOE_DECODE_MEM): a smaller --moe-cache-mib or "
+                "LLAMA_MOE_DECODE_MEM_SPARE_MIB leaves room", __func__, (end - dm.committed)/1024.0/1024.0, ggml_backend_name(devices[id].backend));
+        }
+        dm.committed = end;
+    }
+
+    // nothing in flight on any device or stream of the cache
+    void dm_sync_all(ggml_backend_sched_t sched) {
+        ggml_backend_sched_synchronize(sched);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            if (devices[id].copy) {
+                ggml_backend_synchronize(devices[id].copy.get());
+            }
+            if (id < dh_devs.size() && dh_devs[id].fill) {
+                ggml_backend_synchronize(dh_devs[id].fill.get());
+            }
+        }
+    }
+
+    // BEGIN decode_mem slots (extracted by the CPU harness)
+    // after dm_sync_all: the queued fills are done (committed), the pending ones give their slots back
+    void dm_flush_fills(size_t id) {
+        if (id >= dh_devs.size()) {
+            return;
+        }
+        dh_device & dd = dh_devs[id];
+        for (const dh_fill & f : dd.queued) {
+            dh_commit(f);
+        }
+        dd.queued.clear();
+        for (const dh_fill & f : dd.pending) {
+            moe_cache_slru & c = groups[layers[f.il].ig].slru;
+            dh_inflight.erase(f.il*c.n_expert + f.expert);
+            c.push_front(f.slot);
+        }
+        dd.pending.clear();
+    }
+
+    // the tail [lend_first, n_slots) leaves the cache: the coldest experts of the group are evicted, the hotter ones in the tail
+    // move to the freed slots below it (D2D on the compute stream); every slot of the group is in the SLRU lists here, except
+    // the transient ones at its start
+    void dm_evict_tail(group & g) {
+        moe_cache_slru & c = g.slru;
+        const int32_t first = g.lend_first;
+        const int32_t k     = g.n_slots - first;
+        if (k <= 0) {
+            return;
+        }
+        std::vector<bool> drop(g.n_slots, false);
+        int32_t n_drop = 0;
+        for (int seg = 0; seg < 2 && n_drop < k; ++seg) {
+            for (int32_t s = c.head[seg]; s >= 0 && n_drop < k; s = c.next[s]) {
+                drop[s] = true;
+                n_drop++;
+            }
+        }
+        GGML_ASSERT(n_drop == k);
+
+        std::vector<int32_t> src;
+        std::vector<int32_t> dst;
+        for (int32_t s = first; s < g.n_slots; ++s) {
+            if (!drop[s]) {
+                src.push_back(s);
+            }
+        }
+        for (int32_t s = 0; s < first; ++s) {
+            if (drop[s]) {
+                dst.push_back(s);
+            }
+        }
+        GGML_ASSERT(src.size() == dst.size());
+
+        auto evict = [&](int32_t s) {
+            if (c.key_of[s] >= 0) {
+                c.slot_map[c.key_of[s] / c.n_expert][c.key_of[s] % c.n_expert] = c.empty;
+                c.key_of[s] = -1;
+                c.n_filled--;
+                stats_dm.evicted++;
+            }
+        };
+        for (int32_t s : dst) {
+            evict(s);
+            c.unlink(s);
+        }
+        size_t n_move = 0;
+        for (size_t i = 0; i < src.size(); ++i) {
+            const int32_t key = c.key_of[src[i]];
+            c.replace(src[i], dst[i]);
+            if (key < 0) {
+                continue;
+            }
+            c.slot_map[key / c.n_expert][key % c.n_expert] = dst[i];
+            c.key_of[dst[i]] = key;
+            c.key_of[src[i]] = -1;
+            src[n_move] = src[i];
+            dst[n_move] = dst[i];
+            n_move++;
+        }
+        src.resize(n_move);
+        dst.resize(n_move);
+        for (int32_t s = first; s < g.n_slots; ++s) {
+            if (drop[s]) {
+                evict(s);
+                c.unlink(s);
+            }
+        }
+
+        ggml_backend_t backend = devices[g.id].backend;
+        for (size_t i = 0; i < src.size(); ) {
+            size_t n = 1;
+            while (i + n < src.size() && src[i + n] == src[i] + (int32_t) n && dst[i + n] == dst[i] + (int32_t) n) {
+                n++;
+            }
+            for (ggml_tensor * bank : g.banks) {
+                ggml_reset(ctx_views.get());
+                ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], src[i]*bank->nb[2]);
+                ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], dst[i]*bank->nb[2]);
+                ggml_backend_view_init(src_view);
+                ggml_backend_view_init(dst_view);
+                ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+            }
+            i += n;
+        }
+        stats_dm.moved += n_move;
+    }
+
+    // refill order: the decayed routing counts (adaptive policy) or this run's routings first, then the profile
+    std::pair<double, double> dm_score(int32_t il, int32_t e) const {
+        const size_t key = (size_t) il*n_expert_model + e;
+        double primary = 0.0;
+        if (ad_on) {
+            primary = ad.value((int32_t) key);
+        } else if (!prof_run.empty()) {
+            primary = prof_run[key];
+        }
+        const double secondary = prof.n_layer == (int32_t) layers.size() ? prof.get(il, e) : 0.0;
+        return { primary, secondary };
+    }
+
+    // the returned tail: free slots, the next victims, and the hottest experts missing to put there
+    void dm_return_tail(group & g) {
+        moe_cache_slru & c = g.slru;
+        for (int32_t s = g.n_slots - 1; s >= g.lend_first; --s) {
+            GGML_ASSERT(c.key_of[s] < 0);
+            c.push_front(s);
+        }
+        const size_t k = (size_t) (g.n_slots - g.lend_first);
+        std::vector<std::pair<std::pair<double, double>, std::pair<int32_t, int32_t>>> cand;
+        for (int32_t il : g.layers) {
+            for (int32_t e = 0; e < c.n_expert; ++e) {
+                if (c.slot_map[il][e] < c.n_slots || dh_inflight.count(il*c.n_expert + e) > 0) {
+                    continue;
+                }
+                const auto sc = dm_score(il, e);
+                if (sc.first > 0.0 || sc.second > 0.0) {
+                    cand.push_back({ sc, { il, e } });
+                }
+            }
+        }
+        auto hotter = [](const auto & a, const auto & b) { return a.first != b.first ? a.first > b.first : a.second < b.second; };
+        if (cand.size() > k) {
+            std::partial_sort(cand.begin(), cand.begin() + k, cand.end(), hotter);
+            cand.resize(k);
+        } else {
+            std::sort(cand.begin(), cand.end(), hotter);
+        }
+        g.refill.clear();
+        for (const auto & ce : cand) {
+            g.refill.push_back(ce.second);
+        }
+        g.refill_pos = 0;
+    }
+
+    // up to dm_refill_cap of the refills of the device's groups: on the fill stream with device hits (committed by the next
+    // graph like a miss fill), else on the compute stream before this graph
+    void dm_refill(size_t id) {
+        if (!dm_on || id >= dm_devs.size() || dm_devs[id].lend == 0 || dm_devs[id].lent) {
+            return;
+        }
+        const bool dh = id < dh_devs.size() && !dh_devs[id].rows.empty();
+        int64_t budget = dm_refill_cap > 0 ? dm_refill_cap : INT64_MAX;
+        bool any = false;
+        for (group & g : groups) {
+            if (g.id != (int32_t) id) {
+                continue;
+            }
+            moe_cache_slru & c = g.slru;
+            while (budget > 0 && g.refill_pos < g.refill.size()) {
+                const int32_t il  = g.refill[g.refill_pos].first;
+                const int32_t e   = g.refill[g.refill_pos].second;
+                const int32_t key = il*c.n_expert + e;
+                if (c.slot_map[il][e] < c.n_slots || dh_inflight.count(key) > 0) {
+                    g.refill_pos++;
+                    continue;
+                }
+                const int32_t s = c.head[0];
+                if (s < 0 || c.key_of[s] >= 0) {
+                    g.refill_pos = g.refill.size(); // no free slot left: the misses took them
+                    break;
+                }
+                g.refill_pos++;
+                const layer & l = layers[il];
+                size_t bytes = 0;
+                if (dh) {
+                    c.unlink(s);
+                    dh_devs[id].pending.push_back({ il, e, s });
+                    dh_inflight.insert(key);
+                    for (const ggml_tensor * w : l.experts) {
+                        bytes += w->nb[2];
+                    }
+                } else {
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        const ggml_tensor * w = l.experts[ip];
+                        ggml_backend_tensor_set_async(devices[id].backend, g.banks[ip], (const uint8_t *) w->data + e*w->nb[2], s*w->nb[2], w->nb[2]);
+                        bytes += w->nb[2];
+                    }
+                    c.key_of[s] = key;
+                    c.slot_map[il][e] = s;
+                    c.move(s, false);
+                    c.n_filled++;
+                }
+                stats_dm.refilled++;
+                stats_dm.refill_bytes += bytes;
+                budget--;
+                any = true;
+            }
+        }
+        if (any) {
+            stats_dm.refill_graphs++;
+        }
+    }
+    // END decode_mem slots
+
+    void dm_switch(ggml_backend_sched_t sched, const std::vector<size_t> & take, const std::vector<size_t> & give, const std::vector<size_t> & need) {
+        const int64_t t0 = ggml_time_us();
+        dm_sync_all(sched);
+
+        for (size_t id : take) {
+            dm_flush_fills(id);
+            for (group & g : groups) {
+                if (g.id == (int32_t) id) {
+                    dm_evict_tail(g);
+                }
+            }
+            if (id < dh_devs.size() && !dh_devs[id].rows.empty()) {
+                dh_devs[id].resync = true;
+            }
+        }
+
+        // the memory moves between the banks and the compute buffer, one thread per device (the VMM calls synchronize the device)
+        std::vector<std::string> err(devices.size());
+        std::vector<size_t> released(devices.size(), 0);
+        auto work = [&](size_t id, bool is_take) {
+            device & d = devices[id];
+            dm_device & dm = dm_devs[id];
+            if (is_take) {
+                for (const group & g : groups) {
+                    if (g.id == (int32_t) id) {
+                        for (const auto & r : g.lend_ranges) {
+                            released[id] += vmm_release(d.buf.get(), r.first, r.second);
+                        }
+                    }
+                }
+                if (need[id] > dm.committed && !vmm_commit(dm.cbuf, dm.committed, need[id] - dm.committed)) {
+                    err[id] = "cannot back the compute buffer of a large batch";
+                    return;
+                }
+                dm.committed = std::max(dm.committed, need[id]);
+                dm.lent = true;
+            } else {
+                const size_t keep = std::min(dm.small, ggml_backend_buffer_get_size(dm.cbuf));
+                vmm_release(dm.cbuf, keep, SIZE_MAX/4); // up to the end of the address space
+                dm.committed = std::min(dm.committed, keep);
+                for (const group & g : groups) {
+                    if (g.id == (int32_t) id) {
+                        for (const auto & r : g.lend_ranges) {
+                            if (!vmm_commit(d.buf.get(), r.first, r.second)) {
+                                err[id] = "cannot back the MoE cache again after a large batch";
+                                return;
+                            }
+                        }
+                    }
+                }
+                if (need[id] > dm.committed && !vmm_commit(dm.cbuf, dm.committed, need[id] - dm.committed)) {
+                    err[id] = "cannot back the compute buffer of a small batch";
+                    return;
+                }
+                dm.committed = std::max(dm.committed, need[id]);
+                dm.lent    = false;
+                dm.n_small = 0;
+            }
+        };
+        std::vector<std::pair<size_t, bool>> jobs;
+        for (size_t id : take) {
+            jobs.push_back({ id, true });
+        }
+        for (size_t id : give) {
+            jobs.push_back({ id, false });
+        }
+        if (jobs.size() == 1) {
+            work(jobs[0].first, jobs[0].second);
+        } else {
+            std::vector<std::thread> threads;
+            for (const auto & j : jobs) {
+                threads.emplace_back(work, j.first, j.second);
+            }
+            for (auto & t : threads) {
+                t.join();
+            }
+        }
+        for (size_t id = 0; id < devices.size(); ++id) {
+            if (!err[id].empty()) {
+                GGML_ABORT("%s: %s: %s (LLAMA_MOE_DECODE_MEM; a smaller --moe-cache-mib or a larger LLAMA_MOE_DECODE_MEM_SPARE_MIB leaves room)",
+                    __func__, ggml_backend_name(devices[id].backend), err[id].c_str());
+            }
+            stats_dm.released += released[id];
+        }
+
+        for (size_t id : give) {
+            for (group & g : groups) {
+                if (g.id == (int32_t) id) {
+                    dm_return_tail(g);
+                }
+            }
+        }
+
+        const int64_t dt = ggml_time_us() - t0;
+        if (!take.empty()) {
+            stats_dm.takes++;
+            stats_dm.take_us += dt;
+            if (stats_dm.takes == 1) {
+                LLAMA_LOG_INFO("%s: first large batch: %zu devices lent their cache tails to the compute buffer in %.1f ms\n", __func__,
+                    take.size(), dt/1000.0);
+            }
+        } else {
+            stats_dm.gives++;
+            stats_dm.give_us += dt;
+        }
+    }
+
     void dh_begin(ggml_cgraph * gf) {
         if (dh_devs.empty()) {
             return;
@@ -2412,6 +3218,7 @@ struct llama_moe_cache::impl {
                 dh_process(id);
             }
             if (!ad_on) {
+                dm_refill(id);
                 dh_upload_map(id);
             }
         }
@@ -2422,6 +3229,7 @@ struct llama_moe_cache::impl {
             }
             for (size_t id = 0; id < dh_devs.size(); ++id) {
                 if (!dh_devs[id].rows.empty()) {
+                    dm_refill(id);
                     dh_upload_map(id);
                 }
             }
@@ -2561,6 +3369,11 @@ struct llama_moe_cache::impl {
             profile_save(false);
         }
         dh_begin(gf);
+        for (size_t id = 0; id < devices.size() && dm_on; ++id) {
+            if (id >= dh_devs.size() || dh_devs[id].rows.empty()) {
+                dm_refill(id);
+            }
+        }
         stash.clear();
         // a direct copy of the previous graph reads the CPU compute buffer, which this graph's CPU parts overwrite
         out_buffered = prev_in_flight;
@@ -2895,6 +3708,21 @@ struct llama_moe_cache::impl {
                 "(%zu via transient slots, %zu cached anyway), %zu over the cap of %d per token\n",
                 a.admitted, a.into_free, a.kept_out, a.transient, a.forced, a.capped, ad_fills_per_token);
         }
+        if (dm_on) {
+            const dm_stats & m = stats_dm;
+            LLAMA_LOG_INFO("llama_moe_cache: decode memory: %zu large-batch takes (%.1f ms each, %.2f MiB released per take), %zu gives "
+                "(%.1f ms each), %zu experts moved, %zu evicted, %zu refilled (%.2f MiB) in %zu graph-devices\n",
+                m.takes, m.takes ? m.take_us/1000.0/m.takes : 0.0, m.takes ? m.released/1024.0/1024.0/m.takes : 0.0,
+                m.gives, m.gives ? m.give_us/1000.0/m.gives : 0.0, m.moved, m.evicted, m.refilled, m.refill_bytes/1024.0/1024.0, m.refill_graphs);
+            for (size_t id = 0; id < dm_devs.size(); ++id) {
+                const dm_device & dm = dm_devs[id];
+                if (dm.lend > 0) {
+                    LLAMA_LOG_INFO("llama_moe_cache: decode memory: %s compute used: small graphs up to %.2f MiB (kept %.2f), large up to %.2f MiB (measured %.2f)\n",
+                        ggml_backend_name(devices[id].backend), dm.used_small_max/1024.0/1024.0, dm.small/1024.0/1024.0,
+                        dm.used_large_max/1024.0/1024.0, dm.large/1024.0/1024.0);
+                }
+            }
+        }
         const dh_stats & ds = stats_dh;
         if (ds.hits + ds.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: device hits: %zu graphs, hits = %zu, misses = %zu read from host memory (%.2f MiB), hit rate = %.2f%%, "
@@ -2913,8 +3741,31 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
-        const std::string & profile) :
-    pimpl(new impl(model, backends, bufts, size, cpu_share, profile)) {
+        const std::string & profile, const llama_moe_cache_compute & compute) :
+    pimpl(new impl(model, backends, bufts, size, cpu_share, profile, compute)) {
+}
+
+bool llama_moe_cache::wants_compute_sizes() {
+    const char * dm    = getenv("LLAMA_MOE_DECODE_MEM");
+    const char * split = getenv("LLAMA_MOE_CACHE_SPLIT");
+    return (dm != nullptr && atoi(dm) != 0) || (split != nullptr && strcmp(split, "miss") == 0);
+}
+
+int32_t llama_moe_cache::small_batch_tokens() {
+    const char * env = getenv("LLAMA_MOE_DECODE_MEM_TOKENS");
+    return env != nullptr ? std::max(1, atoi(env)) : 32;
+}
+
+ggml_backend_buffer_type_t llama_moe_cache::compute_buft(ggml_backend_t backend) const {
+    return pimpl->compute_buft(backend);
+}
+
+float llama_moe_cache::compact_ratio() const {
+    return pimpl->dm_on ? pimpl->dm_compact : 0.0f;
+}
+
+void llama_moe_cache::on_alloc(ggml_backend_sched_t sched) {
+    pimpl->on_alloc(sched);
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

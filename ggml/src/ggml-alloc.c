@@ -493,6 +493,13 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // extent of the current plan in chunk 0 of each buffer, SIZE_MAX if it uses another chunk
+    size_t * used; // [n_buffers]
+
+    // re-plan a graph whose plan reserves more than compact times its own tensor bytes (0: never)
+    float  compact;
+    size_t planned; // tensor bytes reserved by the current plan
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -507,6 +514,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->used = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->used != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -571,6 +581,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
 
     ggml_hash_set_free(&galloc->hash_set);
     free(galloc->hash_values);
+    free(galloc->used);
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
@@ -901,6 +912,14 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    galloc->planned = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        galloc->planned += galloc->node_allocs[i].dst.size_max;
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        galloc->planned += galloc->leaf_allocs[i].leaf.size_max;
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -942,6 +961,9 @@ static bool ggml_gallocr_reserve_n_impl(
                     return false;
                 }
             }
+        }
+        if (!no_alloc) {
+            galloc->used[i] = galloc->buf_tallocs[i]->n_chunks <= 1 ? ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], 0) : SIZE_MAX;
         }
     }
 
@@ -1021,9 +1043,14 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         return true;
     }
 
+    size_t own = 0; // tensor bytes of this graph, for compact
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+
+        if (galloc->compact > 0.0f && !node->data && !node->view_src && node_alloc->dst.buffer_id >= 0) {
+            own += ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->dst.buffer_id], node);
+        }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
@@ -1043,6 +1070,20 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #endif
                 return true;
             }
+        }
+    }
+
+    if (galloc->compact > 0.0f) {
+        for (int i = 0; i < graph->n_leafs; i++) {
+            struct ggml_tensor * leaf = graph->leafs[i];
+            const struct tensor_alloc * la = &galloc->leaf_allocs[i].leaf;
+            if (!leaf->data && !leaf->view_src && la->buffer_id >= 0) {
+                own += ggml_backend_buft_get_alloc_size(galloc->bufts[la->buffer_id], leaf);
+            }
+        }
+        // the plan of a much larger graph would place this one's tensors far into the buffers
+        if (own > 0 && (double) galloc->planned > (double) galloc->compact*(double) own) {
+            return true;
         }
     }
 
@@ -1113,6 +1154,19 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+size_t ggml_gallocr_get_buffer_used(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t * chunk0) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    struct vbuffer * buf = galloc->buffers[buffer_id];
+    if (chunk0 != NULL) {
+        *chunk0 = buf != NULL ? buf->chunks[0] : NULL;
+    }
+    return buf != NULL ? galloc->used[buffer_id] : 0;
+}
+
+void ggml_gallocr_set_compact(ggml_gallocr_t galloc, float ratio) {
+    galloc->compact = ratio;
 }
 
 // utils

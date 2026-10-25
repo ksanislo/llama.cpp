@@ -73,6 +73,12 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// end of the tensors of the last allocated graph in chunk 0 of the buffer (SIZE_MAX if they use another chunk), and that chunk
+GGML_API size_t ggml_gallocr_get_buffer_used(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t * chunk0);
+
+// re-plan a graph whose current plan reserves more than ratio times its own tensor bytes (0, the default: reuse any plan that fits)
+GGML_API void ggml_gallocr_set_compact(ggml_gallocr_t galloc, float ratio);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 

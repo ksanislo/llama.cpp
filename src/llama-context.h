@@ -286,6 +286,12 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // the MoE cache backs the compute memory of each graph (LLAMA_MOE_DECODE_MEM)
+    static void sched_alloc_done(ggml_backend_sched_t sched, void * user_data);
+
+    // the compute buffers with a cache built without memory, for LLAMA_MOE_DECODE_MEM / LLAMA_MOE_CACHE_SPLIT=miss
+    void moe_cache_measure(llama_moe_cache_compute & compute);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);

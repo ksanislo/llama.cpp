@@ -6533,6 +6533,39 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_from_mapped_host_ptr(ggml_
     return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_mapped_buffer_interface, ctx, size);
 }
 
+#if defined(GGML_CUDA_VMM_BUFFER)
+// compute buffers in address space only: their owner backs the ranges a graph uses (ggml_backend_cuda_vmm_buffer_commit)
+// before the graph's tensors are written; the buffers themselves belong to the plain CUDA buffer type of the device
+static ggml_backend_buffer_t ggml_backend_cuda_vmm_compute_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    return ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_cuda_buffer_type(device), size);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_vmm_compute_buffer_type(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    if (device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm || ggml_cuda_unified_memory_enabled()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+    if (!initialized[device]) {
+        ggml_backend_buffer_type_i iface = ggml_backend_cuda_buffer_type_interface;
+        iface.alloc_buffer = ggml_backend_cuda_vmm_compute_buffer_type_alloc_buffer;
+        types[device] = {
+            /* .iface    = */ iface,
+            /* .device   = */ dev,
+            /* .context  = */ ggml_backend_cuda_buffer_type(device)->context,
+        };
+        initialized[device] = true;
+    }
+    return &types[device];
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6571,6 +6604,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_vmm_get_granularity") == 0) {
         return (void *)ggml_backend_cuda_vmm_get_granularity;
+    }
+    if (strcmp(name, "ggml_backend_dev_vmm_compute_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_vmm_compute_buffer_type;
     }
 #endif
     return nullptr;

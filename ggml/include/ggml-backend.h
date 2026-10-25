@@ -351,6 +351,8 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // end of the current graph's tensors in the compute buffer of the backend (SIZE_MAX if the buffer has several chunks), and that buffer
+    GGML_API size_t                     ggml_backend_sched_get_buffer_used(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t * buffer);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
@@ -377,6 +379,13 @@ extern "C" {
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+
+    // called after each graph allocation, before any of its tensors is written (inputs included)
+    typedef void (*ggml_backend_sched_alloc_callback)(ggml_backend_sched_t sched, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_alloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_alloc_callback callback, void * user_data);
+
+    // re-plan the compute buffers of a graph whose current plan reserves more than ratio times its own tensor bytes (0: never)
+    GGML_API void                 ggml_backend_sched_set_compact(ggml_backend_sched_t sched, float ratio);
 
     //
     // Meta backend

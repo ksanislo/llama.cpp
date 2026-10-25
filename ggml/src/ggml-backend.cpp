@@ -973,6 +973,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
+    ggml_backend_sched_alloc_callback callback_alloc;
+    void * callback_alloc_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -2183,6 +2186,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->is_alloc = true;
 
+    if (sched->callback_alloc != NULL) {
+        sched->callback_alloc(sched, sched->callback_alloc_user_data);
+    }
+
     return true;
 }
 
@@ -2238,6 +2245,17 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     sched->callback_realloc_user_data = user_data;
 }
 
+void ggml_backend_sched_set_alloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_alloc_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_alloc = callback;
+    sched->callback_alloc_user_data = user_data;
+}
+
+void ggml_backend_sched_set_compact(ggml_backend_sched_t sched, float ratio) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_set_compact(sched->galloc, ratio);
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
@@ -2273,6 +2291,14 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+size_t ggml_backend_sched_get_buffer_used(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t * buffer) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return ggml_gallocr_get_buffer_used(sched->galloc, backend_index, buffer);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
