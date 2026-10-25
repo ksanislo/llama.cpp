@@ -683,6 +683,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // a shared prefix (e.g. a system prompt): loaded by copy and kept in the cache
+    bool prefix = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -712,9 +715,14 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool prefix = false);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // true if a prefix entry holds exactly the first n tokens of the prompt
+    bool has_prefix(const server_tokens & tokens, size_t n) const;
+
+    // prefer_prefix: a prefix entry wins over the current prompt at the same common prefix,
+    //                for when the current state cannot be truncated without a checkpoint
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool prefer_prefix = false);
 
     void update();
 };

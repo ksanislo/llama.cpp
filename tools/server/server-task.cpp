@@ -1743,14 +1743,32 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+bool server_prompt_cache::has_prefix(const server_tokens & tokens, size_t n) const {
+    for (const auto & state : states) {
+        if (state.prefix && state.prompt.tokens.size() == n && state.prompt.tokens.get_common_prefix(tokens) >= n) {
+            return true;
+        }
+    }
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+    return false;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool prefix) {
+    // first check if the current state is contained fully in the cache
+    // a prefix entry is skipped only if the same prefix is already kept, a longer prompt is loaded by moving it out
+    if (prefix) {
+        if (has_prefix(prompt.tokens, prompt.tokens.size())) {
+            SRV_TRC("%s", " - prefix is already in the cache, skipping\n");
             return nullptr;
+        }
+    } else {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+
+            if (cur_lcp_len == (int) prompt.tokens.size()) {
+                SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+                return nullptr;
+            }
         }
     }
 
@@ -1769,11 +1787,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
+    // remove any cached prompts that are fully contained in the current prompt, except the prefix entries
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (!it->prefix && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1820,12 +1838,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.prefix = */ prefix,
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool prefer_prefix) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1842,7 +1861,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f%s\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur, it->prefix ? " (prefix)" : "");
+
+        if (it->prefix) {
+            // a prefix entry is used only as a whole, it has no checkpoints to truncate it with
+            if (lcp_cur != (int) it->prompt.tokens.size()) {
+                continue;
+            }
+
+            // at the same common prefix, a prefix entry is copied instead of moving a longer prompt out of the cache
+            const bool tie_wins = it_best != states.end() ? !it_best->prefix : prefer_prefix;
+
+            if (f_sim_best < f_sim_cur || (f_sim_best == f_sim_cur && f_keep_best < f_keep_cur && tie_wins)) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+
+                it_best = it;
+            }
+
+            continue;
+        }
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -1858,7 +1896,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        const bool prefix = it_best->prefix;
+
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f%s\n", f_keep_best, f_sim_best, prefix ? " (prefix)" : "");
 
         {
             auto & data = it_best->data.main;
@@ -1871,8 +1911,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!prefix) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
@@ -1889,14 +1931,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!prefix) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (prefix) {
+            // keep the entry, most recently used last
+            prompt = it_best->prompt.clone();
 
-        states.erase(it_best);
+            states.splice(states.end(), states, it_best);
+        } else {
+            prompt = std::move(it_best->prompt);
+
+            states.erase(it_best);
+        }
     }
 
     return true;
@@ -1930,7 +1981,8 @@ void server_prompt_cache::update() {
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0),
+                state.prefix ? " (prefix)" : "");
     }
 }
