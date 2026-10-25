@@ -1357,6 +1357,26 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_batch(const slot_info_vec_t & sinfos) const {
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    uint32_t result = 0;
+    for (const auto & sinfo : sinfos) {
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+
+            uint32_t used = cells.used_max_p1();
+            for (const auto idx : sinfo.idxs[s]) {
+                used = std::max<uint32_t>(used, idx + 1);
+            }
+
+            result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used, n_pad_cur))), result);
+        }
+    }
+
+    return result;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -3322,6 +3342,10 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    if (kv->get_batch_shapes_stable() && this->ubatches.size() > 1) {
+        n_kv_batch = kv->get_n_kv_batch(this->sinfos);
+        LLAMA_LOG_DEBUG("%s: stable shapes: n_kv = %u for the %zu ubatches of the batch\n", __func__, n_kv_batch, this->ubatches.size());
+    }
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -3347,7 +3371,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = std::max(kv->get_n_kv(sinfos[i_cur]), n_kv_batch);
 
     return true;
 }

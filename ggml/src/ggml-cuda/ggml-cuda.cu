@@ -6521,6 +6521,74 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_from_mapped_host_ptr(ggml_
     return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_mapped_buffer_interface, ctx, size);
 }
 
+// copies n blocks of size bytes on the stream of backend: block i from srcs[i] to dst + i*dst_stride
+// a source is device memory or pinned host memory mapped into the device (ggml_backend_dev_buffer_from_mapped_host_ptr),
+// read by the kernel over PCIe: one launch replaces a copy per block, so the stream's queue does not fill up
+#define GGML_CUDA_GATHER_MAX 256
+
+struct ggml_cuda_gather_srcs {
+    const char * p[GGML_CUDA_GATHER_MAX];
+};
+
+template <typename T>
+static __global__ void k_gather_blocks(const ggml_cuda_gather_srcs srcs, char * __restrict__ dst, const size_t dst_stride, const int64_t n_vec) {
+    const T * __restrict__ src = (const T *) srcs.p[blockIdx.y];
+    T * __restrict__ d = (T *) (dst + blockIdx.y*dst_stride);
+
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    // four loads in flight per thread before the stores: a read from host memory has a long latency
+    for (; i + 3*stride < n_vec; i += 4*stride) {
+        const T v0 = src[i];
+        const T v1 = src[i + stride];
+        const T v2 = src[i + 2*stride];
+        const T v3 = src[i + 3*stride];
+        d[i]            = v0;
+        d[i + stride]   = v1;
+        d[i + 2*stride] = v2;
+        d[i + 3*stride] = v3;
+    }
+    for (; i < n_vec; i += stride) {
+        d[i] = src[i];
+    }
+}
+
+static void ggml_backend_cuda_gather_blocks_async(ggml_backend_t backend, void * dst, size_t dst_stride, const void * const * srcs, int n, size_t size) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0 || size == 0) {
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+
+    uintptr_t align = (uintptr_t) dst | dst_stride | size;
+    for (int i = 0; i < n; ++i) {
+        align |= (uintptr_t) srcs[i];
+    }
+    const size_t vec = align % 16 == 0 ? 16 : align % 4 == 0 ? 4 : 1;
+    const int64_t n_vec = size/vec;
+
+    const int threads = 256;
+    const int64_t blocks_x = std::min<int64_t>((n_vec + threads - 1)/threads, 32);
+
+    for (int i0 = 0; i0 < n; i0 += GGML_CUDA_GATHER_MAX) {
+        const int nb = std::min(n - i0, GGML_CUDA_GATHER_MAX);
+        ggml_cuda_gather_srcs args;
+        for (int i = 0; i < nb; ++i) {
+            args.p[i] = (const char *) srcs[i0 + i];
+        }
+        char * d = (char *) dst + (size_t) i0*dst_stride;
+        const dim3 grid((unsigned) blocks_x, (unsigned) nb, 1);
+        switch (vec) {
+            case 16: k_gather_blocks<int4><<<grid, threads, 0, stream>>>(args, d, dst_stride, n_vec); break;
+            case 4:  k_gather_blocks<int> <<<grid, threads, 0, stream>>>(args, d, dst_stride, n_vec); break;
+            default: k_gather_blocks<char><<<grid, threads, 0, stream>>>(args, d, dst_stride, n_vec); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6543,6 +6611,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_buffer_from_mapped_host_ptr") == 0) {
         return (void *)ggml_backend_cuda_buffer_from_mapped_host_ptr;
+    }
+    if (strcmp(name, "ggml_backend_gather_blocks_async") == 0) {
+        return (void *)ggml_backend_cuda_gather_blocks_async;
     }
 #if defined(GGML_CUDA_VMM_BUFFER)
     if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {

@@ -404,6 +404,15 @@ private:
 
     copy_experts_info copy_experts;
 
+    // LLAMA_MOE_GATHER: per backend the gather function of its device, per (device, host buffer) its address in the device
+    using gather_blocks_t = void (*)(ggml_backend_t, void *, size_t, const void * const *, int, size_t);
+    std::map<ggml_backend_t, gather_blocks_t> gather_fns;
+    std::map<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>, const uint8_t *> gather_host_bases;
+    std::vector<const void *> gather_srcs;
+
+    // copy every expert of the host weight src to its copy dst with one gather (the cached experts from the MoE cache)
+    bool gather_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst);
+
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
@@ -461,6 +470,12 @@ private:
     double   prompt_pipe       = 0.0;
     uint32_t prompt_pipe_chunk = 0; // the chunk of the decode in progress, 0 when the batch was not planned
     int32_t  n_pipe_devices    = 0; // the stages: devices holding layers
+    // LLAMA_PROMPT_PIPE_STABLE (default 1): the chunks of a piped batch keep one graph shape (n_kv and the k-pool sizes of the
+    // batch's end) and allocate in the layout of the first, instead of re-reserving the worst case before each chunk
+    bool     prompt_pipe_stable = true;
+    // LLAMA_MOE_GATHER (default 1): the experts of a large batch are copied with one gather kernel per weight (cached ones
+    // from the MoE cache, the others read from pinned host memory), instead of one copy per run of experts
+    bool     moe_gather         = true;
 
     // perf
     mutable int64_t t_start_us  = 0;

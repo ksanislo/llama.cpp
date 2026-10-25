@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1006,18 +1007,34 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// GGML_SCHED_WAIT_LOG=1: name the reason of each reallocation (with pipeline parallelism it synchronizes every device)
+static bool ggml_gallocr_log_realloc(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_SCHED_WAIT_LOG");
+        enabled = env != NULL && atoi(env) != 0;
+    }
+    return enabled != 0;
+}
+
+static size_t ggml_gallocr_node_size(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+    return !node->data && !node->view_src && talloc->buffer_id >= 0 ? ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node) : 0;
+}
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const bool log = ggml_gallocr_log_realloc();
+
     if (galloc->n_nodes != graph->n_nodes) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
-#endif
+        if (log) {
+            GGML_LOG_INFO("%s: graph has %d nodes, the layout %d\n", __func__, graph->n_nodes, galloc->n_nodes);
+        }
         return true;
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
-#endif
+        if (log) {
+            GGML_LOG_INFO("%s: graph has %d leafs, the layout %d\n", __func__, graph->n_leafs, galloc->n_leafs);
+        }
         return true;
     }
 
@@ -1026,9 +1043,11 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
-#endif
+            if (log) {
+                GGML_LOG_INFO("%s: node %d %s (%s, %" PRId64 " x %" PRId64 " x %" PRId64 " x %" PRId64 ") needs %zu bytes, the layout has %zu\n",
+                        __func__, i, node->name, ggml_op_desc(node), node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                        ggml_gallocr_node_size(galloc, node, &node_alloc->dst), node_alloc->dst.size_max);
+            }
             return true;
         }
 
@@ -1038,9 +1057,11 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
-#endif
+                if (log) {
+                    GGML_LOG_INFO("%s: src %d (%s, %" PRId64 " x %" PRId64 " x %" PRId64 " x %" PRId64 ") of node %d %s needs %zu bytes, the layout has %zu\n",
+                            __func__, j, src->name, src->ne[0], src->ne[1], src->ne[2], src->ne[3], i, node->name,
+                            ggml_gallocr_node_size(galloc, src, &node_alloc->src[j]), node_alloc->src[j].size_max);
+                }
                 return true;
             }
         }

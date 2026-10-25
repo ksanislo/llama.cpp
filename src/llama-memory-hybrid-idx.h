@@ -71,6 +71,9 @@ public:
     // elastic YaRN: the attention cache moves its keys, the pooled indexer keys of a moved sequence are rebuilt
     void seq_rope_level_set(llama_seq_id seq_id, int32_t level) override;
 
+    // the attention cache, the indexer cache and the k-pool sizes
+    void set_batch_shapes_stable(bool stable) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -228,6 +231,9 @@ private:
 
     // unique_ptr because kpool_state is incomplete here.
     std::unique_ptr<kpool_state> kpool_st;
+
+    // prompt pipe (batch shapes stable): a bound on the pools at the end of the batch, 0 = off
+    uint32_t n_pool_batch = 0;
 
     // The ubatch kpool_st was built for, guards against reads before apply.
     size_t i_kpool = SIZE_MAX;

@@ -135,6 +135,10 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+void llama_memory_hybrid::set_batch_shapes_stable(bool stable) {
+    mem_attn->set_batch_shapes_stable(stable);
+}
+
 bool llama_memory_hybrid::rope_level_enable() {
     return mem_attn->rope_level_enable();
 }

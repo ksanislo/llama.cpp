@@ -635,12 +635,19 @@ llama_context::llama_context(
                 }
             }
             n_pipe_devices = (int32_t) devs.size();
+            if (const char * env = getenv("LLAMA_PROMPT_PIPE_STABLE")) {
+                prompt_pipe_stable = atoi(env) != 0;
+            }
             if (cparams.pipeline_parallel && n_pipe_devices > 1) {
-                LLAMA_LOG_INFO("%s: prompt pipe: batches are read in chunks planned for %d stages (LLAMA_PROMPT_PIPE=%g)\n",
-                        __func__, n_pipe_devices, prompt_pipe);
+                LLAMA_LOG_INFO("%s: prompt pipe: batches are read in chunks planned for %d stages (LLAMA_PROMPT_PIPE=%g, stable shapes %d)\n",
+                        __func__, n_pipe_devices, prompt_pipe, prompt_pipe_stable);
             } else {
                 LLAMA_LOG_INFO("%s: prompt pipe not used: it needs pipeline parallelism over several devices\n", __func__);
             }
+        }
+
+        if (const char * env = getenv("LLAMA_MOE_GATHER")) {
+            moe_gather = atoi(env) != 0;
         }
 
         if (cparams.moe_cache_size > 0) {
@@ -1634,7 +1641,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const uint32_t n_tokens_reserve = std::min(cparams.n_ctx, cparams.n_ubatch);
         // a prompt pipe chunk fits the worst-case graph too: keep (or make) that reservation, else every chunk reallocates
         // and the reallocation synchronizes all the devices, which serializes the pipeline
-        if (ubatch.n_tokens != n_tokens_reserve && prompt_pipe_chunk == 0) {
+        // with stable shapes the chunks allocate in the layout of the first one: the synthetic worst case does not assign the
+        // nodes to the backends as a real chunk does, so reserving it again before each chunk would reallocate every chunk
+        if (prompt_pipe_chunk > 0 && prompt_pipe_stable) {
+            // keep the layout of the previous chunk
+        } else if (ubatch.n_tokens != n_tokens_reserve && prompt_pipe_chunk == 0) {
             worst_case_reserved = false;
         } else if (!worst_case_reserved) {
             const auto mctx_reserve = memory ? memory->init_full() : nullptr;
@@ -2168,6 +2179,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     std::vector<int64_t> t_pipe_enqueue_us;
     const int32_t n_reallocs_pipe = n_reallocs_all;
+
+    // the chunks of a piped batch keep the shape of its last one (see set_batch_shapes_stable)
+    // (LLAMA_BATCH_SHAPES_STABLE=1 does it for every batch, a check that the shapes do not change the results)
+    static const bool shapes_force = [] { const char * env = getenv("LLAMA_BATCH_SHAPES_STABLE"); return env && atoi(env) != 0; }();
+    const bool pipe_stable = memory && ((prompt_pipe_chunk > 0 && prompt_pipe_stable && n_tokens_all > prompt_pipe_chunk) || shapes_force);
+    struct shapes_reset {
+        llama_memory_i * mem;
+        ~shapes_reset() { if (mem) { mem->set_batch_shapes_stable(false); } }
+    } shapes_reset_on_exit { pipe_stable ? memory.get() : nullptr };
+    if (pipe_stable) {
+        memory->set_batch_shapes_stable(true);
+    }
 
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch_cur, embd_all);
@@ -3090,6 +3113,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             if (!lctx->moe_cache || !lctx->pp_cache_copy || lctx->moe_cache->get_experts(src) == nullptr) {
                 return false;
             }
+            // one gather instead of a copy per run of cached or uncached experts: with ~100 copies per weight the device's
+            // queue fills up and the host queues the next chunks at the device's pace, which serializes the prompt pipe
+            if (lctx->moe_gather && lctx->gather_experts(backend, src, dst)) {
+                return true;
+            }
             int64_t next = 0;
             for (int64_t e = 0; e < n_expert; ) {
                 const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, n_expert - 1);
@@ -3163,6 +3191,60 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         first = last + 1;
     }
+
+    return true;
+}
+
+bool llama_context::gather_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || src->buffer == nullptr || dst->data == nullptr || src->nb[2] != dst->nb[2] ||
+        !ggml_are_same_shape(src, dst) || src->type != dst->type) {
+        return false;
+    }
+
+    auto it_fn = gather_fns.find(backend);
+    if (it_fn == gather_fns.end()) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto fn = reg ? (gather_blocks_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_gather_blocks_async") : nullptr;
+        it_fn = gather_fns.emplace(backend, fn).first;
+    }
+    if (it_fn->second == nullptr) {
+        return false;
+    }
+
+    // the host experts as the device addresses them (pinned memory mapped into the device), nullptr if it cannot
+    const auto key = std::make_pair(dev, src->buffer);
+    auto it_base = gather_host_bases.find(key);
+    if (it_base == gather_host_bases.end()) {
+        using from_mapped_t = ggml_backend_buffer_t (*)(ggml_backend_dev_t, void *, size_t);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto from_mapped = reg ? (from_mapped_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_from_mapped_host_ptr") : nullptr;
+        const uint8_t * base = nullptr;
+        if (from_mapped) {
+            ggml_backend_buffer_t mapped = from_mapped(dev, ggml_backend_buffer_get_base(src->buffer), ggml_backend_buffer_get_size(src->buffer));
+            if (mapped) {
+                base = (const uint8_t *) ggml_backend_buffer_get_base(mapped);
+                ggml_backend_buffer_free(mapped);
+            }
+        }
+        if (base == nullptr) {
+            LLAMA_LOG_WARN("%s: %s cannot read the host experts in place, LLAMA_MOE_GATHER is not used for them\n", __func__, ggml_backend_dev_name(dev));
+        }
+        it_base = gather_host_bases.emplace(key, base).first;
+    }
+    if (it_base->second == nullptr) {
+        return false;
+    }
+    const uint8_t * host = it_base->second + ((const uint8_t *) src->data - (const uint8_t *) ggml_backend_buffer_get_base(src->buffer));
+
+    const int64_t n_expert = src->ne[2];
+    const size_t  size     = src->nb[1]*src->ne[1];
+    gather_srcs.resize(n_expert);
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const void * cached = moe_cache ? moe_cache->cached_expert(backend, src, e, size) : nullptr;
+        gather_srcs[e] = cached ? cached : host + e*src->nb[2];
+    }
+    it_fn->second(backend, dst->data, dst->nb[2], gather_srcs.data(), (int) n_expert, size);
 
     return true;
 }

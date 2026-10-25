@@ -1799,6 +1799,29 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    const void * cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e, size_t size) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return nullptr;
+        }
+        const binding & b = it->second;
+        const group & g = groups[layers[b.il].ig];
+        if (backend != devices[g.id].backend) {
+            return nullptr;
+        }
+        const int32_t * slots = g.slru.slot_map[b.il];
+        if (slots == nullptr || slots[e] >= g.n_slots) {
+            return nullptr;
+        }
+        const ggml_tensor * bank = g.banks[b.ip];
+        GGML_ASSERT(bank->nb[1] == w->nb[1] && size <= bank->nb[2]);
+
+        stats_copy.hits  += 1;
+        stats_copy.bytes += size;
+
+        return (const uint8_t *) bank->data + (size_t) slots[e]*bank->nb[2];
+    }
+
     static const ggml_tensor * base_of(const ggml_tensor * t) {
         while (t->view_src != nullptr) {
             t = t->view_src;
@@ -2462,6 +2485,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+const void * llama_moe_cache::cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e, size_t size) {
+    return pimpl->cached_expert(backend, w, e, size);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

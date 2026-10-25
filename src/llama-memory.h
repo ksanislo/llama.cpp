@@ -125,6 +125,10 @@ struct llama_memory_i {
     // rotated with, and a sequence can move its cached keys to another level
     //
 
+    // prompt pipe: the ubatches of the next batches keep one graph shape (the sizes of the batch's last ubatch), so the
+    // compute buffers planned for the first fit the others and a pipelined batch never reallocates them
+    virtual void set_batch_shapes_stable(bool /*stable*/) {}
+
     // track the rope levels; false if this memory cannot re-rotate its cached keys
     virtual bool rope_level_enable() { return false; }
 

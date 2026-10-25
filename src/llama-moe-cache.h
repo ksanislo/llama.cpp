@@ -90,6 +90,10 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // for large batches: the device address of expert e of w in the cache of backend, nullptr if it is not cached there
+    // (counted as copied from the cache: the caller copies size bytes from it)
+    const void * cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e, size_t size);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

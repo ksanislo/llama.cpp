@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <cinttypes>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -991,8 +992,13 @@ struct ggml_backend_sched {
     // GGML_SCHED_WAIT_LOG=1: the host time each graph spends blocked in the scheduler, by cause; with pipeline
     // parallelism any of it holds the graphs behind it, as one thread queues the work of every device
     int     wait_log;
-    int64_t wait_us[5];
-    int     wait_n[5];
+    int64_t wait_us[6];
+    int     wait_n[6];
+    // the longest host split and synchronous copy of the graph (first node / input name)
+    int64_t wait_host_max_us;
+    int64_t wait_sync_max_us;
+    char    wait_host_max[2*GGML_MAX_NAME + 32];
+    char    wait_sync_max[GGML_MAX_NAME];
 };
 
 enum ggml_sched_wait {
@@ -1001,6 +1007,7 @@ enum ggml_sched_wait {
     GGML_SCHED_WAIT_SYNC_COPY,  // an input copied synchronously (no async copy between the backends)
     GGML_SCHED_WAIT_CALLBACK,   // the copy callback (e.g. reading MUL_MAT_ID ids back)
     GGML_SCHED_WAIT_HOST_SPLIT, // a split computed by a host backend
+    GGML_SCHED_WAIT_LAUNCH,     // queueing the split on a device: long when its queue is full (the host runs at device speed)
 };
 
 static inline int64_t ggml_sched_wait_begin(const ggml_backend_sched * sched) {
@@ -1809,6 +1816,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            if (sched->wait_log) {
+                const struct ggml_tensor * node = sched->graph.nodes[i];
+                GGML_LOG_INFO("%s: backend of node %d of %d changed, %s -> %s: %s (%s, %" PRId64 " x %" PRId64 " x %" PRId64 " x %" PRId64 ")\n",
+                        __func__, i, sched->graph.n_nodes, ggml_backend_name(sched->backends[sched->prev_node_backend_ids[i]]),
+                        ggml_backend_name(sched->backends[sched->node_backend_ids[i]]), node->name, ggml_op_desc(node),
+                        node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+            }
             break;
         }
     }
@@ -1817,6 +1831,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
+                if (sched->wait_log) {
+                    const struct ggml_tensor * leaf = sched->graph.leafs[i];
+                    GGML_LOG_INFO("%s: backend of leaf %d of %d changed, %s -> %s: %s (%" PRId64 " x %" PRId64 " x %" PRId64 " x %" PRId64 ")\n",
+                            __func__, i, sched->graph.n_leafs, ggml_backend_name(sched->backends[sched->prev_leaf_backend_ids[i]]),
+                            ggml_backend_name(sched->backends[sched->leaf_backend_ids[i]]), leaf->name,
+                            leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3]);
+                }
                 break;
             }
         }
@@ -1939,6 +1960,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         }
         ggml_backend_tensor_copy(input, input_cpy);
         ggml_sched_wait_end(sched, GGML_SCHED_WAIT_SYNC_COPY, t0);
+        if (sched->wait_log && ggml_time_us() - t0 > sched->wait_sync_max_us) {
+            sched->wait_sync_max_us = ggml_time_us() - t0;
+            snprintf(sched->wait_sync_max, sizeof(sched->wait_sync_max), "%s", input->name);
+        }
     }
 }
 
@@ -1984,6 +2009,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (sched->wait_log) {
         memset(sched->wait_us, 0, sizeof(sched->wait_us));
         memset(sched->wait_n,  0, sizeof(sched->wait_n));
+        sched->wait_host_max_us = 0;
+        sched->wait_sync_max_us = 0;
+        sched->wait_host_max[0] = 0;
+        sched->wait_sync_max[0] = 0;
     }
     const int64_t t_graph_us = ggml_sched_wait_begin(sched);
 
@@ -2025,10 +2054,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             const bool    host_split = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-            const int64_t t0 = host_split ? ggml_sched_wait_begin(sched) : 0;
+            const int64_t t0 = ggml_sched_wait_begin(sched);
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-            if (host_split) {
-                ggml_sched_wait_end(sched, GGML_SCHED_WAIT_HOST_SPLIT, t0);
+            ggml_sched_wait_end(sched, host_split ? GGML_SCHED_WAIT_HOST_SPLIT : GGML_SCHED_WAIT_LAUNCH, t0);
+            if (host_split && sched->wait_log && ggml_time_us() - t0 > sched->wait_host_max_us) {
+                sched->wait_host_max_us = ggml_time_us() - t0;
+                snprintf(sched->wait_host_max, sizeof(sched->wait_host_max), "%s..%s (%d nodes)",
+                        split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "",
+                        split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : "", split->graph.n_nodes);
             }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2079,11 +2112,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t * u = sched->wait_us;
         const int     * n = sched->wait_n;
         GGML_LOG_INFO("%s: %d splits queued in %.1f ms; host blocked: prev split %d x %.1f ms, inputs %d x %.1f ms, "
-                "sync copies %d x %.1f ms, copy callbacks %d x %.1f ms, host splits %d x %.1f ms\n", __func__, sched->n_splits,
+                "sync copies %d x %.1f ms, copy callbacks %d x %.1f ms, host splits %d x %.1f ms, device launches %d x %.1f ms\n", __func__, sched->n_splits,
                 (ggml_time_us() - t_graph_us)/1000.0,
                 n[GGML_SCHED_WAIT_PREV_SPLIT], u[GGML_SCHED_WAIT_PREV_SPLIT]/1000.0, n[GGML_SCHED_WAIT_INPUT],     u[GGML_SCHED_WAIT_INPUT]/1000.0,
                 n[GGML_SCHED_WAIT_SYNC_COPY],  u[GGML_SCHED_WAIT_SYNC_COPY]/1000.0,  n[GGML_SCHED_WAIT_CALLBACK],  u[GGML_SCHED_WAIT_CALLBACK]/1000.0,
-                n[GGML_SCHED_WAIT_HOST_SPLIT], u[GGML_SCHED_WAIT_HOST_SPLIT]/1000.0);
+                n[GGML_SCHED_WAIT_HOST_SPLIT], u[GGML_SCHED_WAIT_HOST_SPLIT]/1000.0, n[GGML_SCHED_WAIT_LAUNCH],    u[GGML_SCHED_WAIT_LAUNCH]/1000.0);
+        if (sched->wait_host_max_us > 1000 || sched->wait_sync_max_us > 1000) {
+            GGML_LOG_INFO("%s:   longest host split %.1f ms: %s; longest sync copy %.1f ms: %s\n", __func__,
+                    sched->wait_host_max_us/1000.0, sched->wait_host_max, sched->wait_sync_max_us/1000.0, sched->wait_sync_max);
+        }
     }
 
     return GGML_STATUS_SUCCESS;

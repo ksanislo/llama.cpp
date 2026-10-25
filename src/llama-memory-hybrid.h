@@ -79,6 +79,8 @@ public:
     std::vector<llama_seq_id> seq_rope_group    (llama_seq_id seq_id) const override;
     void                      seq_rope_level_set(llama_seq_id seq_id, int32_t level) override;
 
+    void set_batch_shapes_stable(bool stable) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

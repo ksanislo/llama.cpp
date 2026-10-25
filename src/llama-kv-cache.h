@@ -217,6 +217,13 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // the n_kv of the last ubatch of a batch: its cells and the cells in use, padded like get_n_kv
+    uint32_t get_n_kv_batch(const slot_info_vec_t & sinfos) const;
+
+    // prompt pipe: the ubatches of a batch keep the n_kv of its last one, so their graphs have one shape
+    void set_batch_shapes_stable(bool stable) override { batch_shapes_stable = stable; }
+    bool get_batch_shapes_stable() const { return batch_shapes_stable; }
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -278,6 +285,8 @@ public:
 private:
     const llama_model & model;
     const llama_hparams & hparams;
+
+    bool batch_shapes_stable = false;
 
     struct kv_layer {
         // layer index in the model
@@ -489,6 +498,9 @@ public:
 
 private:
     llama_memory_status status;
+
+    // n_kv of every ubatch, set when the cache keeps the batch shapes stable
+    uint32_t n_kv_batch = 0;
 
     llama_kv_cache * kv;
     llama_context * lctx;
