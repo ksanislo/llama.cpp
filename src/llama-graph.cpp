@@ -3603,10 +3603,10 @@ ggml_tensor * llm_graph_context::build_fused_top_k_mask(
     return cur;
 }
 
-// query tokens per sparse attention chunk, LLAMA_QSA_CHUNK overrides it for tests, 0 disables the split
+// query tokens per sparse attention chunk (LLAMA_QSA_CHUNK, PR #30815 uses 2048); unset or 0 = no split, as before the PR
 static int64_t llm_qchunk_n() {
     static const char * env = getenv("LLAMA_QSA_CHUNK");
-    static const int64_t n_chunk = env ? std::max<int64_t>(0, atoll(env)) : 2048;
+    static const int64_t n_chunk = env ? std::max<int64_t>(0, atoll(env)) : 0;
     return n_chunk;
 }
 

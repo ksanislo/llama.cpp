@@ -115,15 +115,89 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
-    const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
-                        n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
-                                             flash_attn_mask_to_sparse_indices<8, false>;
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 2 || ncols1 == 4 || ncols1 == 8);
+    const bool oob = n_queries % ncols1 != 0;
+    const auto kernel = ncols1 == 1 ? flash_attn_mask_to_sparse_indices<1, false> :
+                        ncols1 == 2 ? (oob ? flash_attn_mask_to_sparse_indices<2, true> : flash_attn_mask_to_sparse_indices<2, false>) :
+                        ncols1 == 4 ? (oob ? flash_attn_mask_to_sparse_indices<4, true> : flash_attn_mask_to_sparse_indices<4, false>) :
+                                      (oob ? flash_attn_mask_to_sparse_indices<8, true> : flash_attn_mask_to_sparse_indices<8, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// GGML_CUDA_FA_SPARSE_PROMPT=<queries>x<heads> (1x16, 2x16, 1x8, 2x8, 4x8): prompt batches of the 256/256 sparse attention
+// (qwen4exp QSA) gather each query tile's selected cells instead of running the dense kernel over the masked range, as
+// Strata's prompt attention does; GGML_CUDA_FA_SPARSE_PROMPT_MIN_KV (default 8192) is the smallest n_kv. Unset = off.
+struct ggml_cuda_fa_sparse_prompt_cfg {
+    int     ncols1 = 0;
+    int     ncols2 = 0;
+    int64_t min_kv = 8192;
+};
+
+static const ggml_cuda_fa_sparse_prompt_cfg & ggml_cuda_fa_sparse_prompt() {
+    static const ggml_cuda_fa_sparse_prompt_cfg cfg = [] {
+        ggml_cuda_fa_sparse_prompt_cfg c;
+        const char * s = getenv("GGML_CUDA_FA_SPARSE_PROMPT");
+        int a = 0, b = 0;
+        if (s && *s && strcmp(s, "0") != 0) {
+            if (sscanf(s, "%dx%d", &a, &b) != 2) {
+                b = 16; // a bare query count takes the 16-head tile (gqa 12 in one tile)
+                a = atoi(s);
+            }
+            const bool ok = (b == 16 && (a == 1 || a == 2)) || (b == 8 && (a == 1 || a == 2 || a == 4));
+            if (ok) {
+                c.ncols1 = a;
+                c.ncols2 = b;
+            } else {
+                GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE_PROMPT=%s is not one of 1x16 2x16 1x8 2x8 4x8, off\n", __func__, s);
+            }
+        }
+        const char * m = getenv("GGML_CUDA_FA_SPARSE_PROMPT_MIN_KV");
+        if (m && *m) {
+            c.min_kv = std::max<int64_t>(0, atoll(m));
+        }
+        if (c.ncols1 > 0) {
+            GGML_LOG_INFO("%s: sparse prompt attention: %d queries x %d heads per tile, from n_kv %lld\n",
+                __func__, c.ncols1, c.ncols2, (long long) c.min_kv);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+// the conditions of every sparse variant: a mask row per query, no ALiBi/softcap, an n_kv_max hint
+static bool ggml_cuda_fa_sparse_possible(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+        mask != nullptr && ggml_get_op_params_i32(dst, 4) > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1;
+}
+
+// the prompt switch takes this tile shape for this op
+static bool ggml_cuda_fa_sparse_prompt_applies(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+    const auto & sp = ggml_cuda_fa_sparse_prompt();
+    if (sp.ncols1 != ncols1 || sp.ncols2 != ncols2) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    // prompt sized batches only: decode and MTP verify keep their own choice
+    return Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] > 32 &&
+        K->ne[1] >= sp.min_kv && K->ne[1] > ggml_get_op_params_i32(dst, 4) && ggml_cuda_fa_sparse_possible(cc, dst);
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -133,6 +207,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
+
+    if (ggml_cuda_fa_sparse_prompt_applies(cc, dst, ncols1, ncols2)) {
+        return true;
+    }
+    // the shapes only the prompt switch gathers with: their dense kernels stay dense
+    if (Q->ne[0] == 256 && (ncols2 == 16 || (ncols2 == 8 && (ncols1 == 2 || ncols1 == 4)))) {
+        return false;
+    }
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -219,6 +301,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256) {
+        const auto & sp = ggml_cuda_fa_sparse_prompt();
+        if (sp.ncols1 > 0 && use_gqa_opt && gqa_ratio > 1 && ggml_cuda_fa_sparse_prompt_applies(cc, dst, sp.ncols1, sp.ncols2)) {
+            switch (sp.ncols1*100 + sp.ncols2) {
+                case 116: ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 16>(ctx, dst); return;
+                case 216: ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2, 16>(ctx, dst); return;
+                case 108: ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1,  8>(ctx, dst); return;
+                case 208: ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2,  8>(ctx, dst); return;
+                case 408: ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4,  8>(ctx, dst); return;
+                default: break;
+            }
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
