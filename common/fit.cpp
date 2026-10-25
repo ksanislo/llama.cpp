@@ -706,8 +706,13 @@ static void common_params_fit_impl(
             }
             if (done && fits) {
                 // try to fit part of one more layer on each device, like below
+                // (not with the MoE cache: it only takes layers with all of their experts in host memory,
+                // the rest of a partial layer would stay uncached and run on the CPU for every token)
                 std::vector<int64_t> mem = mem_test;
                 for (const common_layer_fraction_t lf : {LAYER_FRACTION_GATE, LAYER_FRACTION_UP}) {
+                    if (cparams->moe_cache_size > 0) {
+                        break;
+                    }
                     std::vector<ngl_t> ngl_per_device_part = ngl_per_device_test;
                     for (size_t id = 0; id < nd; id++) {
                         if (ngl_per_device_part[id].n_part > 0 && ngl_per_device_part[id].overflow_type == LAYER_FRACTION_MOE) {
