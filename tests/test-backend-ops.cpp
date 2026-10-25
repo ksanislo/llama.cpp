@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "llama-moe-lane.h"
 
 #include <algorithm>
 #include <atomic>
@@ -5812,6 +5813,189 @@ struct test_mul_mat_id_mapped : public test_case {
     }
 };
 
+// MoE CPU lane (ggml_moe_doorbell / ggml_moe_join, served by llama_moe_lane as in llama.cpp): an expert FFN (gate, up, swiglu,
+// down) through ggml_mul_mat_id_mapped where the doorbell hands a share frac of the misses to the CPU lane, compared with the plain
+// MUL_MAT_ID FFN on all the experts in the same graph. The lane computes its experts with ggml-cpu, the backend the others, so the
+// halves agree within the usual CPU-vs-backend tolerance on the tested backend (bit for bit on the CPU); then compared with the CPU.
+struct test_moe_cpu_lane : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_slots;
+    const int n_used;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n;   // tokens
+    const float frac;
+    const float clamp; // > 0: swiglu_clamp
+
+    ggml_backend_buffer_ptr chan_buf;
+    uint8_t * chan = nullptr;
+    ggml_context_ptr host_ctx;
+    std::vector<std::vector<uint8_t>> host_data;
+    std::unique_ptr<llama_moe_lane> lane;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, n_mats, n_slots, n_used, n_embd, n_ff, n, frac, clamp);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_CPU_LANE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t h = n/2;
+        const double e_a = nmse(a, a + h, h);
+        if (e_a > max_nmse_err()) {
+            printf("[lane != plain on the tested backend: NMSE = %.9f] ", e_a);
+            return INFINITY;
+        }
+        if (lane && lane->get_stats().timeouts > 0) {
+            printf("[the join timed out] ");
+            return INFINITY;
+        }
+        return nmse(a, b, n);
+    }
+
+    test_moe_cpu_lane(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 16, int n_slots = 6, int n_used = 4,
+            int64_t n_embd = 512, int64_t n_ff = 256, int64_t n = 1, float frac = 0.7f, float clamp = 0.0f)
+        : type_a(type_a), n_mats(n_mats), n_slots(n_slots), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n(n), frac(frac), clamp(clamp) {
+        GGML_ASSERT(n_used <= n_mats && n_slots <= n_mats);
+    }
+
+    // the channel in memory the host and the tested backend share: pinned host memory of a GPU (mapped, UVA) or plain host memory
+    void init_chan() {
+        if (chan != nullptr) {
+            return;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+            if (ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev)) {
+                buft = host;
+            }
+        }
+        const size_t size = ggml_moe_lane_layout(n_embd, n_used, n, nullptr, nullptr, nullptr);
+        chan_buf.reset(ggml_backend_buft_alloc_buffer(buft, size));
+        GGML_ASSERT(chan_buf);
+        ggml_backend_buffer_clear(chan_buf.get(), 0);
+        chan = (uint8_t *) ggml_backend_buffer_get_base(chan_buf.get());
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        init_chan();
+        lane.reset(); // a new lane per graph (initialize_tensors)
+
+        auto experts = [&](const char * name, int64_t k, int64_t m, int64_t n_e) {
+            ggml_tensor * t = ggml_new_tensor_3d(ctx, type_a, k, m, n_e);
+            ggml_set_name(t, name);
+            return t;
+        };
+        ggml_tensor * up      = experts("up",        n_embd, n_ff,   n_mats);
+        ggml_tensor * gate    = experts("gate",      n_embd, n_ff,   n_mats);
+        ggml_tensor * down    = experts("down",      n_ff,   n_embd, n_mats);
+        ggml_tensor * up_b    = experts("up_bank",   n_embd, n_ff,   n_slots);
+        ggml_tensor * gate_b  = experts("gate_bank", n_embd, n_ff,   n_slots);
+        ggml_tensor * down_b  = experts("down_bank", n_ff,   n_embd, n_slots);
+
+        ggml_tensor * ids_mapped = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids_mapped, "ids_mapped");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n);
+        ggml_set_name(x, "x");
+
+        auto ffn = [&](ggml_tensor * u, ggml_tensor * g, ggml_tensor * d, ggml_tensor * ub, ggml_tensor * gb, ggml_tensor * db, ggml_tensor * sel) {
+            ggml_tensor * yu = ub ? ggml_mul_mat_id_mapped(ctx, ub, u, x, sel) : ggml_mul_mat_id(ctx, u, x, sel);
+            ggml_tensor * yg = gb ? ggml_mul_mat_id_mapped(ctx, gb, g, x, sel) : ggml_mul_mat_id(ctx, g, x, sel);
+            ggml_tensor * act = clamp > 0.0f ? ggml_swiglu_clamp(ctx, yg, yu, clamp) : ggml_swiglu_split(ctx, yg, yu);
+            return db ? ggml_mul_mat_id_mapped(ctx, db, d, act, sel) : ggml_mul_mat_id(ctx, d, act, sel);
+        };
+
+        ggml_tensor * lane_ids = ggml_moe_doorbell(ctx, ids_mapped, x, chan, n_mats, (int) n, frac);
+        ggml_set_name(lane_ids, "lane_ids");
+        ggml_tensor * lane_out = ggml_moe_join(ctx, ffn(up, gate, down, up_b, gate_b, down_b, lane_ids), lane_ids, chan, n_mats, (int) n, 5000);
+        ggml_set_name(lane_out, "lane");
+        ggml_tensor * plain = ffn(up, gate, down, nullptr, nullptr, nullptr, ids);
+        ggml_set_name(plain, "plain");
+
+        ggml_tensor * out = ggml_concat(ctx, lane_out, plain, 2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234 + n);
+        const char * names[3] = { "up", "gate", "down" };
+        const char * banks[3] = { "up_bank", "gate_bank", "down_bank" };
+        for (const char * name : names) {
+            init_tensor_uniform(ggml_get_tensor(ctx, name));
+        }
+        init_tensor_uniform(ggml_get_tensor(ctx, "x"));
+
+        // the banks hold copies of n_slots of the experts, in random slots
+        std::vector<int32_t> perm(n_mats);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        std::vector<int32_t> slot_of(n_mats, -1);
+        for (int i = 0; i < 3; ++i) {
+            ggml_tensor * all  = ggml_get_tensor(ctx, names[i]);
+            ggml_tensor * bank = ggml_get_tensor(ctx, banks[i]);
+            std::vector<uint8_t> expert(all->nb[2]);
+            for (int s = 0; s < n_slots; ++s) {
+                slot_of[perm[s]] = s;
+                ggml_backend_tensor_get(all, expert.data(), perm[s]*all->nb[2], expert.size());
+                ggml_backend_tensor_set(bank, expert.data(), s*bank->nb[2], expert.size());
+            }
+        }
+
+        // distinct experts per token, hits read their slot, misses -1 - e; tokens share some experts
+        ggml_tensor * ids        = ggml_get_tensor(ctx, "ids");
+        ggml_tensor * ids_mapped = ggml_get_tensor(ctx, "ids_mapped");
+        std::vector<int32_t> all(n_mats);
+        std::iota(all.begin(), all.end(), 0);
+        for (int64_t t = 0; t < n; ++t) {
+            std::shuffle(all.begin(), all.end(), rng);
+            std::vector<int32_t> row_mapped(n_used);
+            for (int i = 0; i < n_used; ++i) {
+                row_mapped[i] = slot_of[all[i]] >= 0 ? slot_of[all[i]] : -1 - all[i];
+            }
+            ggml_backend_tensor_set(ids, all.data(), t*ids->nb[1], n_used*sizeof(int32_t));
+            ggml_backend_tensor_set(ids_mapped, row_mapped.data(), t*ids_mapped->nb[1], n_used*sizeof(int32_t));
+        }
+
+        // the lane reads host copies of the experts
+        ggml_init_params ip = { ggml_tensor_overhead()*8, nullptr, true };
+        host_ctx.reset(ggml_init(ip));
+        host_data.assign(3, {});
+        ggml_tensor * host[3];
+        for (int i = 0; i < 3; ++i) {
+            ggml_tensor * w = ggml_get_tensor(ctx, names[i]);
+            host_data[i].resize(ggml_nbytes(w));
+            ggml_backend_tensor_get(w, host_data[i].data(), 0, ggml_nbytes(w));
+            host[i] = ggml_new_tensor(host_ctx.get(), w->type, 3, w->ne);
+            host[i]->data = host_data[i].data();
+        }
+        lane = std::make_unique<llama_moe_lane>(1, 4, 0);
+        llama_moe_lane_layer l;
+        l.chan       = chan;
+        l.n_expert   = n_mats;
+        l.n_used     = n_used;
+        l.max_tokens = (int32_t) n;
+        l.n_embd     = n_embd;
+        l.up         = host[0];
+        l.gate       = host[1];
+        l.down       = host[2];
+        l.clamp      = clamp;
+        lane->set(0, l);
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11553,6 +11737,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 #endif
+
+    // MoE CPU lane beside the device hits: expert types of Flash-Next UD-Q4_K_XL and DeepSeek-V4.1 IQ2_XS
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (int n : {1, 2, 4, 8}) {
+            for (float frac : {0.3f, 0.7f, 1.0f}) {
+                test_cases.emplace_back(new test_moe_cpu_lane(ta, 16, 6, 4, 512, 256, n, frac));
+            }
+        }
+        test_cases.emplace_back(new test_moe_cpu_lane(ta, 64, 20, 10, 1024, 512, 1, 0.7f));
+    }
+    test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 6, 4, 512, 256, 1, 0.0f)); // no lane
+    test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 16, 4, 512, 256, 4, 1.0f)); // all hits
+    test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_IQ2_XS, 16, 6, 4, 512, 256, 2, 0.7f, 7.0f)); // swiglu_clamp
 
     // MoE cache device hits: expert types of Flash-Next UD-Q4_K_XL and DeepSeek-V4.1 IQ2_XS, decode-sized batches
     for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q6_K,

@@ -351,6 +351,8 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // end of the current graph's tensors in the compute buffer of the backend (SIZE_MAX if the buffer has several chunks), and that buffer
+    GGML_API size_t                     ggml_backend_sched_get_buffer_used(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t * buffer);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
@@ -391,6 +393,17 @@ extern "C" {
     // ggml_backend_tensor_get_async of an output of the last graph: with submit threads queued by the thread of `backend`
     // after the splits of that graph, else directly
     GGML_API void                 ggml_backend_sched_tensor_get_async(ggml_backend_sched_t sched, ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+    // called after each graph allocation, before any of its tensors is written (inputs included)
+    typedef void (*ggml_backend_sched_alloc_callback)(ggml_backend_sched_t sched, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_alloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_alloc_callback callback, void * user_data);
+
+    // submit threads: called on the thread of `backend` before (begin) and after (!begin) it queues its part of the graph in
+    // pipeline copy `copy`, so per-device work around a graph is queued in order on that device's streams
+    typedef void (*ggml_backend_sched_submit_callback)(ggml_backend_sched_t sched, ggml_backend_t backend, int copy, bool begin, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_submit_callback callback, void * user_data);
+
+    // re-plan the compute buffers of a graph whose current plan reserves more than ratio times its own tensor bytes (0: never)
+    GGML_API void                 ggml_backend_sched_set_compact(ggml_backend_sched_t sched, float ratio);
 
     //
     // Meta backend

@@ -1703,8 +1703,9 @@ static void ggml_compute_forward_mul_mat_id(
                 int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 // a negative id selects expert -1 - id of src_alt, without src_alt it skips the row, its result is zero
+                // so does an id past the experts of src_alt (an expert of the MoE CPU lane, ggml_moe_doorbell)
                 if (i02 < 0) {
-                    if (src_alt == NULL) {
+                    if (src_alt == NULL || -1 - (int64_t) i02 >= src_alt->ne[2]) {
                         memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
                         continue;
                     }
@@ -2127,6 +2128,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
+            } break;
+        case GGML_OP_MOE_DOORBELL:
+            {
+                ggml_compute_forward_moe_doorbell(params, tensor);
+            } break;
+        case GGML_OP_MOE_JOIN:
+            {
+                ggml_compute_forward_moe_join(params, tensor);
             } break;
         case GGML_OP_GET_REL_POS:
             {
@@ -2567,6 +2576,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+        case GGML_OP_MOE_DOORBELL:
+        case GGML_OP_MOE_JOIN:
             {
                 n_tasks = 1;
             } break;

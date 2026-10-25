@@ -673,6 +673,14 @@ static __global__ void mul_mat_vec_q(
     if (use_alt) {
         vx        = fusion.x_alt;
         channel_x = uint32_t(-1 - int32_t(channel_x));
+        if (channel_x >= uint32_t(fusion.n_alt)) {
+            // an expert of the MoE CPU lane (ggml_moe_doorbell): zero here, ggml_moe_join adds the CPU's result
+            if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block &&
+                    (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+                dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + threadIdx.x] = 0.0f;
+            }
+            return;
+        }
     }
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
@@ -960,6 +968,13 @@ static __global__ void mul_mat_vec_q_moe(
         channel_x = uint32_t(-1 - int32_t(channel_x));
         if constexpr (has_fusion) {
             vgate = fusion.gate_alt;
+        }
+        if (channel_x >= uint32_t(fusion.n_alt)) {
+            // an expert of the MoE CPU lane (ggml_moe_doorbell): zero here, ggml_moe_join adds the CPU's result
+            if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+            }
+            return;
         }
     }
 
@@ -1563,6 +1578,7 @@ void ggml_cuda_mul_mat_vec_q(
         GGML_ASSERT(ids);
         GGML_ASSERT(x_alt->type == src0->type && x_alt->nb[1] == src0->nb[1] && x_alt->nb[2] == src0->nb[2]);
         fusion_local.x_alt = x_alt->data;
+        fusion_local.n_alt = (int32_t) x_alt->ne[2];
         if (fusion && fusion->gate) {
             GGML_ASSERT(fusion->gate_alt && fusion->gate_alt->type == src0->type && fusion->gate_alt->nb[2] == src0->nb[2]);
             fusion_local.gate_alt = fusion->gate_alt->data;

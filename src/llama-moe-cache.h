@@ -20,12 +20,38 @@ struct llama_model;
 // are uploaded on a second stream while the current layer and the attention of the next one compute (decode, cached batches only)
 // with LLAMA_MOE_DEVICE_HITS=1|2 small batches look the slots up on the device and read the misses straight from the pinned host experts,
 // so their graph has no host step; the experts they select are logged on the device and the next graph fills the cache from the log
+// with LLAMA_MOE_CPU_LANE=f in addition, a share f of their misses is computed by a CPU thread pool while the device computes the rest
+// with LLAMA_MOE_DECODE_MEM=1 the cache of a device also holds the part of its compute buffer that only large batches use: the
+// tails of its banks are released while such a batch runs and that compute memory is backed instead, then the reverse
+// with LLAMA_MOE_CACHE_SPLIT=miss the budget is split among the devices by the profiled routings of their experts
+
+// the compute buffers of the context, measured with a cache built without memory (measure)
+struct llama_moe_cache_compute {
+    bool measure = false;
+    std::vector<size_t> large; // [backends] compute buffer of the worst-case batch
+    std::vector<size_t> small; // [backends] compute buffer of a small batch (LLAMA_MOE_DECODE_MEM_TOKENS)
+};
+
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    // profile: expert usage profile (see --moe-cache-profile), empty = LLAMA_MOE_CACHE_PROFILE or none
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
+            const std::string & profile = "", const llama_moe_cache_compute & compute = {});
     ~llama_moe_cache();
+
+    // whether the context should measure its compute buffers first (LLAMA_MOE_DECODE_MEM, LLAMA_MOE_CACHE_SPLIT=miss)
+    static bool wants_compute_sizes();
+    // tokens of the small batch to measure
+    static int32_t small_batch_tokens();
+
+    // LLAMA_MOE_DECODE_MEM: the compute buffer type for the scheduler on this backend, nullptr to keep the default
+    ggml_backend_buffer_type_t compute_buft(ggml_backend_t backend) const;
+    // how much larger than a graph's own tensors its compute buffer plan may be before it is re-planned (0: any)
+    float compact_ratio() const;
+    // ggml_backend_sched alloc callback: back the compute memory the graph uses, lending the cache's tails for large batches
+    void on_alloc(ggml_backend_sched_t sched);
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
@@ -60,6 +86,15 @@ public:
     // the host experts of w as a device tensor (mapped pinned memory), for ggml_mul_mat_id_mapped; nullptr without device hits
     ggml_tensor * get_mapped_experts(const ggml_tensor * w, int64_t n_tokens, int64_t n_expert_used) const;
 
+    // LLAMA_MOE_CPU_LANE: the channel (device address) for ggml_moe_doorbell/ggml_moe_join if a share of the misses of layer il
+    // is computed by the CPU lane beside the device for n_tokens tokens, nullptr otherwise; registers the layer's host experts
+    // (up, gate and down, or gate_up and down) and activation (swiglu, or swiglu_clamp if clamp > 0) with the lane
+    void * cpu_lane(int32_t il, int64_t n_tokens, int64_t n_expert_used, const ggml_tensor * up, const ggml_tensor * gate,
+            const ggml_tensor * down, const ggml_tensor * gate_up, float clamp);
+    float   cpu_lane_frac() const;
+    int32_t cpu_lane_max_tokens() const;
+    int32_t cpu_lane_timeout_ms() const;
+
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     ggml_tensor * get_cpu_map(int32_t il) const;
 
@@ -85,6 +120,15 @@ public:
 
     // whether the copy callback may run on the scheduler's submit threads (one per device), else why not
     bool submit_threads_ok(std::string & why) const;
+
+    // submit threads: once before a batch they queue (the threads skip begin() and launched())
+    void submit_settle();
+
+    // submit threads: the LLAMA_MOE_RING plan of the graph in pipeline copy `copy` (scheduler's thread, before it is queued)
+    void ring_plan_copy(ggml_cgraph * graph, int copy);
+
+    // submit threads: on the thread of backend, before (begin) and after it queues its part of the graph in pipeline copy `copy`
+    void submit_graph(ggml_backend_t backend, int copy, bool begin);
 
     // called after the graph is queued
     void launched();

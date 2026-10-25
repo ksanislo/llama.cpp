@@ -2398,6 +2398,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    // LLAMA_MOE_CPU_LANE (device path only): a share of the misses is computed by the CPU beside the device, see llama_moe_cache
+    // the doorbell marks them in the slots (the device computes zero for them) and publishes x, the join adds the CPU's rows
+    void * lane = nullptr;
+    int32_t lane_n_expert = 0;
+    if (slots != nullptr && cpu_ids == nullptr && moe_cache->cpu_lane_frac() > 0.0f && moe_cache->device_hits(il, n_tokens, n_expert_used) &&
+            !weight_before_ffn && loras->empty() && type_op == LLM_FFN_SILU && (gate_exps != nullptr || gate_up_exps != nullptr) &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+            arch != LLM_ARCH_MISTRAL4 && arch != LLM_ARCH_MELLUM && arch != LLM_ARCH_FLINT &&
+            std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; })) {
+        // the activation of build_experts below: swiglu, or swiglu_clamp for these architectures
+        float clamp = 0.0f;
+        bool  ok    = true;
+        if (gate_exps != nullptr && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+            ok = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT ||
+                (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
+            clamp = hparams.swiglu_clamp_exp[il];
+        }
+        if (ok) {
+            lane = moe_cache->cpu_lane(il, n_tokens, n_expert_used, up_exps, gate_exps, down_exps, gate_up_exps, clamp);
+        }
+    }
+    if (lane != nullptr) {
+        lane_n_expert = (int32_t) (gate_up_exps ? gate_up_exps : up_exps)->ne[2];
+        slots = ggml_moe_doorbell(ctx0, slots, cur, lane, lane_n_expert, moe_cache->cpu_lane_max_tokens(), moe_cache->cpu_lane_frac());
+        ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
+        cb(slots, "ffn_moe_lane_slots", il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2570,6 +2598,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
     if (cpu_ids == nullptr) {
         experts = build_experts(cur, selected_experts, slots, true);
+        if (lane != nullptr) {
+            experts = ggml_moe_join(ctx0, experts, slots, lane, lane_n_expert, moe_cache->cpu_lane_max_tokens(), moe_cache->cpu_lane_timeout_ms());
+            ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
+            cb(experts, "ffn_moe_down_lane", il);
+        }
     } else {
         // the device computes the cached experts and the CPU the misses left to it, each reads the others as zero
         ggml_tensor * experts_dev = build_experts(cur, selected_experts, slots, true);

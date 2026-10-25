@@ -1108,9 +1108,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_DOORBELL",
+    "MOE_JOIN",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1227,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_doorbell(ids,x)",
+    "moe_join(a,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3479,6 +3485,73 @@ struct ggml_tensor * ggml_mul_mat_id_mapped(
 
     struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
     result->src[3] = as_alt;
+
+    return result;
+}
+
+// ggml_moe_doorbell, ggml_moe_join
+
+size_t ggml_moe_lane_layout(int64_t n_embd, int64_t n_used, int64_t max_tokens, size_t * off_ids, size_t * off_x, size_t * off_rows) {
+    const size_t a = 256;
+    size_t off = a; // header
+    if (off_ids)  { *off_ids  = off; } off += GGML_PAD((size_t) (n_used*max_tokens)*sizeof(int32_t), a);
+    if (off_x)    { *off_x    = off; } off += GGML_PAD((size_t) (n_embd*max_tokens)*sizeof(float), a);
+    if (off_rows) { *off_rows = off; } off += GGML_PAD((size_t) (n_embd*n_used*max_tokens)*sizeof(float), a);
+    return off;
+}
+
+struct ggml_tensor * ggml_moe_doorbell(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * x,
+        void                * chan,
+        int                   n_expert,
+        int                   max_tokens,
+        float                 frac) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_nelements(x) == x->ne[0]*ids->ne[1] && ids->ne[1] <= max_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 2, ids->ne);
+
+    int32_t params[5];
+    memcpy(params, &chan, sizeof(chan));
+    params[2] = n_expert;
+    params[3] = max_tokens;
+    memcpy(params + 4, &frac, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_DOORBELL;
+    result->src[0] = ids;
+    result->src[1] = x;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * ids,
+        void                * chan,
+        int                   n_expert,
+        int                   max_tokens,
+        int                   timeout_ms) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(a->ne[1] == ids->ne[0] && a->ne[2] == ids->ne[1] && a->ne[3] == 1 && ids->ne[1] <= max_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, a->ne);
+
+    int32_t params[5];
+    memcpy(params, &chan, sizeof(chan));
+    params[2] = n_expert;
+    params[3] = max_tokens;
+    params[4] = timeout_ms;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_JOIN;
+    result->src[0] = a;
+    result->src[1] = ids;
 
     return result;
 }

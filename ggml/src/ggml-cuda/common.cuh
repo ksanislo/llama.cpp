@@ -1597,6 +1597,7 @@ struct ggml_cuda_mm_fusion_args_device {
     // MUL_MAT_ID: an id < 0 reads expert -1 - id from these instead of vx / gate (e.g. mapped host memory)
     const void * x_alt = nullptr;
     const void * gate_alt = nullptr;
+    int32_t n_alt = 0; // experts in x_alt: an id < -n_alt computes zero (an expert of the MoE CPU lane, ggml_moe_doorbell)
 };
 
 struct ggml_cuda_kernel_launch_params {

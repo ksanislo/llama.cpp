@@ -359,6 +359,61 @@ static std::vector<float> reference(const std::vector<float> & x) {
     return h;
 }
 
+// the submit callback as llama's MoE ring uses it (ring_plan_copy / submit_graph): the scheduler's thread leaves a per-copy plan
+// (here the graph number) before the graph is queued, each backend's thread takes it at begin; checks that every backend sees
+// begin/end alternating, the graphs in order, always on one thread (not the caller's with threads)
+#define PROBE_MAX_COPIES 16
+
+struct submit_probe {
+    std::mutex mtx;
+    int plan[PROBE_MAX_COPIES] = {};
+    int next[3] = {};
+    bool open[3] = {};
+    std::thread::id tid[3];
+    ggml_backend_t backends[3] = {};
+    std::thread::id main_tid;
+    bool threads = false;
+    int n_err = 0;
+};
+
+static void submit_probe_cb(ggml_backend_sched_t, ggml_backend_t backend, int copy, bool begin, void * user_data) {
+    auto * p = (submit_probe *) user_data;
+    std::lock_guard<std::mutex> lock(p->mtx);
+    int b = 0;
+    while (b < 3 && p->backends[b] != backend) {
+        b++;
+    }
+    auto err = [&](const char * what) {
+        if (p->n_err++ < 5) {
+            fprintf(stderr, "  submit callback: backend %d copy %d %s: %s\n", b, copy, begin ? "begin" : "end", what);
+        }
+    };
+    if (b == 3 || copy < 0 || copy >= PROBE_MAX_COPIES) {
+        err("unknown backend or copy");
+        return;
+    }
+    if (p->tid[b] == std::thread::id()) {
+        p->tid[b] = std::this_thread::get_id();
+    } else if (p->tid[b] != std::this_thread::get_id()) {
+        err("called on another thread");
+    }
+    if (p->threads && std::this_thread::get_id() == p->main_tid) {
+        err("called on the scheduler's thread");
+    }
+    if (begin) {
+        if (p->open[b]) {
+            err("begin twice");
+        }
+        if (p->plan[copy] != p->next[b]) {
+            err("graph out of order");
+        }
+        p->next[b]++;
+    } else if (!p->open[b]) {
+        err("end without begin");
+    }
+    p->open[b] = begin;
+}
+
 // run n_graph graphs: with submit threads none of them is synchronized before the end
 static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<std::vector<float>> & out) {
     ggml_backend_t backends[3] = { tdev_init(0, seed), tdev_init(1, seed + 1), ggml_backend_cpu_init() };
@@ -374,6 +429,15 @@ static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<
     if (threads && !ggml_backend_sched_set_submit_threads(sched, true)) {
         fprintf(stderr, "submit threads refused\n");
         return false;
+    }
+    submit_probe probe;
+    probe.threads  = threads;
+    probe.main_tid = std::this_thread::get_id();
+    for (int b = 0; b < 3; b++) {
+        probe.backends[b] = backends[b];
+    }
+    if (threads) {
+        ggml_backend_sched_set_submit_callback(sched, submit_probe_cb, &probe);
     }
 
     const size_t ctx_size = ggml_tensor_overhead()*256 + ggml_graph_overhead();
@@ -423,6 +487,10 @@ static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<
         }
         inputs[c] = make_input(c);
         ggml_backend_tensor_set(inp, inputs[c].data(), 0, ggml_nbytes(inp));
+        {
+            std::lock_guard<std::mutex> lock(probe.mtx);
+            probe.plan[ggml_backend_sched_get_copy(sched)] = c;
+        }
 
         if (ggml_backend_sched_graph_compute_async(sched, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "compute failed\n");
@@ -438,6 +506,15 @@ static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<
     }
     if (threads) {
         ggml_backend_sched_set_submit_threads(sched, false);
+        for (int b = 0; b < 3; b++) {
+            if (probe.open[b] || probe.next[b] != n_graph) {
+                fprintf(stderr, "  submit callback: backend %d saw %d of %d graphs%s\n", b, probe.next[b], n_graph, probe.open[b] ? ", one not ended" : "");
+                probe.n_err++;
+            }
+        }
+        if (probe.n_err > 0) {
+            ok = false;
+        }
     }
     ggml_backend_sched_synchronize(sched);
 

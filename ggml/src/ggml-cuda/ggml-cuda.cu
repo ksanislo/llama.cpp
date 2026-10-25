@@ -54,6 +54,7 @@
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
+#include "ggml-cuda/moe-lane.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -2840,6 +2841,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
+            break;
+        case GGML_OP_MOE_DOORBELL:
+            ggml_cuda_op_moe_doorbell(ctx, dst);
+            break;
+        case GGML_OP_MOE_JOIN:
+            ggml_cuda_op_moe_join(ctx, dst);
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
@@ -6385,6 +6392,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_MOE_DOORBELL:
+            // the channel must be pinned host memory mapped to the device, which the caller ensures
+            return ggml_nelements(op->src[0]) <= MOE_LANE_MAX_IDS && ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_VOLTA;
+        case GGML_OP_MOE_JOIN:
+            return ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_VOLTA;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -6764,6 +6776,38 @@ static void ggml_backend_cuda_copy_blocks_async(ggml_backend_t backend, void * c
         CUDA_CHECK(cudaGetLastError());
     }
 }
+#if defined(GGML_CUDA_VMM_BUFFER)
+// compute buffers in address space only: their owner backs the ranges a graph uses (ggml_backend_cuda_vmm_buffer_commit)
+// before the graph's tensors are written; the buffers themselves belong to the plain CUDA buffer type of the device
+static ggml_backend_buffer_t ggml_backend_cuda_vmm_compute_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    return ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_cuda_buffer_type(device), size);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_vmm_compute_buffer_type(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    if (device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm || ggml_cuda_unified_memory_enabled()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+    if (!initialized[device]) {
+        ggml_backend_buffer_type_i iface = ggml_backend_cuda_buffer_type_interface;
+        iface.alloc_buffer = ggml_backend_cuda_vmm_compute_buffer_type_alloc_buffer;
+        types[device] = {
+            /* .iface    = */ iface,
+            /* .device   = */ dev,
+            /* .context  = */ ggml_backend_cuda_buffer_type(device)->context,
+        };
+        initialized[device] = true;
+    }
+    return &types[device];
+}
+#endif
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -6815,6 +6859,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_vmm_get_granularity") == 0) {
         return (void *)ggml_backend_cuda_vmm_get_granularity;
+    }
+    if (strcmp(name, "ggml_backend_dev_vmm_compute_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_vmm_compute_buffer_type;
     }
 #endif
     return nullptr;
