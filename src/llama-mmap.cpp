@@ -479,7 +479,7 @@ struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, const llama_mmap::ranges & interleave_ranges) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -489,8 +489,8 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        // MAP_POPULATE would fault in the lazy ranges too
-        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+        // MAP_POPULATE would fault in the lazy ranges too, and the interleaved ranges before they are placed
+        if (prefetch && lazy_ranges.empty() && interleave_ranges.empty()) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
@@ -509,6 +509,19 @@ struct llama_mmap::impl {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., %s) failed: %s\n", name, strerror(errno));
             }
         };
+
+        if (!interleave_ranges.empty()) {
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            size_t total = 0;
+            for (const auto & range : interleave_ranges) {
+                const size_t beg = range.first & ~(page_size - 1);
+                const size_t end = std::min(range.second, file->size());
+                if (beg < end && ggml_numa_interleave_mapped((char *) addr + beg, end - beg, fd, beg)) {
+                    total += end - beg;
+                }
+            }
+            LLAMA_LOG_INFO("llama_mmap: %.2f MiB of host weights interleaved over the NUMA nodes\n", total/1024.0/1024.0);
+        }
 
         if (prefetch > 0) {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
@@ -586,8 +599,9 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, const llama_mmap::ranges & interleave_ranges) {
         GGML_UNUSED(numa);
+        GGML_UNUSED(interleave_ranges);
 
         size = file->size();
 
@@ -655,11 +669,12 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges, const llama_mmap::ranges & interleave_ranges) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(lazy_ranges);
+        GGML_UNUSED(interleave_ranges);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -677,7 +692,7 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges, const ranges & interleave_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, interleave_ranges)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
