@@ -71,6 +71,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/vmm-buffer.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -786,6 +787,9 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if defined(GGML_CUDA_VMM_BUFFER)
+    ggml_cuda_vmm_region * vmm = nullptr; // dev_ptr is backed on demand, see ggml_backend_cuda_vmm_buffer_alloc
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -793,6 +797,12 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_CUDA_VMM_BUFFER)
+        if (vmm) {
+            ggml_cuda_vmm_region_free(vmm);
+            return;
+        }
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -904,6 +914,13 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+
+#if defined(GGML_CUDA_VMM_BUFFER)
+    if (ctx->vmm) {
+        ggml_cuda_vmm_region_memset_backed(ctx->vmm, value);
+        return;
+    }
+#endif
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
@@ -1019,6 +1036,132 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// buffer with address space for the whole size and no memory yet: back ranges with ggml_backend_cuda_vmm_buffer_commit
+// unbacked ranges read as zeros; nothing may write to them
+ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    if (!ggml_backend_buft_is_cuda(buft) || ggml_cuda_unified_memory_enabled()) {
+        return nullptr;
+    }
+
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (!info.devices[device].vmm) {
+        return nullptr;
+    }
+
+    const int physical_device = ggml_cuda_get_physical_device(device);
+
+    // same access as the VMM pool: peers too when peer access is on
+    std::vector<CUmemAccessDesc> access;
+    bool use_peer_access = ggml_cuda_p2p_enabled();
+#if defined(GGML_USE_NCCL)
+    use_peer_access = true;
+#endif // defined(GGML_USE_NCCL)
+    bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+    for (int id = 0; id < info.device_count; ++id) {
+        const int id_physical = ggml_cuda_get_physical_device(id);
+        if (id_physical != physical_device) {
+            if (!use_peer_access) {
+                continue;
+            }
+            int can_access_peer = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
+            if (!can_access_peer) {
+                continue;
+            }
+        }
+        if (physical_seen[id_physical]) {
+            continue;
+        }
+        physical_seen[id_physical] = true;
+        CUmemAccessDesc desc = {};
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id   = id_physical;
+        desc.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access.push_back(desc);
+    }
+
+    ggml_cuda_vmm_region * vmm = ggml_cuda_vmm_region_create(device, physical_device, info.devices[device].vmm_granularity, size, access);
+    if (vmm == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) vmm->base);
+    ctx->vmm = vmm;
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+#else
+    GGML_UNUSED(buft);
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+#if defined(GGML_CUDA_VMM_BUFFER)
+static ggml_cuda_vmm_region * ggml_backend_cuda_buffer_get_vmm(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return nullptr;
+    }
+    return ((ggml_backend_cuda_buffer_context *) buffer->context)->vmm;
+}
+#endif
+
+bool ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    ggml_cuda_vmm_region * vmm = ggml_backend_cuda_buffer_get_vmm(buffer);
+    if (vmm == nullptr) {
+        return true; // fully backed
+    }
+    return ggml_cuda_vmm_region_commit(vmm, offset, size);
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return true;
+#endif
+}
+
+size_t ggml_backend_cuda_vmm_buffer_release(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    ggml_cuda_vmm_region * vmm = ggml_backend_cuda_buffer_get_vmm(buffer);
+    if (vmm == nullptr) {
+        return 0;
+    }
+    return ggml_cuda_vmm_region_release(vmm, offset, size);
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return 0;
+#endif
+}
+
+size_t ggml_backend_cuda_vmm_buffer_get_backed_size(ggml_backend_buffer_t buffer) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    ggml_cuda_vmm_region * vmm = ggml_backend_cuda_buffer_get_vmm(buffer);
+    if (vmm == nullptr) {
+        return buffer ? ggml_backend_buffer_get_size(buffer) : 0;
+    }
+    return vmm->n_backed*vmm->granularity;
+#else
+    return buffer ? ggml_backend_buffer_get_size(buffer) : 0;
+#endif
+}
+
+size_t ggml_backend_cuda_vmm_get_granularity(ggml_backend_buffer_type_t buft) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    if (!ggml_backend_buft_is_cuda(buft)) {
+        return 0;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    return ggml_cuda_info().devices[device].vmm ? ggml_cuda_info().devices[device].vmm_granularity : 0;
+#else
+    GGML_UNUSED(buft);
+    return 0;
+#endif
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -6261,6 +6404,23 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#if defined(GGML_CUDA_VMM_BUFFER)
+    if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_alloc;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_commit") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_commit;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_release") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_release;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_get_backed_size") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_get_backed_size;
+    }
+    if (strcmp(name, "ggml_backend_vmm_get_granularity") == 0) {
+        return (void *)ggml_backend_cuda_vmm_get_granularity;
+    }
+#endif
     return nullptr;
 }
 
