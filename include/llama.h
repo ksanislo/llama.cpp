@@ -583,6 +583,11 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+
+    // the ubatch size a batch of n_tokens is read in: n_ubatch, or the prompt pipe's chunk (env LLAMA_PROMPT_PIPE)
+    LLAMA_API uint32_t llama_prompt_chunk(const struct llama_context * ctx, uint32_t n_tokens);
+    // true if the prompt pipe plans the ubatches of large batches (LLAMA_PROMPT_PIPE, pipeline parallelism on)
+    LLAMA_API bool     llama_prompt_pipe (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

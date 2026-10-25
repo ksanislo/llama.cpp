@@ -11,6 +11,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-prompt-pipe.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -622,6 +623,26 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (const char * env = getenv("LLAMA_PROMPT_PIPE")) {
+            prompt_pipe = std::max(0.0, atof(env));
+        }
+        if (prompt_pipe > 0.0) {
+            std::vector<ggml_backend_dev_t> devs;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                ggml_backend_dev_t dev = model.dev_layer(il);
+                if (dev != nullptr && std::find(devs.begin(), devs.end(), dev) == devs.end()) {
+                    devs.push_back(dev);
+                }
+            }
+            n_pipe_devices = (int32_t) devs.size();
+            if (cparams.pipeline_parallel && n_pipe_devices > 1) {
+                LLAMA_LOG_INFO("%s: prompt pipe: batches are read in chunks planned for %d stages (LLAMA_PROMPT_PIPE=%g)\n",
+                        __func__, n_pipe_devices, prompt_pipe);
+            } else {
+                LLAMA_LOG_INFO("%s: prompt pipe not used: it needs pipeline parallelism over several devices\n", __func__);
+            }
+        }
+
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
@@ -1018,6 +1039,17 @@ uint32_t llama_context::n_batch() const {
 
 uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
+}
+
+bool llama_context::prompt_pipe_on() const {
+    return prompt_pipe > 0.0 && cparams.pipeline_parallel && n_pipe_devices > 1 && cparams.causal_attn && !cparams.embeddings;
+}
+
+uint32_t llama_context::prompt_chunk(uint32_t n_tokens) const {
+    if (!prompt_pipe_on()) {
+        return cparams.n_ubatch;
+    }
+    return (uint32_t) llama_prompt_pipe_chunk(n_tokens, cparams.n_ubatch, n_pipe_devices, prompt_pipe);
 }
 
 uint32_t llama_context::n_seq_max() const {
@@ -1600,7 +1632,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // (e.g. a small batch with host weights), otherwise every ubatch of the prompt reallocates the compute buffers
     if (cparams.pipeline_parallel && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {
         const uint32_t n_tokens_reserve = std::min(cparams.n_ctx, cparams.n_ubatch);
-        if (ubatch.n_tokens != n_tokens_reserve) {
+        // a prompt pipe chunk fits the worst-case graph too: keep (or make) that reservation, else every chunk reallocates
+        // and the reallocation synchronizes all the devices, which serializes the pipeline
+        if (ubatch.n_tokens != n_tokens_reserve && prompt_pipe_chunk == 0) {
             worst_case_reserved = false;
         } else if (!worst_case_reserved) {
             const auto mctx_reserve = memory ? memory->init_full() : nullptr;
@@ -1623,7 +1657,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // (a reused graph synchronizes the scheduler under pipeline parallelism, so the prompt pipe's chunks are rebuilt)
+    if (!graph_reuse_disable && prompt_pipe_chunk == 0 && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1654,10 +1689,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const int32_t n_reallocs = n_reallocs_all;
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        if (prompt_pipe_chunk > 0 && n_reallocs_all != n_reallocs) {
+            // the chunk's graph did not fit the worst-case reservation: it holds this graph's layout now
+            worst_case_reserved = false;
         }
 
         gf_res_prev_active = res;
@@ -2114,8 +2154,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // LLAMA_PROMPT_PIPE: the chunks of a long batch, sized so the stages of the layer split read them at once
+    // (prompt_pipe_chunk is set for this decode only: it also marks its large chunks for the copy callback and the reserve)
+    const bool     pipe_on      = !embd_all && prompt_pipe > 0.0 && cparams.pipeline_parallel && n_pipe_devices > 1;
+    const uint32_t n_ubatch_cur = pipe_on ? prompt_chunk(n_tokens_all) : cparams.n_ubatch;
+    prompt_pipe_chunk = pipe_on && n_tokens_all >= 512 ? n_ubatch_cur : 0;
+    struct pipe_reset {
+        uint32_t & chunk;
+        ~pipe_reset() { chunk = 0; }
+    } pipe_reset_on_exit { prompt_pipe_chunk };
+    if (prompt_pipe_chunk > 0 && n_tokens_all > prompt_pipe_chunk) {
+        LLAMA_LOG_INFO("%s: prompt pipe: %u tokens in %u-token chunks over %d stages\n", __func__, n_tokens_all, prompt_pipe_chunk, n_pipe_devices);
+    }
+    std::vector<int64_t> t_pipe_enqueue_us;
+    const int32_t n_reallocs_pipe = n_reallocs_all;
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_cur, embd_all);
         if (!mctx) {
             return -2;
         }
@@ -2192,7 +2247,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        const int64_t t_ub_us = prompt_pipe_chunk > 0 ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (prompt_pipe_chunk > 0) {
+            t_pipe_enqueue_us.push_back(ggml_time_us() - t_ub_us);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2405,6 +2464,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 output_ids[out_ids[i]] = i;
             }
         }
+    }
+
+    // with the prompt pipe, the host time to queue each chunk: a chunk that took about as long as its compute was not
+    // overlapped with the others (something synchronized the host)
+    if (t_pipe_enqueue_us.size() > 1) {
+        std::string ms;
+        for (const int64_t t : t_pipe_enqueue_us) {
+            ms += (ms.empty() ? "" : ", ") + std::to_string((t + 500)/1000);
+        }
+        LLAMA_LOG_INFO("%s: prompt pipe: queued %zu chunks in [%s] ms, %d graph reallocations\n", __func__,
+                t_pipe_enqueue_us.size(), ms.c_str(), n_reallocs_all - n_reallocs_pipe);
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
@@ -2914,12 +2984,14 @@ llm_graph_params llama_context::graph_params(
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+
+    lctx->n_reallocs_all++;
+
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
-
-    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
@@ -3006,7 +3078,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     if (lctx->cparams.pipeline_parallel) {
         const int64_t n_ids      = ggml_nelements(ids);
         const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
-        st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : full_batch && n_ids >= 64*n_expert);
+        // a prompt pipe chunk never reads the ids back (the host sync would hold every later chunk): at 4 ids per expert
+        // ~98% of the experts are used anyway (Strata streams them all from 1024 tokens on)
+        const bool    piped      = lctx->prompt_pipe_chunk > 0 && n_ids >= 4*n_expert;
+        st.upload_all = st.upload_all || piped || (st.prev_in_flight ? n_ids >= 16*n_expert : full_batch && n_ids >= 64*n_expert);
         if (st.upload_all) {
             // the experts in the MoE cache of this device are still copied from device memory, without reading the ids
             if (!lctx->moe_cache || !lctx->pp_cache_copy || lctx->moe_cache->get_experts(src) == nullptr) {
@@ -4424,6 +4499,14 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+uint32_t llama_prompt_chunk(const llama_context * ctx, uint32_t n_tokens) {
+    return ctx->prompt_chunk(n_tokens);
+}
+
+bool llama_prompt_pipe(const llama_context * ctx) {
+    return ctx->prompt_pipe_on();
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

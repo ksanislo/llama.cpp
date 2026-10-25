@@ -135,15 +135,29 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
-// tokens between the context checkpoint before the prompt tail and the one 4 tokens before the end
-// a checkpoint synchronizes the context: with pipeline parallelism the batch after it runs alone on the devices,
-// so the earlier one moves close to the end there; LLAMA_CKPT_PRE_END=N sets it (0 = only the one 4 tokens before the end)
-static int32_t server_ckpt_pre_end(int32_t n_ubatch, bool pipeline_parallel) {
+// LLAMA_PROMPT_PIPE_TAIL=0: no checkpoint one chunk before the end of a piped prompt
+static bool pipe_tail_checkpoint() {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_PROMPT_PIPE_TAIL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on;
+}
+
+// tokens between the context checkpoint before the prompt tail and the one 4 tokens before the end (0 = only that one)
+// a checkpoint synchronizes the context, so the batch after it runs alone on the devices:
+// - prompt pipe on (LLAMA_PROMPT_PIPE): one planned chunk of a prompt of n_prompt tokens, or none (LLAMA_PROMPT_PIPE_TAIL=0)
+// - otherwise n_ubatch, 512 with pipeline parallelism; LLAMA_CKPT_PRE_END=N sets it
+static int32_t server_ckpt_pre_end(const llama_context * ctx, int32_t n_prompt) {
+    if (llama_prompt_pipe(ctx)) {
+        return pipe_tail_checkpoint() ? (int32_t) llama_prompt_chunk(ctx, n_prompt) : 0;
+    }
     static const char * env = getenv("LLAMA_CKPT_PRE_END");
     if (env != nullptr) {
         return std::max(0, atoi(env));
     }
-    return pipeline_parallel ? std::min(n_ubatch, 512) : n_ubatch;
+    const int32_t n_ubatch = llama_n_ubatch(ctx);
+    return llama_pipeline_parallel(ctx) ? std::min(n_ubatch, 512) : n_ubatch;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -3936,8 +3950,6 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
-        const int32_t n_ckpt_pre = server_ckpt_pre_end(n_ubatch, llama_pipeline_parallel(ctx_tgt));
-
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -4405,6 +4417,8 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    const int32_t n_ckpt_pre = server_ckpt_pre_end(ctx_tgt, slot.task->n_tokens());
+
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
                         if (!add_prompt_mixed(slot)) {
@@ -4522,7 +4536,7 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ckpt_pre (n_ubatch, 512 with pipeline parallelism, see server_ckpt_pre_end)
+                        //  - 4 + n_ckpt_pre (a planned chunk, n_ubatch or 512, see server_ckpt_pre_end)
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {

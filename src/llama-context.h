@@ -69,6 +69,11 @@ struct llama_context {
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
+
+    // the ubatch size LLAMA_PROMPT_PIPE gives a batch of n_tokens (n_ubatch when it does not apply)
+    uint32_t prompt_chunk(uint32_t n_tokens) const;
+    bool     prompt_pipe_on() const;
+
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;
@@ -403,6 +408,7 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+    int32_t n_reallocs_all  = 0; // also the expected ones
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -449,6 +455,12 @@ private:
 
     // with pipeline parallelism, large batches copy the experts in the MoE cache from device memory
     bool pp_cache_copy = true;
+
+    // LLAMA_PROMPT_PIPE (Strata's --prefill-pipe): with pipeline parallelism, a batch is read in chunks sized so the
+    // layer-split devices work on different chunks at once (0 off, 1 = even chunks, r > 1 = per-chunk cost / per-token cost)
+    double   prompt_pipe       = 0.0;
+    uint32_t prompt_pipe_chunk = 0; // the chunk of the decode in progress, 0 when the batch was not planned
+    int32_t  n_pipe_devices    = 0; // the stages: devices holding layers
 
     // perf
     mutable int64_t t_start_us  = 0;
