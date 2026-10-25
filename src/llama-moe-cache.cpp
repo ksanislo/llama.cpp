@@ -1460,7 +1460,8 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         // the uploads and every read of the banks (also copy_experts) are on the compute stream of the device, so with pipeline
-        // parallelism a graph still in flight reads a slot before a later graph evicts it; an upload on another stream must wait for that
+        // parallelism a graph still in flight reads a slot before a later graph evicts it; the staging copy stream (LLAMA_MOE_ASYNC)
+        // reads the banks only after waiting for ev_compute, and the fills above wait for its last upload (last_slot)
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 
         return true;
