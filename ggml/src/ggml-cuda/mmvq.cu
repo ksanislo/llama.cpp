@@ -602,6 +602,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
                 }
+                if (table_id == MMVQ_PARAMETERS_TURING) {
+                    // Q5_K: two rows share the q8_1 loads, which are 6 of a thread's 11 loads per block
+                    return type == GGML_TYPE_Q5_K ? 2 : 1;
+                }
                 return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
