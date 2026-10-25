@@ -12819,6 +12819,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qwen4exp (Qwen3.8-Flash-Next) dense Q8_0 projections at prompt sizes: qkv, q, gate, out, shared expert, hc down / up
+    // (GGML_CUDA_SM75_DENSE_F16 A/B on Turing: test-backend-ops perf -o MUL_MAT -b CUDA0 -p "type_a=q8_0.*n=(1024|4096|8192)")
+    for (int bs : {1024, 4096, 8192}) {
+        for (auto mk : std::vector<std::pair<int, int>>{{10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144},
+                                                        {640, 2560}, {2560, 640}, {320, 10240}, {10240, 320}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {

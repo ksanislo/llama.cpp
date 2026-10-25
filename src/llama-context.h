@@ -495,6 +495,9 @@ private:
     // LLAMA_MOE_GATHER (default 1): the experts of a large batch are copied with one gather kernel per weight (cached ones
     // from the MoE cache, the others read from pinned host memory), instead of one copy per run of experts
     bool     moe_gather         = true;
+    // LLAMA_PROMPT_PIPE_GRAPHS (default 0): the device splits of a piped chunk are captured and launched as CUDA graphs, so
+    // one host thread queues ~1500 kernels per device per chunk without blocking on a full launch queue
+    bool     prompt_pipe_graphs = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

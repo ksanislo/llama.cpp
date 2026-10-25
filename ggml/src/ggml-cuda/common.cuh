@@ -1275,6 +1275,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint32_t capture_all_next = 0; // graph_capture_all: the next of the round-robin executables of this key
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1453,6 +1454,10 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    // capture every compatible graph, launch it as CUDA graphs (no warmup, no property check); set by the
+    // prompt pipe so a chunk's ~1500 kernels per device take a few queue entries and never block the host
+    bool graph_capture_all = false;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

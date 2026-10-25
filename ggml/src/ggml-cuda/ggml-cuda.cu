@@ -1688,7 +1688,8 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 };
 
 template<ggml_type compute_type>
-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        bool force_f32_output = false) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -1791,7 +1792,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) || force_f32_output;
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
@@ -2194,6 +2195,48 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+// Turing (sm_75): a quantized 2D weight times a prompt-sized batch as an FP16 tensor-core GEMM (weight dequantized per
+// call, activations saturated to FP16, FP32 sums and output) instead of MMQ, like Strata's prompt GEMMs (BF16_TC).
+// GGML_CUDA_SM75_DENSE_F16=<min batch columns>; unset or 0 = off. MUL_MAT_ID (experts) keeps MMQ.
+static int64_t ggml_cuda_sm75_dense_f16_min() {
+    static const int64_t v = [] {
+        const char * e = getenv("GGML_CUDA_SM75_DENSE_F16");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : (int64_t) 0;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_use_sm75_dense_f16(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    const int64_t min_cols = ggml_cuda_sm75_dense_f16_min();
+    return min_cols > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE &&
+        ggml_is_quantized(src0->type) && ggml_get_to_fp16_cuda(src0->type) != nullptr &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[1] >= min_cols &&
+        ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+}
+
+static __global__ void k_f32_to_f16_sat(const float * __restrict__ x, half * __restrict__ y, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = __float2half_rn(fminf(fmaxf(x[i], -65504.0f), 65504.0f));
+    }
+}
+
+static void ggml_cuda_mul_mat_sm75_dense_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(src1);
+    ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(), n);
+    k_f32_to_f16_sat<<<(n + 255) / 256, 256, 0, ctx.stream()>>>((const float *) src1->data, src1_f16.get(), n);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_tensor src1_h = *src1;
+    src1_h.type  = GGML_TYPE_F16;
+    src1_h.data  = src1_f16.get();
+    src1_h.nb[0] = sizeof(half);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        src1_h.nb[i] = src1_h.nb[i - 1]*src1_h.ne[i - 1];
+    }
+    ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, &src1_h, dst, /*force_f32_output =*/ true);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2240,6 +2283,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_use_sm75_dense_f16(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_sm75_dense_f16(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -3103,6 +3150,9 @@ static int ggml_cuda_graph_chunk_size() {
     }();
     return chunk_size;
 }
+
+// graph_capture_all: executables per graph key, used in turn
+#define GGML_CUDA_GRAPH_CAPTURE_SLOTS 4
 
 // end the capture of chunk `idx`, update or create its executable and launch it
 static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
@@ -5139,7 +5189,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (cuda_ctx->graph_capture_all) {
+        // a round robin of executables per key: the one updated was launched GGML_CUDA_GRAPH_CAPTURE_SLOTS calls ago
+        // (the scheduler's copies differ per call anyway, so every call is captured)
+        if (graph->is_enabled() && ggml_cuda_graph_check_compability(cgraph)) {
+            const uint32_t slot = graph->capture_all_next++ % GGML_CUDA_GRAPH_CAPTURE_SLOTS;
+            graph_key = (const char *) graph_key + slot; // not a tensor address: no clash with the normal keys
+            graph = cuda_ctx->cuda_graph(graph_key);
+            // the normal path must not trust properties of a graph captured here
+            graph->node_props.clear();
+            graph->uid             = 0;
+            graph->warmup_complete = false;
+            use_cuda_graph             = true;
+            cuda_graph_update_required = true;
+        }
+    } else if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -6587,6 +6651,13 @@ static __global__ void k_gather_blocks(const ggml_cuda_gather_srcs srcs, char * 
     }
 }
 
+// with on, every compatible graph computed on this backend is captured and launched as CUDA graphs (see graph_capture_all)
+static void ggml_backend_cuda_set_graph_capture_all(ggml_backend_t backend, bool on) {
+    if (ggml_backend_is_cuda(backend)) {
+        ((ggml_backend_cuda_context *) backend->context)->graph_capture_all = on;
+    }
+}
+
 static void ggml_backend_cuda_gather_blocks_async(ggml_backend_t backend, void * dst, size_t dst_stride, const void * const * srcs, int n, size_t size) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6725,6 +6796,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_copy_blocks_async") == 0) {
         return (void *)ggml_backend_cuda_copy_blocks_async;
+    }
+    if (strcmp(name, "ggml_backend_set_graph_capture_all") == 0) {
+        return (void *)ggml_backend_cuda_set_graph_capture_all;
     }
 #if defined(GGML_CUDA_VMM_BUFFER)
     if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {
