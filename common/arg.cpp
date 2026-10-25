@@ -1741,6 +1741,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--cache-prefix"},
+        {"--no-cache-prefix"},
+        "keep the state at the end of the system prompt (before the first user message) in the prompt cache, so that\n"
+        "new conversations with the same system prompt and tools resume from it (default: disabled, requires cache-ram)",
+        [](common_params & params, bool value) {
+            params.cache_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
