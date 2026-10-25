@@ -1236,6 +1236,13 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                      int   il) const;
 
+    // LLAMA_MOE_PREFETCH: the top experts of the next layer, by its router applied to the input cur of layer il, nullptr if not predicted
+    ggml_tensor * build_moe_cache_prediction(
+             ggml_tensor * cur,
+                 int64_t   n_expert_used,
+        llama_expert_gating_func_type gating_op,
+                     int   il) const;
+
     //
     // inputs
     //

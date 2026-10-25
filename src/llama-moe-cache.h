@@ -13,6 +13,8 @@ struct llama_model;
 // with LLAMA_MOE_ASYNC=n, the batches the cache does not serve read the experts of a layer from one of n staging slots per device instead,
 // filled on a separate stream of the device; large batches stage all the experts of the next layer while the current one computes
 // with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
+// with LLAMA_MOE_PREFETCH=k the router of the next layer is applied to the input of the current one, and the missing experts among its top k
+// are uploaded on a second stream while the current layer and the attention of the next one compute (decode, cached batches only)
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
@@ -48,6 +50,18 @@ public:
     // its inputs on the device are read together with the selected experts, so the CPU part does not wait for the device
     // its output is copied to the device without waiting on the host
     void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * output);
+
+    // the router of the layer after il, if its experts are to be predicted from the input of layer il (LLAMA_MOE_PREFETCH), n_pred is the top k
+    struct next_router {
+        ggml_tensor * gate_inp    = nullptr;
+        ggml_tensor * gate_inp_b  = nullptr;
+        ggml_tensor * exp_probs_b = nullptr;
+        int32_t       n_pred      = 0;
+    };
+    bool get_next_router(int32_t il, int64_t n_tokens, int64_t n_expert_used, next_router & r) const;
+
+    // the predicted experts of the next layer, read back with the selected experts of the lookup, nullptr if none
+    void set_prediction(const ggml_tensor * lookup, const ggml_tensor * pred);
 
     // called before each graph compute, prev_in_flight if the previous graph may still run (no synchronization since)
     void begin(bool prev_in_flight);

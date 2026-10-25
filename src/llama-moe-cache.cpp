@@ -262,6 +262,39 @@ struct moe_cache_slru {
         }
         return true;
     }
+
+    // give a slot to each predicted expert e of layer il_next that is not cached, at most max_fill, appended to fills
+    // the victims spare the experts selected by the last plan if it was for layer il (its device part may still read them)
+    // a prefetched expert enters probation like a fill, so a wrong prediction is the next victim
+    void prefetch(int32_t il, int32_t il_next, const int32_t * pred, size_t n_pred, size_t max_fill, std::vector<fill> & fills) {
+        int32_t * slots = slot_map[il_next];
+        for (size_t i = 0; i < n_pred && fills.size() < max_fill; ++i) {
+            const int32_t e = pred[i];
+            if (e < 0 || e >= n_expert || slots[e] < n_slots) {
+                continue;
+            }
+            // a cached guess is not a victim: it goes to the recent end of probation, like a new one
+            int32_t s = victim(il);
+            for (size_t n_moved = 0; key_of[s] >= 0 && key_of[s] / n_expert == il_next && n_moved < n_pred &&
+                    std::find(pred, pred + n_pred, key_of[s] % n_expert) != pred + n_pred; ++n_moved) {
+                move(s, false);
+                s = victim(il);
+            }
+            if (std::any_of(fills.begin(), fills.end(), [&](const fill & f) { return f.slot == s; }) ||
+                (key_of[s] >= 0 && key_of[s] / n_expert == il_next && std::find(pred, pred + n_pred, key_of[s] % n_expert) != pred + n_pred)) {
+                break; // the cache is too small to hold more guesses
+            }
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
+            } else {
+                n_filled++;
+            }
+            key_of[s] = il_next*n_expert + e;
+            slots[e] = s;
+            move(s, false);
+            fills.push_back({ e, s });
+        }
+    }
 };
 
 // gate, up, down or gate_up, down
@@ -335,6 +368,15 @@ struct llama_moe_cache::impl {
         ggml_backend_buffer_ptr buf_out;
         bool out_idle   = true;  // no copy from buf_out is queued (the device was synchronized after the last one)
         bool out_direct = false; // a copy from the CPU compute buffer may be queued
+
+        // LLAMA_MOE_PREFETCH: uploads of predicted experts on the copy stream, one expert after the other, best guess first
+        ggml_backend_event_ptr ev_fills;                // the compute stream after the fills of the current layer, the prefetch starts after it
+        std::vector<ggml_backend_event_ptr> ev_pf;      // [pref_max] the copy stream after upload i of the last prefetch
+        ggml_backend_event_ptr ev_pf_prev;              // the copy stream after the uploads of the earlier prefetches
+        std::vector<int32_t> pf_slot;                   // slots of the last prefetch, in upload order
+        int32_t pf_layer = -1;                          // layer of the last prefetch
+        bool pf_pending      = false;                   // the compute stream may not have waited for all uploads of the last prefetch
+        bool pf_prev_pending = false;                   // ... or for ev_pf_prev
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -347,6 +389,7 @@ struct llama_moe_cache::impl {
         int32_t n_slots = 0;
         moe_cache_slru slru;
         std::vector<std::vector<ggml_tensor *>> stage; // [n_stage][expert tensor] staging slots, n_expert + 1 experts each
+        std::vector<bool> pf_unused;      // [n_slots] prefetched and not selected since (LLAMA_MOE_PREFETCH statistics)
     };
 
     struct layer {
@@ -359,6 +402,8 @@ struct llama_moe_cache::impl {
 
         int32_t rank = -1;                  // index in the layers of its device
         ggml_tensor * stage_map = nullptr;  // I32 [1, n_expert] in host memory, the identity: a staged expert is read at its own index
+
+        next_router router;                 // LLAMA_MOE_PREFETCH: the router of the next layer, if it is cached on the same device
     };
 
     struct binding {
@@ -410,6 +455,24 @@ struct llama_moe_cache::impl {
     std::unordered_map<const ggml_tensor *, int32_t> stage_layer_of;              // staging map -> layer
     std::unordered_map<const ggml_tensor *, ggml_tensor *> stage_bindings;       // host experts -> their staging slot
     std::vector<uint8_t> zeros = std::vector<uint8_t>(512, 0);                    // padding after the last expert of a slot
+
+    // LLAMA_MOE_PREFETCH
+    int32_t n_pref   = 0; // predicted experts per token, 0 if off
+    int32_t pref_max = 0; // uploaded experts per layer at most
+    struct prediction {
+        const ggml_tensor * pred; // I32 [n_pref, n_tokens] on the device
+    };
+    std::unordered_map<const ggml_tensor *, prediction> predictions; // slot lookup -> predicted experts of the next layer
+    std::vector<int32_t> pred_ids;
+    std::vector<int32_t> ids_pf;
+    std::vector<moe_cache_slru::fill> pf_fills;
+    struct pf_stats {
+        size_t layers = 0; // layers with a prediction read back
+        size_t issued = 0; // experts uploaded ahead
+        size_t used   = 0; // of them, selected by the next lookup of their layer
+        size_t wasted = 0; // evicted before being selected
+        size_t bytes  = 0;
+    } stats_pf;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -485,12 +548,26 @@ struct llama_moe_cache::impl {
         if (const char * env = getenv("LLAMA_MOE_ASYNC_BORROW")) {
             borrow = atoi(env) != 0;
         }
+        if (const char * env = getenv("LLAMA_MOE_PREFETCH")) {
+            n_pref = std::clamp(atoi(env), 0, (int) model.hparams.n_expert);
+            pref_max = n_pref;
+            if (const char * env_max = getenv("LLAMA_MOE_PREFETCH_MAX")) {
+                pref_max = std::max(0, atoi(env_max));
+            }
+            if (pref_max == 0) {
+                n_pref = 0;
+            }
+        }
         for (const device & d : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(ggml_backend_get_device(d.backend), &props);
             if (n_stage > 0 && (!props.caps.async || !props.caps.events)) {
                 LLAMA_LOG_WARN("%s: %s does not support async copies and events, LLAMA_MOE_ASYNC is disabled\n", __func__, ggml_backend_name(d.backend));
                 n_stage = 0;
+            }
+            if (n_pref > 0 && (!props.caps.async || !props.caps.events)) {
+                LLAMA_LOG_WARN("%s: %s does not support async copies and events, LLAMA_MOE_PREFETCH is disabled\n", __func__, ggml_backend_name(d.backend));
+                n_pref = 0;
             }
         }
 
@@ -703,6 +780,9 @@ struct llama_moe_cache::impl {
         if (n_stage > 0) {
             init_stage(model.hparams.no_alloc);
         }
+        if (n_pref > 0) {
+            init_prefetch(model);
+        }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
@@ -735,6 +815,58 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+    }
+
+    // LLAMA_MOE_PREFETCH: a layer predicts the next one if both are cached on the same device, the router of the next one is on
+    // that device too and its experts are pinned (an upload from pageable memory would block the host)
+    void init_prefetch(const llama_model & model) {
+        size_t n_pred_layers = 0;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+            ggml_backend_buffer_type_t buft_pinned = ggml_backend_dev_host_buffer_type(dev);
+            bool any = false;
+            for (size_t il = 0; il + 1 < layers.size(); ++il) {
+                layer & l = layers[il];
+                const layer & ln = layers[il + 1];
+                if (l.ig < 0 || ln.ig < 0 || groups[l.ig].id != (int32_t) id || groups[ln.ig].id != (int32_t) id || groups[ln.ig].n_slots == 0) {
+                    continue;
+                }
+                const llama_layer & mn = model.layers[il + 1];
+                if (mn.ffn_gate_inp == nullptr || mn.ffn_gate_inp->buffer == nullptr || ggml_backend_buffer_is_host(mn.ffn_gate_inp->buffer) ||
+                    ln.experts.empty() || ln.experts[0]->buffer == nullptr || ggml_backend_buffer_get_type(ln.experts[0]->buffer) != buft_pinned) {
+                    continue;
+                }
+                l.router.gate_inp    = mn.ffn_gate_inp;
+                l.router.gate_inp_b  = mn.ffn_gate_inp_b;
+                l.router.exp_probs_b = mn.ffn_exp_probs_b;
+                l.router.n_pred      = n_pref;
+                any = true;
+                n_pred_layers++;
+            }
+            if (!any || model.hparams.no_alloc) {
+                continue;
+            }
+            if (!d.copy) {
+                d.copy.reset(ggml_backend_dev_init(dev, nullptr));
+            }
+            d.ev_fills.reset(ggml_backend_event_new(dev));
+            d.ev_pf_prev.reset(ggml_backend_event_new(dev));
+            if (!d.copy || !d.ev_fills || !d.ev_pf_prev) {
+                throw std::runtime_error("failed to create the MoE prefetch stream");
+            }
+            for (int32_t i = 0; i < pref_max; ++i) {
+                d.ev_pf.emplace_back(ggml_backend_event_new(dev));
+                if (!d.ev_pf.back()) {
+                    throw std::runtime_error("failed to create the MoE prefetch stream");
+                }
+            }
+        }
+        for (group & g : groups) {
+            g.pf_unused.assign(g.n_slots, false);
+        }
+        LLAMA_LOG_INFO("%s: MoE prefetch: %zu layers predict the top %d experts of the next layer, up to %d uploads a layer (LLAMA_MOE_PREFETCH)\n",
+            __func__, n_pred_layers, n_pref, pref_max);
     }
 
     // the staging slots of each device, they overlap for the groups of the device, so a slot fits the experts of its largest layer
@@ -1223,6 +1355,10 @@ struct llama_moe_cache::impl {
 
     void begin(bool prev_in_flight) {
         stash.clear();
+        // large batches read and move the banks on the compute stream without a lookup
+        for (device & d : devices) {
+            wait_prefetch(d, false);
+        }
         // a direct copy of the previous graph reads the CPU compute buffer, which this graph's CPU parts overwrite
         out_buffered = prev_in_flight;
         for (device & d : devices) {
@@ -1453,8 +1589,23 @@ struct llama_moe_cache::impl {
         }
         const cpu_part * part = read_cpu_inputs(backend, graph, lookup, l);
         const bool has_cpu = part != nullptr;
+        const bool has_pred = read_prediction(backend, graph, lookup, il);
         read_ids(backend, graph, lookup, il);
         d.out_idle = true; // read_ids synchronized the device
+
+        // the fills below and the reads of the device part come after the uploads of earlier prefetches, see wait_prefetch_layer
+        // for the one of this layer
+        wait_prefetch(d, d.pf_layer == il);
+        if (!g.pf_unused.empty()) {
+            const int32_t * slots = g.slru.slot_map[il];
+            for (int32_t e : ids) {
+                const int32_t s = e >= 0 && e < g.slru.n_expert ? slots[e] : g.n_slots;
+                if (s < g.n_slots && g.pf_unused[s]) {
+                    g.pf_unused[s] = false;
+                    stats_pf.used++;
+                }
+            }
+        }
 
         // the fills below may replace experts that the copy stream still reads
         if (d.last_slot >= 0) {
@@ -1493,7 +1644,40 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (!g.pf_unused.empty()) {
+            for (const auto & f : fills) {
+                if (g.pf_unused[f.slot]) {
+                    g.pf_unused[f.slot] = false;
+                    stats_pf.wasted++;
+                }
+            }
+        }
+        wait_prefetch_layer(d, il);
+
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        const size_t bytes = upload(backend, l, g, fills);
+
+        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        st.hits   += n_hit;
+        st.misses += fills.size() + cpu.size();
+        st.cpu    += cpu.size();
+        st.bytes  += bytes;
+
+        // the next copy synchronizes the backend before it changes the slot map again
+        // the uploads and every read of the banks (also copy_experts) are on the compute stream of the device, so with pipeline
+        // parallelism a graph still in flight reads a slot before a later graph evicts it; the staging copy stream (LLAMA_MOE_ASYNC)
+        // reads the banks only after waiting for ev_compute, and the fills above wait for its last upload (last_slot)
+        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+
+        if (has_pred) {
+            prefetch(backend, d, il);
+        }
+
+        return true;
+    }
+
+    // upload the experts of layer l to their slots on the stream of backend, consecutive experts going to consecutive slots together
+    static size_t upload(ggml_backend_t backend, const layer & l, const group & g, const std::vector<moe_cache_slru::fill> & fills) {
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
@@ -1509,20 +1693,137 @@ struct llama_moe_cache::impl {
                 i += n;
             }
         }
+        return bytes;
+    }
 
-        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
-        st.hits   += n_hit;
-        st.misses += fills.size() + cpu.size();
-        st.cpu    += cpu.size();
-        st.bytes  += bytes;
-
-        // the next copy synchronizes the backend before it changes the slot map again
-        // the uploads and every read of the banks (also copy_experts) are on the compute stream of the device, so with pipeline
-        // parallelism a graph still in flight reads a slot before a later graph evicts it; the staging copy stream (LLAMA_MOE_ASYNC)
-        // reads the banks only after waiting for ev_compute, and the fills above wait for its last upload (last_slot)
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
-
+    // read back the experts of the next layer predicted for the lookup with its selected experts (the same synchronization)
+    // returns false if the lookup has no prediction or it is computed in the split of the lookup
+    bool read_prediction(ggml_backend_t backend, ggml_cgraph * graph, const ggml_tensor * lookup, int32_t il) {
+        const auto it = predictions.find(lookup);
+        if (it == predictions.end() || it->second.pred == nullptr || layers[il].router.n_pred == 0) {
+            return false;
+        }
+        const ggml_tensor * pred = it->second.pred;
+        if (pred->buffer == nullptr || pred->data == nullptr || pred->type != GGML_TYPE_I32 || !ggml_is_contiguous(pred)) {
+            return false;
+        }
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            if (ggml_graph_node(graph, i) == pred) {
+                return false;
+            }
+        }
+        pred_ids.resize(ggml_nelements(pred));
+        ggml_backend_tensor_get_async(backend, pred, pred_ids.data(), 0, ggml_nbytes(pred));
         return true;
+    }
+
+    // upload the predicted experts of the layer after il that are not cached on the copy stream, after the fills of layer il,
+    // so they overlap the device part of layer il, its CPU part and the attention of the next layer
+    // no stream reads the victims: the device part of il reads its selected experts only (spared), earlier reads were synchronized
+    // by read_ids; the next cached lookup of the device and the next graph wait for ev_pf before they fill or read a slot
+    void prefetch(ggml_backend_t backend, device & d, int32_t il) {
+        const int32_t il_next = il + 1;
+        const layer & l  = layers[il];
+        const layer & ln = layers[il_next];
+        group & gn = groups[ln.ig];
+
+        // rank major: the best guess of every token first
+        const int64_t k = l.router.n_pred;
+        const int64_t n_tokens = (int64_t) pred_ids.size() / k;
+        ids_pf.resize(pred_ids.size());
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            for (int64_t r = 0; r < k; ++r) {
+                ids_pf[r*n_tokens + it] = pred_ids[it*k + r];
+            }
+        }
+
+        pf_fills.clear();
+        gn.slru.prefetch(ln.ig == l.ig ? il : -1, il_next, ids_pf.data(), ids_pf.size(), (size_t) pref_max, pf_fills);
+        stats_pf.layers++;
+        if (pf_fills.empty()) {
+            return;
+        }
+        for (const auto & f : pf_fills) {
+            if (gn.pf_unused[f.slot]) {
+                stats_pf.wasted++;
+            }
+            gn.pf_unused[f.slot] = true;
+        }
+
+        ggml_backend_t copy = d.copy.get();
+        // uploads of the last prefetch that the compute stream did not wait for end before this one
+        if (d.pf_pending) {
+            ggml_backend_event_record(d.ev_pf_prev.get(), copy);
+            d.pf_prev_pending = true;
+        }
+        // the fills of layer il go first on the link
+        ggml_backend_event_record(d.ev_fills.get(), backend);
+        ggml_backend_event_wait(copy, d.ev_fills.get());
+        d.pf_slot.clear();
+        for (size_t i = 0; i < pf_fills.size(); ++i) {
+            stats_pf.bytes += upload(copy, ln, gn, { pf_fills[i] });
+            ggml_backend_event_record(d.ev_pf[i].get(), copy);
+            d.pf_slot.push_back(pf_fills[i].slot);
+        }
+        stats_pf.issued += pf_fills.size();
+        d.pf_layer   = il_next;
+        d.pf_pending = true;
+    }
+
+    // the compute stream of d waits for the uploads of the earlier prefetches, and for those of the last one unless keep_last
+    void wait_prefetch(device & d, bool keep_last) {
+        if (d.pf_prev_pending) {
+            ggml_backend_event_wait(d.backend, d.ev_pf_prev.get());
+            d.pf_prev_pending = false;
+        }
+        if (d.pf_pending && !keep_last) {
+            ggml_backend_event_wait(d.backend, d.ev_pf[d.pf_slot.size() - 1].get());
+            d.pf_pending = false;
+        }
+    }
+
+    // after the plan of layer il, before its fills: the compute stream waits for the prefetched uploads up to the last one that the
+    // layer reads (selected) or overwrites (filled); the later ones (wrong guesses) are still read by no one and may go on
+    void wait_prefetch_layer(device & d, int32_t il) {
+        if (!d.pf_pending || d.pf_layer != il) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        const moe_cache_slru & c = g.slru;
+        int32_t last = -1;
+        for (int32_t i = 0; i < (int32_t) d.pf_slot.size(); ++i) {
+            const int32_t s = d.pf_slot[i];
+            const int32_t key = c.key_of[s];
+            bool needed = key >= 0 && key / c.n_expert == il && c.seen[key % c.n_expert] == c.seen_gen;
+            for (size_t j = 0; j < fills.size() && !needed; ++j) {
+                needed = fills[j].slot == s;
+            }
+            if (needed) {
+                last = i;
+            }
+        }
+        if (last >= 0) {
+            ggml_backend_event_wait(d.backend, d.ev_pf[last].get());
+        }
+        if (last == (int32_t) d.pf_slot.size() - 1) {
+            d.pf_pending = false;
+        } else {
+            d.pf_layer = -1; // the rest is waited for by the next lookup of the device or the next prefetch
+        }
+    }
+
+    bool get_next_router(int32_t il, int64_t n_tokens, int64_t n_expert_used, next_router & r) const {
+        if (n_pref == 0 || il < 0 || il + 1 >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il].router.n_pred == 0 ||
+            !use_cache(il, n_tokens, n_expert_used) || layers[il + 1].ig < 0 || !use_cache(il + 1, n_tokens, n_expert_used)) {
+            return false;
+        }
+        r = layers[il].router;
+        return true;
+    }
+
+    void set_prediction(const ggml_tensor * lookup, const ggml_tensor * pred) {
+        predictions[lookup] = { pred };
     }
 
     void log_stats() const {
@@ -1543,6 +1844,10 @@ struct llama_moe_cache::impl {
         if (ss.layers_prefetched + ss.layers_waited + ss.layers_partial > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: staged layers: %zu prefetched, %zu waited for, %zu partial, %zu prefetches, %.2f MiB uploaded, %.2f MiB from the cache\n",
                 ss.layers_prefetched, ss.layers_waited, ss.layers_partial, ss.prefetches, ss.bytes_host/1024.0/1024.0, ss.bytes_cache/1024.0/1024.0);
+        }
+        if (stats_pf.layers > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: prefetch: %zu predictions, %zu experts uploaded ahead (%.2f MiB), %zu selected (%.1f%%), %zu evicted unused\n",
+                stats_pf.layers, stats_pf.issued, stats_pf.bytes/1024.0/1024.0, stats_pf.used, stats_pf.issued ? 100.0*stats_pf.used/stats_pf.issued : 0.0, stats_pf.wasted);
         }
         if (ss.borrows > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: staging borrowed the cache %zu times: %zu experts moved, %zu evicted\n", ss.borrows, ss.experts_moved, ss.experts_evicted);
@@ -1590,6 +1895,14 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il) const {
 
 void llama_moe_cache::set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * output) {
     pimpl->set_cpu_part(lookup, n_used, std::move(inputs), output);
+}
+
+bool llama_moe_cache::get_next_router(int32_t il, int64_t n_tokens, int64_t n_expert_used, next_router & r) const {
+    return pimpl->get_next_router(il, n_tokens, n_expert_used, r);
+}
+
+void llama_moe_cache::set_prediction(const ggml_tensor * lookup, const ggml_tensor * pred) {
+    pimpl->set_prediction(lookup, pred);
 }
 
 void llama_moe_cache::begin(bool prev_in_flight) {
