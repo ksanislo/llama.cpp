@@ -1340,7 +1340,26 @@ static void ggml_backend_cuda_host_buffer_free_buffer_interleaved(ggml_backend_b
     ggml_numa_interleave_free(buffer->context, buffer->size);
 }
 
-// NUMA interleave: mmap + mbind first, then pin; cudaMallocHost would fault the pages in before mbind could place them
+// GGML_NUMA_PINNED: how pinned buffers are interleaved under NUMA interleave
+//   policy (default): cudaMallocHost under an interleave thread policy, the driver's pages stay off the LRU as without NUMA
+//   register: mmap + mbind + cudaHostRegister; these are LRU anon pages that reclaim scans but cannot free
+//   off: not interleaved
+enum ggml_cuda_numa_pinned { GGML_CUDA_NUMA_PINNED_OFF, GGML_CUDA_NUMA_PINNED_POLICY, GGML_CUDA_NUMA_PINNED_REGISTER };
+
+static ggml_cuda_numa_pinned ggml_cuda_numa_pinned_mode() {
+    static const ggml_cuda_numa_pinned mode = [] {
+        const char * env = getenv("GGML_NUMA_PINNED");
+        if (env == nullptr || strcmp(env, "policy") == 0 || env[0] == '\0') {
+            return GGML_CUDA_NUMA_PINNED_POLICY;
+        }
+        if (strcmp(env, "register") == 0) {
+            return GGML_CUDA_NUMA_PINNED_REGISTER;
+        }
+        return GGML_CUDA_NUMA_PINNED_OFF;
+    }();
+    return mode;
+}
+
 static void * ggml_cuda_host_malloc_interleaved(size_t size) {
     // small host buffers (staging, outputs) are not worth it
     if (size < 64ull*1024*1024) {
@@ -1367,7 +1386,20 @@ static void * ggml_cuda_host_malloc(size_t size) {
     }
 
     void * ptr = nullptr;
+    const bool numa = size >= 64ull*1024*1024 && ggml_cuda_numa_pinned_mode() == GGML_CUDA_NUMA_PINNED_POLICY &&
+        ggml_numa_thread_interleave_begin();
+    int64_t free_before[8];
+    const int n_nodes = numa ? ggml_numa_free_bytes(free_before, 8) : 0;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    if (numa) {
+        ggml_numa_thread_interleave_end();
+        // the driver may hand out pooled pages of the local node, so show where the pages went
+        int64_t free_after[8];
+        if (err == cudaSuccess && ggml_numa_free_bytes(free_after, n_nodes) == n_nodes && n_nodes > 1) {
+            GGML_LOG_INFO("%s: %.2f MiB pinned, interleaved: node0 %.0f MiB, node1 %.0f MiB%s\n", __func__, size/1024.0/1024.0,
+                (free_before[0] - free_after[0])/1024.0/1024.0, (free_before[1] - free_after[1])/1024.0/1024.0, n_nodes > 2 ? ", ..." : "");
+        }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -1380,7 +1412,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    if (!ggml_cuda_pinned_memory_disabled() && ggml_numa_interleave_enabled()) {
+    if (!ggml_cuda_pinned_memory_disabled() && ggml_cuda_numa_pinned_mode() == GGML_CUDA_NUMA_PINNED_REGISTER &&
+        ggml_numa_interleave_enabled()) {
         void * ptr = ggml_cuda_host_malloc_interleaved(size);
         if (ptr != nullptr) {
             ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);

@@ -89,6 +89,38 @@ static long ggml_numa_mbind(void * addr, size_t size, unsigned flags) {
 
 void ggml_numa_set_interleave(bool enable) {
     g_numa_interleave = enable ? 1 : 0;
+    // log now: the first use may come while the caller silences the log (llama's parameter fitting)
+    (void) ggml_numa_interleave_enabled();
+}
+
+int ggml_numa_free_bytes(int64_t * free_per_node, int max_nodes) {
+#if defined(__linux__)
+    int n = 0;
+    for (; n < max_nodes; ++n) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", n);
+        FILE * f = fopen(path, "r");
+        if (f == NULL) {
+            break;
+        }
+        char line[256];
+        long long kb = -1;
+        while (fgets(line, sizeof(line), f)) {
+            const char * p = strstr(line, "MemFree:");
+            if (p != NULL) {
+                kb = strtoll(p + 8, NULL, 10);
+                break;
+            }
+        }
+        fclose(f);
+        free_per_node[n] = kb < 0 ? -1 : (int64_t) kb * 1024;
+    }
+    return n;
+#else
+    GGML_UNUSED(free_per_node);
+    GGML_UNUSED(max_nodes);
+    return 0;
+#endif
 }
 
 bool ggml_numa_interleave_enabled(void) {
@@ -223,6 +255,46 @@ static double ggml_numa_busiest_share(void * addr, size_t size, size_t page) {
 }
 #endif
 
+#if defined(__linux__)
+static _Thread_local int           g_numa_old_mode = -1; // saved by ggml_numa_thread_interleave_begin, -1: nothing saved
+static _Thread_local unsigned long g_numa_old_mask[GGML_NUMA_MASK_LONGS];
+#endif
+
+bool ggml_numa_thread_interleave_begin(void) {
+#if defined(__linux__)
+    if (!ggml_numa_interleave_enabled() || g_numa_old_mode >= 0) {
+        return false;
+    }
+    int old_mode = GGML_MPOL_DEFAULT;
+    memset(g_numa_old_mask, 0, sizeof(g_numa_old_mask));
+    if (syscall(SYS_get_mempolicy, &old_mode, g_numa_old_mask, GGML_NUMA_MAXNODE, NULL, 0) != 0) {
+        old_mode = GGML_MPOL_DEFAULT;
+    }
+    if (syscall(SYS_set_mempolicy, GGML_MPOL_INTERLEAVE, g_numa_mask, GGML_NUMA_MAXNODE) != 0) {
+        GGML_LOG_WARN("%s: set_mempolicy failed: %s\n", __func__, strerror(errno));
+        return false;
+    }
+    g_numa_old_mode = old_mode;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void ggml_numa_thread_interleave_end(void) {
+#if defined(__linux__)
+    if (g_numa_old_mode < 0) {
+        return;
+    }
+    if (g_numa_old_mode == GGML_MPOL_DEFAULT) {
+        syscall(SYS_set_mempolicy, GGML_MPOL_DEFAULT, NULL, 0);
+    } else {
+        syscall(SYS_set_mempolicy, g_numa_old_mode, g_numa_old_mask, GGML_NUMA_MAXNODE);
+    }
+    g_numa_old_mode = -1;
+#endif
+}
+
 bool ggml_numa_interleave_mapped(void * addr, size_t size, int fd, size_t offset) {
 #if defined(__linux__)
     if (addr == NULL || size == 0 || !ggml_numa_interleave_enabled()) {
@@ -238,13 +310,7 @@ bool ggml_numa_interleave_mapped(void * addr, size_t size, int fd, size_t offset
     size    = (size + head + page - 1) & ~(page - 1);
 
     // page-cache pages are placed by the faulting thread's policy, not by the mapping's (mbind has no effect on them)
-    int old_mode = GGML_MPOL_DEFAULT;
-    unsigned long old_mask[GGML_NUMA_MASK_LONGS] = { 0 };
-    if (syscall(SYS_get_mempolicy, &old_mode, old_mask, GGML_NUMA_MAXNODE, NULL, 0) != 0) {
-        old_mode = GGML_MPOL_DEFAULT;
-    }
-    if (syscall(SYS_set_mempolicy, GGML_MPOL_INTERLEAVE, g_numa_mask, GGML_NUMA_MAXNODE) != 0) {
-        GGML_LOG_WARN("%s: set_mempolicy failed: %s\n", __func__, strerror(errno));
+    if (!ggml_numa_thread_interleave_begin()) {
         return false;
     }
 
@@ -261,11 +327,7 @@ bool ggml_numa_interleave_mapped(void * addr, size_t size, int fd, size_t offset
         ggml_numa_populate(addr, size, page);
     }
 
-    if (old_mode == GGML_MPOL_DEFAULT) {
-        syscall(SYS_set_mempolicy, GGML_MPOL_DEFAULT, NULL, 0);
-    } else {
-        syscall(SYS_set_mempolicy, old_mode, old_mask, GGML_NUMA_MAXNODE);
-    }
+    ggml_numa_thread_interleave_end();
     return true;
 #else
     GGML_UNUSED(addr);

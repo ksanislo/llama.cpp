@@ -3069,6 +3069,12 @@ extern "C" {
     // fault in a range of a read-only file mapping with its page-cache pages interleaved (the page cache ignores
     // the mapping's policy); cached pages that sit mostly on one node are dropped and read again
     GGML_API bool   ggml_numa_interleave_mapped(void * addr, size_t size, int fd, size_t offset);
+    // interleave the pages the calling thread allocates from here on (also kernel allocations made on its behalf, e.g. a
+    // driver's pinned memory) until _end restores its previous policy; false if not enabled or already begun
+    GGML_API bool   ggml_numa_thread_interleave_begin(void);
+    GGML_API void   ggml_numa_thread_interleave_end(void);
+    // MemFree of each node (bytes, -1 if unknown), returns the number of nodes read
+    GGML_API int    ggml_numa_free_bytes(int64_t * free_per_node, int max_nodes);
 
 #ifdef  __cplusplus
 }
