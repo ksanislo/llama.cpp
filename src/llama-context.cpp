@@ -39,6 +39,9 @@ static void llama_verify_hadamard_graph(
         if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
             forward.emplace(cached, t);
         }
+        if (const ggml_tensor * staged = moe_cache ? moe_cache->get_staged_experts(w) : nullptr) {
+            forward.emplace(staged, t);
+        }
     }
 
     auto unwrap = [](const ggml_tensor * t) {
