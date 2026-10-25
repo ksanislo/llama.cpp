@@ -1498,7 +1498,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const bool use_ref) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1511,6 +1512,49 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t blck_1 = 16;
 
     float tmp[16];
+
+#if defined(GGML_VEC_DOT_MR_MAX)
+    // AVX1: several rows of this expert per src0 row, src0 decoded once for them (bit-identical to vec_dot)
+    ggml_vec_dot_mr_t const vec_dot_mr = (!use_ref && ir1_end - ir1_start > 1) ? ggml_cpu_get_vec_dot_mr(type) : NULL;
+    if (vec_dot_mr) {
+        float tmp_mr[GGML_VEC_DOT_MR_MAX][16];
+        const void * src1_cols[GGML_VEC_DOT_MR_MAX];
+        float * dst_cols[GGML_VEC_DOT_MR_MAX];
+
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                const int64_t ir0_last = MIN(iir0 + blck_0, ir0_end);
+                const int64_t ir1_last = MIN(iir1 + blck_1, ir1_end);
+                for (int64_t ir1 = iir1; ir1 < ir1_last; ir1 += GGML_VEC_DOT_MR_MAX) {
+                    const int nr = (int) MIN(GGML_VEC_DOT_MR_MAX, ir1_last - ir1);
+                    for (int r = 0; r < nr; ++r) {
+                        struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                        const int64_t i11 = row_mapping.i1 % ne11;
+                        const int64_t i12 = row_mapping.i2;
+                        src1_cols[r] = (const char *) wdata +
+                            (src1_cont || src1->type != vec_dot_type
+                            ? (i11      + i12*ne11)*row_size
+                            : (i11*nb11 + i12*nb12));
+                        dst_cols[r] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+                    }
+                    for (int64_t ir0 = iir0; ir0 < ir0_last; ++ir0) {
+                        if (nr == 1) {
+                            vec_dot(ne00, &tmp_mr[0][ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_cols[0], 0, 1);
+                        } else {
+                            vec_dot_mr(ne00, &tmp_mr[0][ir0 - iir0], 16, src0_cur + ir0*nb01, src1_cols, nr);
+                        }
+                    }
+                    for (int r = 0; r < nr; ++r) {
+                        memcpy(&dst_cols[r][iir0], tmp_mr[r], (ir0_last - iir0)*sizeof(float));
+                    }
+                }
+            }
+        }
+        return;
+    }
+#else
+    GGML_UNUSED(use_ref);
+#endif
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1684,8 +1728,15 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // tiled takes over if profitable for this expert (see tiled.h); on AVX1 the multi-row dots
+        // are faster for fewer rows
+#if defined(GGML_VEC_DOT_MR_MAX)
+        const bool mr_rows = !params->use_ref && ggml_cpu_get_vec_dot_mr(src0->type) != NULL &&
+                             cne1 < ggml_cpu_vec_dot_mr_tiled_min(src0->type);
+#else
+        const bool mr_rows = false;
+#endif
+        if (!mr_rows && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
@@ -1732,7 +1783,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref
             );
 
             if (nth >= nchunk0 * nchunk1) {
