@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -1319,6 +1320,17 @@ struct llama_moe_cache::impl {
         ggml_backend_event_ptr ev_fill;              // the fills are done
         std::vector<dh_fill> pending;                // slots taken, not uploaded yet
         std::vector<dh_fill> queued;                 // uploading, committed at the next begin()
+        // LLAMA_MOE_FILL_ASYNC: the queued fills in upload order, a batch per event; begin() commits the batches whose
+        // event is done and never makes the compute stream wait for the fill stream
+        std::deque<std::pair<size_t, ggml_backend_event_ptr>> flight;
+        std::vector<ggml_backend_event_ptr> ev_pool;
+        size_t  n_queued_batches = 0; // ASYNC: batches queued so far
+        size_t  n_done_batches   = 0; //        and committed
+        size_t  rf_seq    = 0;  // ASYNC: the refill is done when n_done_batches reaches this
+        int64_t rf_t0     = -1; // a refill after a give is under way since (us), -1 none
+        int32_t rf_graphs = 0;  // graphs since
+        size_t  rf_n      = 0;  // experts refilled since
+        bool    rf_sealed = false; // ASYNC: rf_seq covers the last refill
     };
     struct dh_stats {
         size_t graphs  = 0;
@@ -1332,6 +1344,28 @@ struct llama_moe_cache::impl {
     int32_t dh_mode     = 0;
     int64_t dh_max      = 8;  // tokens per ubatch
     int32_t dh_fill_max = 64; // fills per device per graph
+    // port/refill (all off by default = combined6):
+    // LLAMA_MOE_FILL_ASYNC=1: fills are committed when their copy is done (event query), the decode never waits for them
+    // LLAMA_MOE_REFILL_BG=1 (implies ASYNC): the lent tails' refill is queued in one go right after the give, before the graph
+    //   (LLAMA_MOE_DECODE_MEM_REFILL then caps it per graph, default 0 = all), apart from the miss fills
+    // LLAMA_MOE_FILL_BATCH=N: fills per event (ASYNC), default 32
+    // LLAMA_MOE_FILL_MIN_MISSES=K: an expert is filled after K misses (decayed: halved every 256 graphs)
+    // LLAMA_MOE_FILL_BUDGET_MIB=M: miss-fill bytes per device per graph
+    // LLAMA_MOE_FILL_EVICT=0: miss fills only take free slots, never evict (once the refill is done there are no fills)
+    bool    fill_async      = false;
+    bool    refill_bg       = false;
+    int32_t fill_batch      = 32;
+    int32_t fill_min_misses = 1;
+    size_t  fill_budget     = 0;
+    bool    fill_evict      = true;
+    std::vector<uint8_t> miss_cnt; // [n_layer*n_expert] with FILL_MIN_MISSES > 1
+    typedef bool (*event_query_t)(ggml_backend_event_t);
+    event_query_t ev_query = nullptr;
+    struct fill_stats {
+        size_t batches = 0, polls_busy = 0, max_flight = 0, refill_runs = 0, kept_out = 0, no_free = 0, budget_cut = 0;
+        int64_t refill_us = 0, refill_graphs = 0;
+    };
+    fill_stats stats_fill;
     int64_t dh_log_cap  = 0;
     bool    dh_logged   = false; // the last graph logs selected experts
     std::vector<dh_device> dh_devs; // [devices]
@@ -1972,6 +2006,25 @@ struct llama_moe_cache::impl {
         if (const char * env = moe_env("LLAMA_MOE_DEVICE_HITS_FILLS")) {
             dh_fill_max = std::max(0, atoi(env));
         }
+        if (const char * env = moe_env("LLAMA_MOE_FILL_ASYNC")) {
+            fill_async = atoi(env) != 0;
+        }
+        if (const char * env = moe_env("LLAMA_MOE_REFILL_BG")) {
+            refill_bg  = atoi(env) != 0;
+            fill_async = fill_async || refill_bg;
+        }
+        if (const char * env = moe_env("LLAMA_MOE_FILL_BATCH")) {
+            fill_batch = std::max(1, atoi(env));
+        }
+        if (const char * env = moe_env("LLAMA_MOE_FILL_MIN_MISSES")) {
+            fill_min_misses = std::clamp(atoi(env), 1, 255);
+        }
+        if (const char * env = moe_env("LLAMA_MOE_FILL_BUDGET_MIB")) {
+            fill_budget = (size_t) std::max(0.0, atof(env)*1024.0*1024.0);
+        }
+        if (const char * env = moe_env("LLAMA_MOE_FILL_EVICT")) {
+            fill_evict = atoi(env) != 0;
+        }
         if (const char * env = moe_env("LLAMA_MOE_CPU_LANE")) {
             lane_frac = std::clamp((float) atof(env), 0.0f, 1.0f);
         }
@@ -2334,7 +2387,7 @@ struct llama_moe_cache::impl {
             return v != nullptr && *v != '\0' ? atoi(v) : def;
         };
         dm_return_after = std::max(1, env_i("LLAMA_MOE_DECODE_MEM_RETURN", 1));
-        dm_refill_cap   = std::max(0, env_i("LLAMA_MOE_DECODE_MEM_REFILL", 256));
+        dm_refill_cap   = std::max(0, env_i("LLAMA_MOE_DECODE_MEM_REFILL", refill_bg ? 0 : 256)); // LLAMA_MOE_REFILL_BG: all at once
         const size_t spare = (size_t) std::max(0, env_i("LLAMA_MOE_DECODE_MEM_SPARE_MIB", 64))*1024*1024;
         if (const char * v = moe_env("LLAMA_MOE_DECODE_MEM_COMPACT")) {
             dm_compact = std::max(0.0f, (float) atof(v));
@@ -3536,6 +3589,15 @@ struct llama_moe_cache::impl {
             if (!dd.fill || !dd.ev_after || !dd.ev_fill) {
                 throw std::runtime_error("failed to create the MoE cache fill stream");
             }
+            if (fill_async && ev_query == nullptr) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                ev_query = reg ? (event_query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_query") : nullptr;
+                if (ev_query == nullptr) {
+                    LLAMA_LOG_WARN("%s: %s cannot query events: LLAMA_MOE_FILL_ASYNC / LLAMA_MOE_REFILL_BG are off\n", __func__, ggml_backend_name(devices[id].backend));
+                    fill_async = false;
+                    refill_bg  = false;
+                }
+            }
             for (int32_t il : dd.rows) {
                 for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
                     dh_alias_of[layers[il].experts[ip]] = layers[il].dh_alias[ip];
@@ -4102,6 +4164,7 @@ struct llama_moe_cache::impl {
         }
         if (dh) {
             dm_flush_fills(id);
+            dh_flight_clear(dh_devs[id]);
         }
         d.last_slot = -1;
 
@@ -4331,6 +4394,7 @@ struct llama_moe_cache::impl {
     void dh_process(size_t id) {
         dh_device & dd = dh_devs[id];
         int32_t budget = dh_fill_max;
+        size_t  bytes_taken = 0; // LLAMA_MOE_FILL_BUDGET_MIB
         for (size_t r = 0; r < dd.rows.size(); ++r) {
             const int32_t il = dd.rows[r];
             const layer & l = layers[il];
@@ -4373,7 +4437,7 @@ struct llama_moe_cache::impl {
                 } else {
                     stats_dh.misses++;
                     stats_dh.bytes_miss += expert_bytes;
-                    if (dh_inflight.count(il*slru.n_expert + e) == 0) {
+                    if (dh_inflight.count(il*slru.n_expert + e) == 0 && fill_wanted(il, e, slru.n_expert)) {
                         dh_cand.push_back(e);
                     }
                 }
@@ -4386,10 +4450,16 @@ struct llama_moe_cache::impl {
                 if (budget <= 0) {
                     break;
                 }
-                const int32_t s = slru.try_victim(il);
+                if (fill_budget > 0 && bytes_taken + expert_bytes > fill_budget) {
+                    stats_fill.budget_cut++;
+                    break;
+                }
+                const int32_t s = fill_slot(slru, il);
                 if (s < 0) {
                     break;
                 }
+                fill_taken(il, e, slru.n_expert);
+                bytes_taken += expert_bytes;
                 const int32_t key = slru.key_of[s];
                 if (key >= 0) {
                     slru.slot_map[key / slru.n_expert][key % slru.n_expert] = slru.empty;
@@ -4405,17 +4475,146 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // BEGIN fill policy slots (extracted by the CPU harness)
+    // a missed expert of layer il, not in flight: true if it may be filled now (LLAMA_MOE_FILL_MIN_MISSES counts its misses)
+    bool fill_wanted(int32_t il, int32_t e, int32_t n_expert) {
+        if (fill_min_misses <= 1) {
+            return true;
+        }
+        const size_t key = (size_t) il*n_expert + e;
+        if (miss_cnt.size() <= key) {
+            miss_cnt.resize(((size_t) il + 1)*n_expert, 0);
+        }
+        uint8_t & c = miss_cnt[key];
+        c = (uint8_t) std::min(255, c + 1);
+        if (c < fill_min_misses) {
+            stats_fill.kept_out++;
+            return false;
+        }
+        return true;
+    }
+    void fill_taken(int32_t il, int32_t e, int32_t n_expert) {
+        const size_t key = (size_t) il*n_expert + e;
+        if (key < miss_cnt.size()) {
+            miss_cnt[key] = 0;
+        }
+    }
+    // the slot a miss fill of layer il takes: the SLRU victim, with LLAMA_MOE_FILL_EVICT=0 a free slot only (-1: none);
+    // free slots sit at the head of the probation list (dm_return_tail, dm_flush_fills, dropped fills)
+    int32_t fill_slot(const moe_cache_slru & slru, int32_t il) {
+        if (fill_evict) {
+            return slru.try_victim(il);
+        }
+        int32_t n = 0;
+        for (int32_t s = slru.head[0]; s >= 0 && n < 16; s = slru.next[s], ++n) {
+            if (slru.key_of[s] < 0) {
+                return s;
+            }
+        }
+        stats_fill.no_free++;
+        return -1;
+    }
+    // LLAMA_MOE_FILL_ASYNC: commit the batches whose copies are done, in upload order (the fill stream is FIFO)
+    template <typename Q>
+    void dh_poll(dh_device & dd, Q done) {
+        while (!dd.flight.empty()) {
+            auto & b = dd.flight.front();
+            if (!done(b.second.get())) {
+                stats_fill.polls_busy++;
+                break;
+            }
+            const size_t n = std::min(b.first, dd.queued.size());
+            for (size_t i = 0; i < n; ++i) {
+                dh_commit(dd.queued[i]);
+            }
+            dd.queued.erase(dd.queued.begin(), dd.queued.begin() + n);
+            dd.ev_pool.push_back(std::move(b.second));
+            dd.flight.pop_front();
+            dd.n_done_batches++;
+        }
+    }
+    // after dm_flush_fills (every stream synchronized): the batches are committed
+    void dh_flight_clear(dh_device & dd) {
+        for (auto & b : dd.flight) {
+            dd.ev_pool.push_back(std::move(b.second));
+            dd.n_done_batches++;
+        }
+        dd.flight.clear();
+    }
+
+    bool refill_consumed(size_t id) const {
+        for (const group & g : groups) {
+            if (g.id == (int32_t) id && g.refill_pos < g.refill.size()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the refill of the lent tails: with LLAMA_MOE_REFILL_BG queued on the fill stream right away (before this graph), the
+    // miss fills of the last graph stay pending for launched(); otherwise pending with them
+    void dh_refill(size_t id) {
+        dh_device & dd = dh_devs[id];
+        const size_t before = stats_dm.refilled;
+        if (refill_bg) {
+            std::vector<dh_fill> miss;
+            miss.swap(dd.pending);
+            dm_refill(id);
+            if (stats_dm.refilled > before && dd.rf_t0 < 0) {
+                dd.rf_t0 = ggml_time_us();
+                dd.rf_graphs = 0;
+                dd.rf_n = 0;
+                dd.rf_sealed = false;
+            }
+            dh_queue(id);
+            dd.pending.swap(miss);
+        } else {
+            dm_refill(id);
+            if (stats_dm.refilled > before && dd.rf_t0 < 0) {
+                dd.rf_t0 = ggml_time_us();
+                dd.rf_graphs = 0;
+                dd.rf_n = 0;
+                dd.rf_sealed = false;
+            }
+        }
+        dd.rf_n += stats_dm.refilled - before;
+    }
+
+    // at a graph's begin, after the commits: is the device's refill done (every entry used and its copies landed)?
+    void refill_check(size_t id, bool cut = false) {
+        dh_device & dd = dh_devs[id];
+        if (dd.rf_t0 < 0) {
+            return;
+        }
+        const bool landed = fill_async ? dd.rf_sealed && dd.n_done_batches >= dd.rf_seq : dd.queued.empty();
+        if (!cut && !(refill_consumed(id) && landed && dd.pending.empty())) {
+            dd.rf_graphs++;
+            return;
+        }
+        const int64_t dt = ggml_time_us() - dd.rf_t0;
+        stats_fill.refill_runs++;
+        stats_fill.refill_us     += dt;
+        stats_fill.refill_graphs += dd.rf_graphs;
+        if (stats_fill.refill_runs <= 8) {
+            LLAMA_LOG_INFO("%s: %s: refill after a give %s: %zu experts in %.1f ms, %d graphs (%s)\n", __func__,
+                ggml_backend_name(devices[id].backend), cut ? "cut short by a take" : "done", dd.rf_n, dt/1000.0, dd.rf_graphs,
+                refill_bg ? "background, LLAMA_MOE_REFILL_BG" : fill_async ? "LLAMA_MOE_FILL_ASYNC" : "per graph, waited for");
+        }
+        dd.rf_t0 = -1;
+    }
+
     // upload the pending fills on the fill stream, after what the compute stream has queued so far
     void dh_queue(size_t id) {
         dh_device & dd = dh_devs[id];
         if (dd.pending.empty()) {
             return;
         }
-        GGML_ASSERT(dd.queued.empty());
+        GGML_ASSERT(fill_async || dd.queued.empty());
         ggml_backend_t fill = dd.fill.get();
         ggml_backend_event_record(dd.ev_after.get(), devices[id].backend);
         ggml_backend_event_wait(fill, dd.ev_after.get());
 
+        size_t n_batched = 0;
         // consecutive experts of a layer going to consecutive slots are uploaded together
         std::sort(dd.pending.begin(), dd.pending.end(), [](const dh_fill & a, const dh_fill & b) {
             return a.il != b.il ? a.il < b.il : a.expert < b.expert;
@@ -4436,12 +4635,38 @@ struct llama_moe_cache::impl {
                 stats_dh.bytes_fill += n*expert_size;
             }
             i += n;
+            if (fill_async && (i - n_batched >= (size_t) fill_batch || i == dd.pending.size())) {
+                // a batch ends after a run: an event of its own, committed by dh_poll once it is done
+                ggml_backend_event_ptr ev;
+                if (!dd.ev_pool.empty()) {
+                    ev = std::move(dd.ev_pool.back());
+                    dd.ev_pool.pop_back();
+                } else {
+                    ev.reset(ggml_backend_event_new(ggml_backend_get_device(fill)));
+                    GGML_ASSERT(ev && "failed to create a MoE fill event");
+                }
+                ggml_backend_event_record(ev.get(), fill);
+                dd.flight.emplace_back(i - n_batched, std::move(ev));
+                n_batched = i;
+                stats_fill.batches++;
+                dd.n_queued_batches++;
+            }
         }
-        ggml_backend_event_record(dd.ev_fill.get(), fill);
         stats_dh.fills += dd.pending.size();
-        dd.queued.swap(dd.pending);
+        if (fill_async) {
+            stats_fill.max_flight = std::max(stats_fill.max_flight, dd.queued.size() + dd.pending.size());
+            dd.queued.insert(dd.queued.end(), dd.pending.begin(), dd.pending.end());
+            if (dd.rf_t0 >= 0 && !dd.rf_sealed) {
+                dd.rf_seq    = dd.n_queued_batches; // the refill is done once the batches up to here are
+                dd.rf_sealed = refill_consumed(id);
+            }
+        } else {
+            ggml_backend_event_record(dd.ev_fill.get(), fill);
+            dd.queued.swap(dd.pending);
+        }
         dd.pending.clear();
     }
+    // END fill policy slots
 
     // a fill is done: the expert is cached from the next graph on, unless the cache path uploaded it meanwhile
     void dh_commit(const dh_fill & f) {
@@ -4961,6 +5186,10 @@ struct llama_moe_cache::impl {
 
         for (size_t id : take) {
             dm_flush_fills(id);
+            if (id < dh_devs.size()) {
+                dh_flight_clear(dh_devs[id]);
+                refill_check(id, true); // a refill cut short by the take ends here
+            }
             for (group & g : groups) {
                 if (g.id == (int32_t) id && !g.tail_out) {
                     dm_evict_tail(g);
@@ -5171,13 +5400,16 @@ struct llama_moe_cache::impl {
                 ggml_backend_synchronize(backend);
                 ggml_backend_tensor_set_async(backend, dd.log, dd.log_clear.data(), 0, ggml_nbytes(dd.log));
             }
-            if (!dd.queued.empty()) {
+            if (fill_async) {
+                dh_poll(dd, ev_query);
+            } else if (!dd.queued.empty()) {
                 ggml_backend_event_wait(backend, dd.ev_fill.get());
                 for (const dh_fill & f : dd.queued) {
                     dh_commit(f);
                 }
                 dd.queued.clear();
             }
+            refill_check(id);
             if (dd.resync) {
                 dh_rebuild_map(dd);
                 dd.resync = false;
@@ -5186,7 +5418,7 @@ struct llama_moe_cache::impl {
                 dh_process(id);
             }
             if (!ad_on) {
-                dm_refill(id);
+                dh_refill(id);
                 dh_upload_map(id);
             }
         }
@@ -5197,13 +5429,18 @@ struct llama_moe_cache::impl {
             }
             for (size_t id = 0; id < dh_devs.size(); ++id) {
                 if (!dh_devs[id].rows.empty()) {
-                    dm_refill(id);
+                    dh_refill(id);
                     dh_upload_map(id);
                 }
             }
         }
         if (dh_logged) {
             stats_dh.graphs++;
+            if (fill_min_misses > 1 && stats_dh.graphs % 256 == 0) {
+                for (uint8_t & c : miss_cnt) {
+                    c >>= 1;
+                }
+            }
             if (dh_graph_tokens > 0) {
                 stats_dh_n[dh_graph_tokens].graphs++;
             }
@@ -6732,6 +6969,14 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: device hits: %zu graphs, hits = %zu, misses = %zu read from host memory (%.2f MiB), hit rate = %.2f%%, "
                 "fills = %zu (%.2f MiB), %zu dropped\n", log_tag(), ds.graphs, ds.hits, ds.misses, ds.bytes_miss/1024.0/1024.0,
                 100.0*ds.hits/(ds.hits + ds.misses), ds.fills, ds.bytes_fill/1024.0/1024.0, ds.dropped);
+            const fill_stats & fs = stats_fill;
+            const size_t refills = std::min(ds.fills, stats_dm.refilled);
+            LLAMA_LOG_INFO("%s: fills: %zu refills of lent tails + %zu miss fills; refills done %zu times, %.1f ms / %.1f graphs each; "
+                "async %d (%zu batches, %zu busy polls, up to %zu in flight), min misses %d (%zu kept out), budget %.0f MiB (%zu cuts), "
+                "evict %d (%zu without a free slot)\n", log_tag(), refills, ds.fills - refills, fs.refill_runs,
+                fs.refill_runs ? fs.refill_us/1000.0/fs.refill_runs : 0.0, fs.refill_runs ? (double) fs.refill_graphs/fs.refill_runs : 0.0,
+                fill_async ? (refill_bg ? 2 : 1) : 0, fs.batches, fs.polls_busy, fs.max_flight, fill_min_misses, fs.kept_out,
+                fill_budget/1024.0/1024.0, fs.budget_cut, fill_evict ? 1 : 0, fs.no_free);
         }
         for (size_t i = 0; i < lanes.size(); ++i) {
             const llama_moe_lane::stats ls = lanes[i]->get_stats();

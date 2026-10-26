@@ -7865,6 +7865,17 @@ static void ggml_backend_cuda_copy_blocks_async(ggml_backend_t backend, void * c
 }
 // the streams of a backend created after this call get the device's highest (rank > 0), lowest (rank < 0) or the default
 // priority (LLAMA_MOE_RING_PRIO: the ring's copy kernel gets SMs ahead of the compute stream's blocks); false if a stream exists
+// true once the work recorded in the event is done (cudaEventQuery, no wait)
+static bool ggml_backend_cuda_event_query(ggml_backend_event_t event) {
+    const cudaError_t err = cudaEventQuery((cudaEvent_t) event->context);
+    if (err == cudaErrorNotReady) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    CUDA_CHECK(err);
+    return true;
+}
+
 static bool ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int rank) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -7945,6 +7956,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_copy_blocks_async") == 0) {
         return (void *)ggml_backend_cuda_copy_blocks_async;
+    }
+    if (strcmp(name, "ggml_backend_event_query") == 0) {
+        return (void *)ggml_backend_cuda_event_query;
     }
     if (strcmp(name, "ggml_backend_set_stream_priority") == 0) {
         return (void *)ggml_backend_cuda_set_stream_priority;
