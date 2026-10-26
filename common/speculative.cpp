@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1678,10 +1679,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
+            // LLAMA_MTP_PROMPT_TAIL=N: a fresh sequence's first batch (the prompt) gives the draft only its last N rows:
+            // the draft's attention then sees N tokens of context, its h input carries the rest (fewer K/V rows to build;
+            // only acceptance can change, the target verifies every token). Later batches stay consecutive.
+            static const int32_t prompt_tail = [] { const char * e = getenv("LLAMA_MTP_PROMPT_TAIL"); return e ? std::max(0, atoi(e)) : 0; }();
+            std::vector<int32_t> k_first(i_batch_beg);
+            if (prompt_tail > 0) {
+                auto * mem = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0 && i_batch_end[seq_id] - i_batch_beg[seq_id] + 1 > prompt_tail &&
+                            llama_memory_seq_pos_max(mem, seq_id) < 0) {
+                        k_first[seq_id] = i_batch_end[seq_id] - prompt_tail + 1;
+                    }
+                }
+            }
+
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
                 const llama_seq_id seq_id = t.seq_id;
+
+                if (k < k_first[seq_id]) {
+                    continue;
+                }
 
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
