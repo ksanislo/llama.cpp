@@ -6674,6 +6674,119 @@ struct test_mul_mat_id_slots : public test_case {
     }
 };
 
+// Expert matmuls at Flash-Next prompt shapes (GGML_CUDA_MMQ_MOE): 512 experts, 10 used, a prompt chunk of n tokens, routed by a
+// skewed popularity (log-normal expert weights, sigma = skew; 0 = uniform) drawn without replacement per token, fixed per case
+// (no redraw between perf runs). slots: ggml_mul_mat_id_slots with 3/4 of the experts in a bank, the rest in a staging area
+// (LLAMA_MOE_RING_INPLACE), else plain MUL_MAT_ID. gate/up: b = true, m = 640, k = 2560; down: b = false, m = 2560, k = 640.
+struct test_mul_mat_id_fn : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool slots;
+    const float skew;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, n_mats, n_used, b, m, n, k, slots, skew);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return slots ? "MUL_MAT_ID_SLOTS_FN" : "MUL_MAT_ID_FN";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_fn(ggml_type type_a = GGML_TYPE_Q5_1, int n_mats = 512, int n_used = 10, bool b = false,
+            int64_t m = 2560, int64_t n = 3584, int64_t k = 640, bool slots = false, float skew = 0.7f)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), slots(slots), skew(skew) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    int n_hit() const { return slots ? n_mats*3/4 : n_mats; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * bt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_set_name(bt, "b");
+        ggml_tensor * out;
+        if (slots) {
+            ggml_tensor * bank = ggml_new_tensor_3d(ctx, type_a, k, m, n_hit());
+            ggml_set_name(bank, "bank");
+            ggml_tensor * stage = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats - n_hit());
+            ggml_set_name(stage, "stage");
+            ggml_tensor * map = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_mats);
+            ggml_set_name(map, "map");
+            out = ggml_mul_mat_id_slots(ctx, bank, stage, nullptr, bt, ids, map);
+        } else {
+            ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(as, "as");
+            out = ggml_mul_mat_id(ctx, as, bt, ids);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321 + n + 3*m + (slots ? 1 : 0));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        if (slots) {
+            std::vector<int32_t> perm(n_mats), slot(n_hit()), place(n_mats - n_hit()), map_v(n_mats);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::iota(slot.begin(), slot.end(), 0);
+            std::iota(place.begin(), place.end(), 0);
+            std::shuffle(perm.begin(), perm.end(), rng);
+            std::shuffle(slot.begin(), slot.end(), rng);
+            std::shuffle(place.begin(), place.end(), rng);
+            for (int i = 0; i < n_mats; ++i) {
+                map_v[perm[i]] = i < n_hit() ? slot[i] : -1 - place[i - n_hit()];
+            }
+            ggml_tensor * map = ggml_get_tensor(ctx, "map");
+            ggml_backend_tensor_set(map, map_v.data(), 0, ggml_nbytes(map));
+        }
+
+        // per token the n_used largest log(w_e) + Gumbel noise: weighted sampling without replacement
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::uniform_real_distribution<float> ud(1e-7f, 1.0f);
+        std::vector<float> logw(n_mats);
+        for (float & l : logw) {
+            l = skew*nd(rng);
+        }
+        std::vector<std::pair<float, int32_t>> key(n_mats);
+        std::vector<int32_t> ids_v(n_used*n);
+        for (int64_t t = 0; t < n; ++t) {
+            for (int e = 0; e < n_mats; ++e) {
+                key[e] = { logw[e] - logf(-logf(ud(rng))), e };
+            }
+            std::partial_sort(key.begin(), key.begin() + n_used, key.end(), std::greater<>());
+            for (int i = 0; i < n_used; ++i) {
+                ids_v[t*n_used + i] = key[i].second;
+            }
+        }
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        ggml_backend_tensor_set(ids, ids_v.data(), 0, ggml_nbytes(ids));
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+    }
+};
+
 // MoE CPU lane (ggml_moe_doorbell / ggml_moe_join, served by llama_moe_lane as in llama.cpp): an expert FFN (gate, up, swiglu,
 // down) through ggml_mul_mat_id_mapped where the doorbell hands a share frac of the misses to the CPU lane, compared with the plain
 // MUL_MAT_ID FFN on all the experts in the same graph. The lane computes its experts with ggml-cpu, the backend the others, so the
@@ -12650,6 +12763,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 24, 40, false, 8, false, 128, 512, 512)); // no host
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 128, 600, 100, 20, true, 10, true, 128, 384, 512)); // bank >> experts
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 512, 1500, 120, 300, true, 10, false, 128, 1024, 512)); // Flash-Next shape
+    // GGML_CUDA_MMQ_MOE: Flash-Next prompt shapes, skewed routing (gate/up Q4_K, down Q5_1 and Q8_0), plain and in place
+    for (bool sl : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q4_K, 512, 10, true,   640, 3584, 2560, sl, 0.7f));
+        test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, 3584,  640, sl, 0.7f));
+        test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q8_0, 512, 10, false, 2560, 3584,  640, sl, 0.7f));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, 100, 640, false, 1.5f)); // sparse, skewed
     // LLAMA_MOE_RING_BYTES: the staging tensor is the whole byte ring, more places than experts, the staged ones anywhere in it
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 16, 200, true, 8, true, 128, 512, 512));
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 64, 96, 16, 200, true, 8, false, 256, 512, 640));
@@ -13769,6 +13889,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GGML_CUDA_MMQ_MOE: Flash-Next expert matmuls of a prompt chunk (3584 = the nsys capture, 2048 = LLAMA_PROMPT_PIPE=2048)
+    for (int n : {3584, 2048}) {
+        for (bool sl : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q4_K, 512, 10, true,   640, n, 2560, sl, 0.7f));
+            test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, n,  640, sl, 0.7f));
+            test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q8_0, 512, 10, false, 2560, n,  640, sl, 0.7f));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, 3584, 640, false, 0.0f)); // uniform routing
+    test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q4_K, 512, 10, true,   640, 3584, 2560, false, 0.0f));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
