@@ -6849,6 +6849,24 @@ static void ggml_backend_cuda_copy_blocks_async(ggml_backend_t backend, void * c
         CUDA_CHECK(cudaGetLastError());
     }
 }
+// the streams of a backend created after this call get the device's highest (rank > 0), lowest (rank < 0) or the default
+// priority (LLAMA_MOE_RING_PRIO: the ring's copy kernel gets SMs ahead of the compute stream's blocks); false if a stream exists
+static bool ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int rank) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+        if (cuda_ctx->streams[cuda_ctx->device][s] != nullptr) {
+            return false;
+        }
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    int least    = 0;
+    int greatest = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    cuda_ctx->stream_priority = rank > 0 ? greatest : rank < 0 ? least : 0;
+    return true;
+}
+
 #if defined(GGML_CUDA_VMM_BUFFER)
 // compute buffers in address space only: their owner backs the ranges a graph uses (ggml_backend_cuda_vmm_buffer_commit)
 // before the graph's tensors are written; the buffers themselves belong to the plain CUDA buffer type of the device
@@ -6913,6 +6931,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_copy_blocks_async") == 0) {
         return (void *)ggml_backend_cuda_copy_blocks_async;
+    }
+    if (strcmp(name, "ggml_backend_set_stream_priority") == 0) {
+        return (void *)ggml_backend_cuda_set_stream_priority;
     }
     if (strcmp(name, "ggml_backend_set_graph_capture_all") == 0) {
         return (void *)ggml_backend_cuda_set_graph_capture_all;

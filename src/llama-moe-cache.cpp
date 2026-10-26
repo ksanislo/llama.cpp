@@ -889,6 +889,52 @@ static bool moe_cache_plan_floors_dm(std::vector<double> & budget, std::vector<d
     }
     return true;
 }
+
+// LLAMA_MOE_CACHE_SPLIT=stream: per prompt chunk each stage streams need - budget (need = its host experts + the ring's staging
+// borrowed from its cache) and the stage that streams most paces the pipe. Water-filling: the budgets in [0, min(cap, need)],
+// summing to at most size, that minimize the largest need - budget. Returns that largest need - budget.
+static double moe_cache_split_stream(const std::vector<double> & need, const std::vector<double> & cap, double size, std::vector<double> & budget) {
+    const size_t n = need.size();
+    std::vector<double> hi(n);
+    double sum_hi = 0.0;
+    double top    = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        hi[i]   = std::max(0.0, std::min(cap[i], need[i]));
+        sum_hi += hi[i];
+        top     = std::max(top, need[i]);
+    }
+    auto at = [&](double level, std::vector<double> & b) {
+        double sum = 0.0;
+        b.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            b[i] = std::clamp(need[i] - level, 0.0, hi[i]);
+            sum += b[i];
+        }
+        return sum;
+    };
+    if (size >= sum_hi) {
+        at(0.0, budget);
+    } else {
+        // the sum falls as the level rises: the lowest level whose budgets fit in size
+        double lo = 0.0;
+        double up = top;
+        std::vector<double> tmp;
+        for (int it = 0; it < 64 && up - lo > 1.0; ++it) {
+            const double mid = 0.5*(lo + up);
+            if (at(mid, tmp) > size) {
+                lo = mid;
+            } else {
+                up = mid;
+            }
+        }
+        at(up, budget);
+    }
+    double worst = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        worst = std::max(worst, need[i] - budget[i]);
+    }
+    return worst;
+}
 // END moe_cache_plan
 
 }
@@ -994,6 +1040,8 @@ struct llama_moe_cache::impl {
             int64_t issue_us    = 0; // host time queueing the copies
             int64_t issue_us_max = 0;
         } rstats;
+        ring_stats rstats_graph; // LLAMA_MOE_RING_LOG: rstats at the start of the device's part of the graph
+        int64_t    rgraph_t0 = 0;
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -1092,6 +1140,8 @@ struct llama_moe_cache::impl {
     int32_t ring_merge = 0; // LLAMA_MOE_RING_MERGE=g: up to g cached experts between two uploaded runs are uploaded with them
     int32_t ring_zc     = 1;  // LLAMA_MOE_RING_ZC=0: uncached experts by host copies on the copy engine (one per run) instead of the kernel
     int32_t ring_blocks = 16; // LLAMA_MOE_RING_BLOCKS: CUDA blocks of the copy kernel
+    bool    ring_prio   = false; // LLAMA_MOE_RING_PRIO=1: the copy stream has the device's highest priority (its kernel's blocks go first)
+    bool    ring_log    = false; // LLAMA_MOE_RING_LOG=1: one line per device and ring graph (the exit stats are often lost with the log)
     typedef void (*copy_blocks_t)(ggml_backend_t, void * const *, const void * const *, int, size_t, int);
     copy_blocks_t copy_blocks = nullptr;
     std::unordered_map<const ggml_tensor *, int32_t> stage_view_layer; // staged experts (the matmul's src[0]) -> layer
@@ -1318,6 +1368,8 @@ struct llama_moe_cache::impl {
 
     // LLAMA_MOE_CACHE_SPLIT=miss: the hottest profiled experts are cached first, on whichever device they are
     bool split_miss  = false;
+    // LLAMA_MOE_CACHE_SPLIT=stream: the budget evens out the experts each stage streams per prompt chunk
+    bool split_stream = false;
     bool prof_loaded = false;
     bool prof_exists = false;
 
@@ -1388,6 +1440,12 @@ struct llama_moe_cache::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_RING_BLOCKS")) {
             ring_blocks = std::max(1, atoi(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_RING_PRIO")) {
+            ring_prio = atoi(env) != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_RING_LOG")) {
+            ring_log = atoi(env) != 0;
         }
         if (const char * env = getenv("LLAMA_MOE_PREFETCH")) {
             n_pref = std::clamp(atoi(env), 0, (int) model.hparams.n_expert);
@@ -1491,14 +1549,18 @@ struct llama_moe_cache::impl {
             g.budget = (double) size*d.split/split_sum*g.host_bytes/d.host_bytes;
         }
         if (const char * env = getenv("LLAMA_MOE_CACHE_SPLIT")) {
-            split_miss = strcmp(env, "miss") == 0;
-            if (!split_miss && *env != '\0' && strcmp(env, "free") != 0) {
-                LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_SPLIT=%s (free or miss), using free\n", __func__, env);
+            split_miss   = strcmp(env, "miss") == 0;
+            split_stream = strcmp(env, "stream") == 0;
+            if (!split_miss && !split_stream && *env != '\0' && strcmp(env, "free") != 0) {
+                LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_SPLIT=%s (free, miss or stream), using free\n", __func__, env);
             }
         }
         if (split_miss && !compute.measure) {
             load_profile(profile);
             split_by_miss(size, compute, no_alloc);
+        }
+        if (split_stream && !compute.measure) {
+            split_by_stream(size, compute, no_alloc);
         }
         apply_floors();
         // the plan without decode memory: the cache its large batches use is the least the plan with it may leave them
@@ -1969,6 +2031,72 @@ struct llama_moe_cache::impl {
         }
         if (left >= 1024.0*1024.0) {
             LLAMA_LOG_WARN("%s: %.2f MiB of the MoE cache budget do not fit beside the compute buffers\n", __func__, left/1024.0/1024.0);
+        }
+    }
+
+    // LLAMA_MOE_CACHE_SPLIT=stream: a piped prompt chunk streams every uncached expert of each stage, and the stage that streams
+    // most sets the pace (srv-c3-allnodm: CUDA0 has 13 layers / 20.2 GB of host experts beside 11-12 / 17-18.3 GB, the same
+    // cache, and ~2.3 GB of VRAM left unused). The budget goes where the most is streamed (moe_cache_split_stream), each device
+    // capped by its room beside the measured compute buffer; --moe-cache-mib stays the total (a larger one is cut to the room).
+    void split_by_stream(size_t size, const llama_moe_cache_compute & compute, bool no_alloc) {
+        std::vector<double> need(devices.size(), 0.0);
+        std::vector<double> cap(devices.size(), 0.0);
+        std::vector<double> stage(devices.size(), 0.0);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
+            if (d.host_bytes == 0) {
+                continue;
+            }
+            size_t slot_size = 0;
+            const std::vector<size_t> sec = n_stage > 0 ? stage_sec(id, slot_size, true) : std::vector<size_t>();
+            double own = 0.0;
+            if (n_stage > 0 && borrow) {
+                // the staging slots borrow the bank slots of the device's largest group during large batches
+                int32_t ig_max = -1;
+                for (size_t ig = 0; ig < groups.size(); ++ig) {
+                    if (groups[ig].id == (int32_t) id && (ig_max < 0 || groups[ig].host_bytes > groups[ig_max].host_bytes)) {
+                        ig_max = (int32_t) ig;
+                    }
+                }
+                const std::vector<size_t> nb = bank_nb(groups[ig_max]);
+                const int32_t k = moe_cache_stage_slots(nb, sec, n_stage);
+                for (size_t b : nb) {
+                    stage[id] += (double) k*b;
+                }
+            } else if (n_stage > 0) {
+                own = (double) n_stage*slot_size;
+            }
+            need[id] = (double) d.host_bytes + stage[id];
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
+            const double large   = compute.large.size()   > d.ib ? (double) compute.large[d.ib]   : 0.0;
+            const double reserve = compute.reserve.size() > d.ib ? (double) compute.reserve[d.ib] : 0.0;
+            cap[id] = no_alloc || free == 0 ? 1e30 : std::max(0.0, (double) free - fit_margin(id) - large - reserve - own);
+        }
+        if (compute.large.empty() && !no_alloc) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_SPLIT=stream without measured compute buffers: the devices' free memory caps the split\n", __func__);
+        }
+        std::vector<double> b;
+        moe_cache_split_stream(need, cap, (double) size, b);
+        double given = 0.0;
+        for (group & g : groups) {
+            const device & d = devices[g.id];
+            g.budget = d.host_bytes > 0 ? b[g.id]*g.host_bytes/d.host_bytes : 0.0;
+        }
+        for (size_t id = 0; id < devices.size(); ++id) {
+            if (devices[id].host_bytes == 0) {
+                continue;
+            }
+            given += b[id];
+            LLAMA_LOG_INFO("%s: %10s MoE cache split by streamed bytes: %8.2f MiB (cap %.2f MiB); a prompt chunk streams %.2f MiB "
+                "(%.2f MiB host experts, %.2f MiB staging borrowed)\n", __func__, ggml_backend_buft_name(devices[id].buft),
+                b[id]/1024.0/1024.0, cap[id] >= 1e29 ? 0.0 : cap[id]/1024.0/1024.0, (need[id] - b[id])/1024.0/1024.0,
+                devices[id].host_bytes/1024.0/1024.0, stage[id]/1024.0/1024.0);
+        }
+        if (given + 1024.0*1024.0 < (double) size) {
+            LLAMA_LOG_WARN("%s: %.2f MiB of the MoE cache budget do not fit beside the compute buffers (or are not needed)\n", __func__,
+                ((double) size - given)/1024.0/1024.0);
         }
     }
 
@@ -3230,6 +3358,17 @@ struct llama_moe_cache::impl {
             d.ev_compute.reset(ggml_backend_event_new(dev));
             if (!d.copy || !d.ev_compute) {
                 throw std::runtime_error("failed to create the MoE staging stream");
+            }
+            if (ring > 0 && ring_prio) {
+                typedef bool (*set_prio_t)(ggml_backend_t, int);
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto set_prio = reg ? (set_prio_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_stream_priority") : nullptr;
+                if (set_prio && set_prio(d.copy.get(), 1)) {
+                    LLAMA_LOG_INFO("%s: %10s MoE ring: the copy stream has the device's highest priority (LLAMA_MOE_RING_PRIO=1)\n", __func__,
+                        ggml_backend_buft_name(d.buft));
+                } else {
+                    LLAMA_LOG_WARN("%s: %s: LLAMA_MOE_RING_PRIO=1 not applied (no stream priorities)\n", __func__, ggml_backend_name(d.backend));
+                }
             }
             for (int32_t is = 0; is < n_stage; ++is) {
                 d.ev_ready.emplace_back(ggml_backend_event_new(dev));
@@ -4934,6 +5073,10 @@ struct llama_moe_cache::impl {
         d.rs.start(std::move(plan), fence);
         d.ring_prev  = true;
         d.ring_fence = false;
+        if (ring_log) {
+            d.rstats_graph = d.rstats;
+            d.rgraph_t0    = ggml_time_us();
+        }
         d.rstats.graphs++;
         ring_issue(d);
     }
@@ -4955,6 +5098,16 @@ struct llama_moe_cache::impl {
         const int32_t rel = d.rs.release();
         if (rel >= 0) {
             ggml_backend_event_record(d.ev_used[rel].get(), d.backend);
+        }
+        if (ring_log && d.rgraph_t0 > 0) {
+            const auto & a = d.rstats_graph;
+            const auto & b = d.rstats;
+            LLAMA_LOG_INFO("llama_moe_cache: ring %s graph %zu: %zu layers ahead, %zu at their layer, %zu partial, %zu dropped; %.2f GiB "
+                "from host, %.2f GiB from the cache; host %.1f ms queueing copies, %.1f ms queueing the graph\n",
+                ggml_backend_name(d.backend), b.graphs, b.layers - a.layers, b.at_layer - a.at_layer, b.partial - a.partial,
+                b.dropped - a.dropped, (b.bytes_host - a.bytes_host)/1024.0/1024.0/1024.0, (b.bytes_cache - a.bytes_cache)/1024.0/1024.0/1024.0,
+                (b.issue_us - a.issue_us)/1000.0, (ggml_time_us() - d.rgraph_t0)/1000.0);
+            d.rgraph_t0 = 0;
         }
     }
 
@@ -5615,7 +5768,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
 bool llama_moe_cache::wants_compute_sizes() {
     const char * dm    = getenv("LLAMA_MOE_DECODE_MEM");
     const char * split = getenv("LLAMA_MOE_CACHE_SPLIT");
-    return (dm != nullptr && atoi(dm) != 0) || (split != nullptr && strcmp(split, "miss") == 0);
+    return (dm != nullptr && atoi(dm) != 0) || (split != nullptr && (strcmp(split, "miss") == 0 || strcmp(split, "stream") == 0));
 }
 
 int32_t llama_moe_cache::small_batch_tokens() {
