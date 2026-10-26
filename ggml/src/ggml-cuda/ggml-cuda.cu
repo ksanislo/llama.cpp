@@ -4485,6 +4485,12 @@ static const ggml_tensor * ggml_cuda_gdn_sole_reader(const ggml_cgraph * cgraph,
     if (gdn == nullptr || gdn->src[2]->ne[2] >= 64 || gdn->src[3]->ne[0] != 1) {
         return nullptr;
     }
+    // nor may the GDN's own output (same freed-memory reuse)
+    for (const ggml_tensor * k : keep) {
+        if (!ggml_cuda_fusion_no_overlap(gdn, { k }, {})) {
+            return nullptr;
+        }
+    }
     return gdn;
 }
 
@@ -4691,6 +4697,28 @@ static bool ggml_cuda_try_skip_conv_state(ggml_backend_cuda_context * cuda_ctx, 
         }
         r.tail_col[t] = (int64_t) (tail->view_offs / sizeof(float));
         r.tail_dst[t] = (float *) dst->data;
+    }
+
+    // the conv's own output (sc, or the SILU / ADD + SILU fused into it): the allocator gives it freed memory, and x is
+    // freed after the concat, ids after its last gather. Disjoint, or exactly x (the kernel writes y(t, c) over x(t, c)
+    // only after reading it); a partial overlap would race between threads.
+    for (int j = j_sc; j < std::min(j_sc + 3, cgraph->n_nodes); ++j) {
+        const ggml_tensor * o = cgraph->nodes[j];
+        if (j > j_sc && o->src[0] != cgraph->nodes[j - 1] && o->src[1] != cgraph->nodes[j - 1]) {
+            break;
+        }
+        const bool y_is_x = o->data == xt->data && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) &&
+            o->ne[0] == nr && o->ne[1] == T && ggml_nelements(o) == nr*T &&
+            (size_t) xt->nb[0] == o->nb[1] && xt->nb[1] == sizeof(float);
+        if (!ggml_cuda_fusion_no_overlap(o, { ids, rows, cache }, {}) ||
+                (!y_is_x && !ggml_cuda_fusion_no_overlap(o, { xt, xr }, {}))) {
+            return false;
+        }
+        for (int t = 0; t < n_tail; ++t) {
+            if (!ggml_cuda_fusion_no_overlap(o, { cpys[t]->src[1] }, {})) {
+                return false;
+            }
+        }
     }
 
     // nothing else between the gather and the SSM_CONV may write over what the SSM_CONV now reads

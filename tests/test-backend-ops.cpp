@@ -5115,13 +5115,22 @@ struct test_decode_fusion_gdn_l2 : public test_case {
 
 // convstate: the conv state of a GDN layer as build_conv_state_at makes it: GET_ROWS of the cache row, CONCAT with x^T, SSM_CONV
 // + SILU, the tail of each rollback slot copied back into the cache (VIEW -> CONT -> CPY, slot 0 to the row read)
+// alias: where the conv output lives. ggml-alloc frees x (qkv_mixed) after the concat, its last reader, and the SSM_CONV of
+// the same [nr, T] size takes that block (exact best fit; the SILU goes in place on it), so in the model the fused kernel
+// writes y over the x it reads. DFC_ALIAS_X mirrors that, DFC_ALIAS_PARTIAL puts the output half a row into x (must not
+// fuse). ggml_backend_alloc_ctx_tensors gives every tensor its own memory, so the pointers are set after allocation.
+enum test_dfc_alias { DFC_ALIAS_NONE, DFC_ALIAS_X, DFC_ALIAS_PARTIAL };
+
 struct test_decode_fusion_conv_state : public test_case {
     const int64_t nr, d_conv, n_seq_tokens, n_cells, n_slots;
+    const test_dfc_alias alias;
     std::vector<ggml_tensor *> cpys;
-    ggml_tensor * out = nullptr;
+    ggml_tensor * xbuf = nullptr;
+    ggml_tensor * conv = nullptr;
+    ggml_tensor * out  = nullptr;
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DECODE_FUSION_CONV_STATE"; }
-    std::string vars() override { return VARS_TO_STR5(nr, d_conv, n_seq_tokens, n_cells, n_slots); }
+    std::string vars() override { return VARS_TO_STR6(nr, d_conv, n_seq_tokens, n_cells, n_slots, alias); }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         std::vector<ggml_tensor *> v = { out };
@@ -5131,8 +5140,9 @@ struct test_decode_fusion_conv_state : public test_case {
         return v;
     }
 
-    test_decode_fusion_conv_state(int64_t nr = 256, int64_t d_conv = 4, int64_t n_seq_tokens = 1, int64_t n_cells = 3, int64_t n_slots = 1)
-        : nr(nr), d_conv(d_conv), n_seq_tokens(n_seq_tokens), n_cells(n_cells), n_slots(n_slots) {}
+    test_decode_fusion_conv_state(int64_t nr = 256, int64_t d_conv = 4, int64_t n_seq_tokens = 1, int64_t n_cells = 3, int64_t n_slots = 1,
+            test_dfc_alias alias = DFC_ALIAS_NONE)
+        : nr(nr), d_conv(d_conv), n_seq_tokens(n_seq_tokens), n_cells(n_cells), n_slots(n_slots), alias(alias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t ns = d_conv - 1;
@@ -5142,7 +5152,10 @@ struct test_decode_fusion_conv_state : public test_case {
         ggml_set_name(cache, "cache");
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_set_name(ids, "ids");
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr, T);
+        // x at the start of a block one row longer, so that a partially overlapping output fits in it
+        xbuf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nr*(T + 1));
+        ggml_set_name(xbuf, "xbuf");
+        ggml_tensor * x = ggml_view_2d(ctx, xbuf, nr, T, nr*sizeof(float), 0);
         ggml_set_name(x, "x");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
         ggml_set_name(w, "w");
@@ -5163,14 +5176,22 @@ struct test_decode_fusion_conv_state : public test_case {
             }
         }
 
-        out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, w));
+        conv = ggml_ssm_conv(ctx, cc, w);
+        ggml_set_name(conv, "conv");
+        out = ggml_silu(ctx, conv);
         ggml_set_name(out, "out");
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        if (alias != DFC_ALIAS_NONE) {
+            // the conv and the in-place SILU in x's block, as ggml-alloc places them in the model graph
+            char * base = (char *) xbuf->data + (alias == DFC_ALIAS_PARTIAL ? (nr/2)*sizeof(float) : 0);
+            conv->data = base;
+            out->data  = base;
+        }
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_is_view_op(t->op)) { continue; }
+            if (ggml_is_view_op(t->op) || t == conv || t == out) { continue; }
             if (strcmp(t->name, "ids") == 0) {
                 const int32_t id = 1;
                 ggml_backend_tensor_set(t, &id, 0, sizeof(id));
@@ -13478,6 +13499,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
+    // convstate at the -ub 32 perplexity batch (the fused path's limit)
+    for (test_dfc_alias alias : { DFC_ALIAS_NONE, DFC_ALIAS_X }) {
+        test_cases.emplace_back(new test_decode_fusion_conv_state(10240, 4, 32, 2, 1, alias));
+    }
+
     // GGML_CUDA_DECODE_FUSION (CUDA); the same graphs unfused elsewhere
     for (int64_t n : { 1, 3, 8 }) {
         test_cases.emplace_back(new test_decode_fusion_silu_mm(GGML_TYPE_Q8_0, 320,  1024, n));
@@ -13510,6 +13536,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_decode_fusion_conv_state(256, 4, n, 3, 1));
         test_cases.emplace_back(new test_decode_fusion_conv_state(256, 4, n, 3, 2));
         test_cases.emplace_back(new test_decode_fusion_conv_state(10240, 4, n, 2, 1));
+        // the conv output in x's block, as ggml-alloc places it in qwen4exp (Flash-Next: 10240 channels, rs_seq 0 and 3)
+        test_cases.emplace_back(new test_decode_fusion_conv_state(10240, 4, n, 2, 1, DFC_ALIAS_X));
+        test_cases.emplace_back(new test_decode_fusion_conv_state(10240, 4, n, 2, 4, DFC_ALIAS_X));
+        test_cases.emplace_back(new test_decode_fusion_conv_state(256,   4, n, 3, 2, DFC_ALIAS_X));
+        test_cases.emplace_back(new test_decode_fusion_conv_state(10240, 4, n, 2, 1, DFC_ALIAS_PARTIAL));
         for (test_dfv_mode mode : { DFV_ADD_CHAIN, DFV_RMS_MUL, DFV_RMS_MUL_ADD, DFV_HCNORM, DFV_NEGATIVE }) {
             test_cases.emplace_back(new test_decode_fusion_views(mode, GGML_TYPE_F32, 2560, n));
         }

@@ -60,6 +60,8 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
 // GGML_CUDA_DECODE_FUSION convstate: ssm_conv_f32 for one sequence whose input is the concatenation of the state (row ids[0] of
 // the cache, [d_conv - 1, nr]) and x^T, read in place; the tails of that concatenation (the next states) are written to the
 // cache rows. Each thread reads its channel's state before writing it, so a tail may go to the row it was read from.
+// The output may be x itself (ggml-alloc hands the conv x's block, freed after the concat): y(t, c) is then x(t, c), so the
+// tails are written first and the conv reads x(t, c) before it writes y(t, c), all in the thread of channel c.
 struct ssm_conv_state_args {
     const float *   rows;
     const int32_t * ids;
@@ -79,7 +81,7 @@ static __global__ void ssm_conv_state_f32(const ssm_conv_state_args args, const 
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
     const float * GGML_CUDA_RESTRICT bias = bias_ptr;
-    float       * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    float       *                    dst  = dst_ptr; // may be args.x
     const int tid  = threadIdx.x;
     const int bidy = blockIdx.y;
     const int64_t c = bidy * split_d_inner + tid;
@@ -113,6 +115,15 @@ static __global__ void ssm_conv_state_f32(const ssm_conv_state_args args, const 
 
     float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
 
+    // tails before the conv: once y is written, x may hold y
+    for (int t = 0; t < args.n_tail; t++) {
+        float * tail = args.tail_dst[t] + c * ns;
+#pragma unroll
+        for (int j = 0; j < ns; j++) {
+            tail[j] = col(args.tail_col[t] + j);
+        }
+    }
+
     for (int64_t i = 0; i < n_t; i++) {
         float sumf = 0.0f;
 
@@ -130,14 +141,6 @@ static __global__ void ssm_conv_state_f32(const ssm_conv_state_args args, const 
         }
         sumf += b;
         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
-    }
-
-    for (int t = 0; t < args.n_tail; t++) {
-        float * tail = args.tail_dst[t] + c * ns;
-#pragma unroll
-        for (int j = 0; j < ns; j++) {
-            tail[j] = col(args.tail_col[t] + j);
-        }
     }
 }
 
