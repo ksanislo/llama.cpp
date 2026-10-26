@@ -184,7 +184,8 @@ static bool ggml_cuda_fusion_disabled() {
 // its gate and beta from the raw projections: ADD -> SOFTPLUS -> MUL and SIGMOID skipped), expglu (expert up + gate + GLU
 // in one MMVQ when the expert cache's bank views sit between them), gdnl2 (the q/k l2 norms done by the gated delta net),
 // convstate (the conv state gather, concat and tail copy done by SSM_CONV), views (the fusion matchers also look past
-// no-op nodes: views, reshapes, permutes, transposes). All keep the unfused values.
+// no-op nodes: views, reshapes, permutes, transposes), imrope (rms_norm + mul + rope (+ view + set_rows) and
+// rope + view + set_rows also for (I)M-RoPE). All keep the unfused values.
 enum ggml_cuda_decode_fusion_bit {
     GGML_CUDA_DF_Q8       = 1 << 0,
     GGML_CUDA_DF_SILU     = 1 << 1,
@@ -196,6 +197,7 @@ enum ggml_cuda_decode_fusion_bit {
     GGML_CUDA_DF_GDNL2    = 1 << 7,
     GGML_CUDA_DF_CONVSTATE = 1 << 8,
     GGML_CUDA_DF_VIEWS    = 1 << 9,
+    GGML_CUDA_DF_IMROPE   = 1 << 10,
 };
 
 static int ggml_cuda_decode_fusion() {
@@ -208,12 +210,12 @@ static int ggml_cuda_decode_fusion() {
             { "q8", GGML_CUDA_DF_Q8 }, { "silu", GGML_CUDA_DF_SILU }, { "shgate", GGML_CUDA_DF_SHGATE },
             { "hcnorm", GGML_CUDA_DF_HCNORM }, { "gdnstate", GGML_CUDA_DF_GDNSTATE }, { "gdngate", GGML_CUDA_DF_GDNGATE },
             { "expglu", GGML_CUDA_DF_EXPGLU }, { "gdnl2", GGML_CUDA_DF_GDNL2 }, { "convstate", GGML_CUDA_DF_CONVSTATE },
-            { "views", GGML_CUDA_DF_VIEWS },
+            { "views", GGML_CUDA_DF_VIEWS }, { "imrope", GGML_CUDA_DF_IMROPE },
         };
         int m = 0;
         std::string list = env;
         if (list == "1" || list == "all") {
-            list = "q8,silu,shgate,hcnorm,gdnstate,gdngate,expglu,gdnl2,convstate,views";
+            list = "q8,silu,shgate,hcnorm,gdnstate,gdngate,expglu,gdnl2,convstate,views,imrope";
         }
         size_t pos = 0;
         while (pos <= list.size()) {
@@ -231,12 +233,12 @@ static int ggml_cuda_decode_fusion() {
             }
             pos = end + 1;
         }
-        GGML_LOG_INFO("%s: GGML_CUDA_DECODE_FUSION =%s%s%s%s%s%s%s%s%s%s\n", __func__,
+        GGML_LOG_INFO("%s: GGML_CUDA_DECODE_FUSION =%s%s%s%s%s%s%s%s%s%s%s\n", __func__,
             m & GGML_CUDA_DF_Q8 ? " q8" : "", m & GGML_CUDA_DF_SILU ? " silu" : "", m & GGML_CUDA_DF_SHGATE ? " shgate" : "",
             m & GGML_CUDA_DF_HCNORM ? " hcnorm" : "", m & GGML_CUDA_DF_GDNSTATE ? " gdnstate" : "",
             m & GGML_CUDA_DF_GDNGATE ? " gdngate" : "", m & GGML_CUDA_DF_EXPGLU ? " expglu" : "",
             m & GGML_CUDA_DF_GDNL2 ? " gdnl2" : "", m & GGML_CUDA_DF_CONVSTATE ? " convstate" : "",
-            m & GGML_CUDA_DF_VIEWS ? " views" : "");
+            m & GGML_CUDA_DF_VIEWS ? " views" : "", m & GGML_CUDA_DF_IMROPE ? " imrope" : "");
         return m;
     }();
     return ggml_cuda_fusion_disabled() ? 0 : mask;
@@ -3398,6 +3400,16 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
 }
 #endif // USE_CUDA_GRAPH
 
+// the rope modes the fused rope kernels handle: norm/neox, and (I)M-RoPE (not vision) with GGML_CUDA_DECODE_FUSION=imrope
+static bool ggml_cuda_fused_rope_mode_ok(const ggml_tensor * rope) {
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) {
+        return true;
+    }
+    return (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) &&
+           (ggml_cuda_decode_fusion() & GGML_CUDA_DF_IMROPE) != 0;
+}
+
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
                                                 const ggml_tensor * set_rows) {
@@ -3423,13 +3435,8 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    // Only norm/neox shaders have the fusion code
-    const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
-        return false;
-    }
-
-    return true;
+    // Only norm/neox (and with imrope the multi) shaders have the fusion code
+    return ggml_cuda_fused_rope_mode_ok(rope);
 }
 
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
@@ -3464,9 +3471,7 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
-    const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (!ggml_cuda_fused_rope_mode_ok(rope)) {
         return false;
     }
 

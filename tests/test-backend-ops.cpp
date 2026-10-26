@@ -5302,6 +5302,106 @@ struct test_decode_fusion_views : public test_case {
 };
 
 
+// imrope: the fused rms_norm + mul + rope (+ view + set_rows) and rope + view + set_rows in (I)M-RoPE mode
+// (GGML_CUDA_DECODE_FUSION=imrope), qwen4exp shapes: partial rotation (n_rot of head), 4 position rows,
+// the plain (yarn = false) and the YaRN level of an elastic-YaRN context (freq_scale, ext_factor, attn_factor, betas)
+enum test_dfi_mode { DFI_Q, DFI_K_SET_ROWS, DFI_ROPE_SET_ROWS };
+
+static const char * dfi_mode_name(test_dfi_mode m) {
+    switch (m) {
+        case DFI_Q:             return "q";
+        case DFI_K_SET_ROWS:    return "k_set_rows";
+        case DFI_ROPE_SET_ROWS: return "rope_set_rows";
+    }
+    return "?";
+}
+
+struct test_decode_fusion_imrope : public test_case {
+    const test_dfi_mode mode;
+    const int rope_mode;
+    const int64_t head, n_head, n;
+    const int n_rot;
+    const bool yarn;
+    const bool ff;
+    const bool q_view; // q rows read from a bigger tensor (the q/gate interleave of Qcur_full)
+    const ggml_type cache_type;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DECODE_FUSION_IMROPE"; }
+    std::string vars() override {
+        return std::string("mode=") + dfi_mode_name(mode) + "," +
+            VARS_TO_STR9(rope_mode, head, n_head, n, n_rot, yarn, ff, q_view, cache_type);
+    }
+    bool run_whole_graph() override { return true; }
+
+    test_decode_fusion_imrope(test_dfi_mode mode, int rope_mode, int64_t head, int64_t n_head, int64_t n, int n_rot,
+            bool yarn, bool ff = false, bool q_view = false, ggml_type cache_type = GGML_TYPE_F16)
+        : mode(mode), rope_mode(rope_mode), head(head), n_head(n_head), n(n), n_rot(n_rot), yarn(yarn), ff(ff),
+          q_view(q_view), cache_type(cache_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (q_view) {
+            ggml_tensor * full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*head*n_head, n);
+            ggml_set_name(full, "full");
+            full = ggml_scale(ctx, full, 1.5f); // computed, as the q projection
+            x = ggml_view_3d(ctx, full, head, n_head, n, 2*head*ggml_element_size(full), full->nb[1], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head, n_head, n);
+            ggml_set_name(x, "x");
+        }
+        if (mode != DFI_ROPE_SET_ROWS) {
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head);
+            ggml_set_name(w, "w");
+            x = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        }
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n*4);
+        ggml_set_name(pos, "pos");
+        ggml_tensor * freq = nullptr;
+        if (ff) {
+            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_rot/2);
+            ggml_set_name(freq, "freq");
+        }
+        int sections[4] = { 11, 11, 10, 0 };
+        if (n_rot != 64) {
+            sections[0] = sections[1] = sections[2] = n_rot/6;
+        }
+        const float freq_scale  = yarn ? 0.25f : 1.0f;
+        const float ext_factor  = yarn ? 1.0f  : 0.0f;
+        const float attn_factor = yarn ? 0.9f  : 1.0f;
+        ggml_tensor * out = ggml_rope_multi(ctx, x, pos, freq, n_rot, sections, rope_mode, 262144, 1e7f,
+            freq_scale, ext_factor, attn_factor, 32.0f, 1.0f);
+        if (mode != DFI_Q) {
+            ggml_tensor * view = ggml_view_2d(ctx, out, head*n_head, n, out->nb[2], 0);
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, cache_type, head*n_head, 2*n + 3);
+            ggml_set_name(cache, "cache");
+            ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n);
+            ggml_set_name(idx, "idx");
+            out = ggml_set_rows(ctx, cache, view, idx);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 2*n + 3);
+            } else if (t->type == GGML_TYPE_I32) {
+                // t/h/w/e rows; positions kept small: -use_fast_math cosf/sinf drift from the CPU's at large angles
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & v : data) {
+                    v = rand() % 4096;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "freq") == 0) {
+                init_tensor_uniform(t, 0.9f, 1.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -13403,6 +13503,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_decode_fusion_views(DFV_ADD_CHAIN, GGML_TYPE_F32, 256, n));
         test_cases.emplace_back(new test_decode_fusion_views(DFV_GLU, GGML_TYPE_Q4_K, 2560, n));
         test_cases.emplace_back(new test_decode_fusion_views(DFV_GLU, GGML_TYPE_Q8_0, 2560, n));
+        for (int rope_mode : { GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE }) {
+            for (bool yarn : { false, true }) {
+                // attention q (q/gate view), k into the f16 cache, indexer q (4 heads of 128), the bare rope + set_rows
+                test_cases.emplace_back(new test_decode_fusion_imrope(DFI_Q,             rope_mode, 256, 24, n, 64, yarn, false, true));
+                test_cases.emplace_back(new test_decode_fusion_imrope(DFI_K_SET_ROWS,    rope_mode, 256, 2,  n, 64, yarn));
+                test_cases.emplace_back(new test_decode_fusion_imrope(DFI_Q,             rope_mode, 128, 4,  n, 64, yarn));
+                test_cases.emplace_back(new test_decode_fusion_imrope(DFI_ROPE_SET_ROWS, rope_mode, 256, 2,  n, 64, yarn));
+            }
+            test_cases.emplace_back(new test_decode_fusion_imrope(DFI_K_SET_ROWS,    rope_mode, 256, 2, n, 64,  true, false, false, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_decode_fusion_imrope(DFI_Q,             rope_mode, 128, 4, n, 128, true, true));
+            test_cases.emplace_back(new test_decode_fusion_imrope(DFI_ROPE_SET_ROWS, rope_mode, 128, 4, n, 128, true, true));
+            test_cases.emplace_back(new test_decode_fusion_imrope(DFI_K_SET_ROWS,    rope_mode, 1536, 1, n, 96, true));
+        }
     }
 
 #if 0
