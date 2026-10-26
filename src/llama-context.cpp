@@ -1969,6 +1969,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // LLAMA_DECODE_TIMING: host ms of the phases of small graphs (graph / inputs / MoE begin / queue / MoE launched)
+    static const bool phase_timing = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
+    const bool phases = phase_timing && ubatch.n_tokens <= 8;
+    const int64_t t_ph0 = phases ? ggml_time_us() : 0;
+    bool built = false;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2014,6 +2020,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
         n_group_reused += group_cur >= 0;
     } else {
+        built = true;
         *res_active = nullptr;
         n_group_built += group_cur >= 0;
         res->reset();
@@ -2059,7 +2066,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_ph1 = phases ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (phases) {
+        // [0] built graphs: n, ms to the inputs; [1] reused; then compute phases summed over both
+        static double   acc[2][2] = {};
+        static double   cmp[3]    = {};
+        static uint64_t cnt[2]    = {};
+        static uint64_t n_all     = 0;
+        acc[built ? 0 : 1][0] += (t_ph1 - t_ph0)/1000.0;
+        cnt[built ? 0 : 1]++;
+        for (int k = 0; k < 3; ++k) {
+            cmp[k] += t_compute_phase[k]/1000.0;
+        }
+        if (++n_all % 100 == 0) {
+            LLAMA_LOG_INFO("decode timing: last 100 graphs of <= 8 tokens (%s): %llu built %.2f ms to the inputs, %llu reused %.2f ms; "
+                    "MoE begin %.2f ms, queue (sched compute) %.2f ms, MoE launched %.2f ms a graph (host)\n",
+                    group_cur >= 0 ? "decode groups" : "plain", (unsigned long long) cnt[0], cnt[0] ? acc[0][0]/cnt[0] : 0.0,
+                    (unsigned long long) cnt[1], cnt[1] ? acc[1][0]/cnt[1] : 0.0, cmp[0]/100, cmp[1]/100, cmp[2]/100);
+            acc[0][0] = acc[1][0] = cmp[0] = cmp[1] = cmp[2] = 0.0;
+            cnt[0] = cnt[1] = 0;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3640,17 +3668,23 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
     copy_experts.prev_in_flight = copy_experts.in_flight;
     copy_experts.in_flight      = true;
+    const int64_t t0 = ggml_time_us();
     if (moe_cache) {
         moe_cache->begin(copy_experts.prev_in_flight, gf);
     }
+    const int64_t t1 = ggml_time_us();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+    const int64_t t2 = ggml_time_us();
     if (moe_cache) {
         moe_cache->launched();
     }
+    t_compute_phase[0] = t1 - t0;
+    t_compute_phase[1] = t2 - t1;
+    t_compute_phase[2] = ggml_time_us() - t2;
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 

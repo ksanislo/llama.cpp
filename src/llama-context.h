@@ -527,6 +527,7 @@ private:
     std::vector<ggml_backend_sched_ptr> group_sched;
     std::vector<llm_graph_result_ptr>   group_res;
     std::vector<llm_graph_result *>     group_res_active;
+    int64_t t_compute_phase[3] = { 0, 0, 0 }; // host us of the last graph_compute: MoE begin, sched queue, MoE launched
     int32_t n_group_built  = 0;
     int32_t n_group_reused = 0;
 
