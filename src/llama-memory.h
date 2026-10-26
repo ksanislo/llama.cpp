@@ -14,6 +14,7 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+class llama_memory_recurrent;
 
 struct llama_memory_params {
     // kv cache
@@ -140,6 +141,10 @@ struct llama_memory_i {
 
     // move the cached keys of seq_id to level, done by the next init_update(); pass a whole seq_rope_group()
     virtual void seq_rope_level_set(llama_seq_id /*seq_id*/, int32_t /*level*/) {}
+
+    // the recurrent memory whose state is ALL that state_write(seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) writes
+    // (the other parts write nothing then), or nullptr: the partial state can then be checkpointed mid-batch
+    virtual llama_memory_recurrent * partial_state_recurrent() const { return nullptr; }
 
     //
     // state write/read

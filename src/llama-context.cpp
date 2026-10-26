@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache-elastic.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -16,6 +17,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
@@ -1194,6 +1196,204 @@ uint32_t llama_context::prompt_chunk(uint32_t n_tokens) const {
         return cparams.n_ubatch;
     }
     return (uint32_t) llama_prompt_pipe_chunk(n_tokens, cparams.n_ubatch, n_pipe_devices, prompt_pipe);
+}
+
+bool llama_context::pipe_checkpoints_supported() const {
+    return memory && memory->partial_state_recurrent() != nullptr;
+}
+
+bool llama_context::pipe_checkpoint_request(llama_seq_id seq_id, llama_pos pos) {
+    if (!pipe_checkpoints_supported() || seq_id < 0 || seq_id >= (llama_seq_id) cparams.n_seq_max || pos <= 0) {
+        return false;
+    }
+    for (const auto & c : pipe_ckpts) {
+        if (c->seq_id == seq_id && c->pos == pos) {
+            return true;
+        }
+    }
+    auto c = std::make_unique<pipe_ckpt>();
+    c->seq_id = seq_id;
+    c->pos    = pos;
+    pipe_ckpts.push_back(std::move(c));
+    return true;
+}
+
+static void pipe_ckpt_post(ggml_backend_t backend, void * user_data) {
+    const auto * job = (const llama_context::pipe_ckpt_job *) user_data;
+    if (!job->async) {
+        // the rows are not in this backend's device buffer: wait for its queue, then read them
+        ggml_backend_synchronize(backend);
+    }
+    for (const auto & r : job->rows) {
+        if (job->async) {
+            ggml_backend_tensor_get_async(backend, r.t, r.dst, r.offs, r.size);
+        } else {
+            ggml_backend_tensor_get(r.t, r.dst, r.offs, r.size);
+        }
+    }
+}
+
+// after the graph of ubatch is queued: the requested checkpoints that end with it copy their rows
+void llama_context::pipe_ckpt_ubatch(const llama_ubatch & ubatch) {
+    llama_memory_recurrent * mem_recr = memory ? memory->partial_state_recurrent() : nullptr;
+
+    for (auto & c : pipe_ckpts) {
+        if (c->taken) {
+            continue;
+        }
+        llama_pos pos_last = -1;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                if (ubatch.seq_id[i][j] == c->seq_id) {
+                    pos_last = std::max(pos_last, ubatch.pos[i]);
+                }
+            }
+        }
+        if (pos_last != c->pos - 1) {
+            continue;
+        }
+
+        std::vector<llama_memory_recurrent::snap_row> rows;
+        llama_pos cell_pos = -1;
+        if (mem_recr == nullptr || !mem_recr->snapshot_rows(c->seq_id, cell_pos, rows) || cell_pos != c->pos - 1) {
+            LLAMA_LOG_WARN("%s: no checkpoint of seq %d at %d (the sequence is not one recurrent cell at %d)\n",
+                    __func__, c->seq_id, c->pos, cell_pos);
+            c->taken    = true; // as failed: get() returns 0
+            c->cell_pos = -1;
+            continue;
+        }
+
+        size_t total = 0;
+        for (const auto & r : rows) {
+            total += GGML_PAD(r.size, 64);
+        }
+
+        // pinned host memory, so the copies stay asynchronous
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        for (const auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (host_buft) {
+                    break;
+                }
+            }
+        }
+        uint8_t * base = nullptr;
+        if (host_buft) {
+            for (auto it = pipe_ckpt_free.begin(); it != pipe_ckpt_free.end(); ++it) {
+                if (ggml_backend_buffer_get_size(it->get()) >= total) {
+                    c->buf = std::move(*it);
+                    pipe_ckpt_free.erase(it);
+                    break;
+                }
+            }
+            if (!c->buf) {
+                c->buf.reset(ggml_backend_buft_alloc_buffer(host_buft, total));
+            }
+            base = c->buf ? (uint8_t *) ggml_backend_buffer_get_base(c->buf.get()) : nullptr;
+        }
+        if (base == nullptr) {
+            c->host.resize(total);
+            base = c->host.data();
+        }
+
+        // each row is copied by the backend of the device that holds it, after its part of this ubatch
+        std::map<ggml_backend_t, pipe_ckpt_job *> by_backend;
+        size_t off = 0;
+        for (const auto & r : rows) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r.t->buffer);
+            ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+            ggml_backend_t backend = nullptr;
+            for (const auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) == dev) {
+                    backend = b.get();
+                    break;
+                }
+            }
+            if (backend == nullptr || ggml_backend_buft_is_host(buft)) {
+                backend = backend_cpu;
+            }
+            GGML_ASSERT(backend != nullptr);
+            auto & job = by_backend[backend];
+            if (job == nullptr) {
+                c->jobs.push_back(std::make_unique<pipe_ckpt_job>());
+                job = c->jobs.back().get();
+                job->async = dev != nullptr && ggml_backend_get_device(backend) == dev && buft == ggml_backend_dev_buffer_type(dev) &&
+                        ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && c->buf != nullptr;
+            }
+            job->rows.push_back({ r.t, r.offs, r.size, base + off });
+            c->rows.push_back({ r.t, r.offs, r.size, base + off });
+            off += GGML_PAD(r.size, 64);
+        }
+        for (auto & [backend, job] : by_backend) {
+            ggml_backend_sched_post_callback(sched.get(), backend, pipe_ckpt_post, job);
+        }
+
+        c->taken    = true;
+        c->cell_pos = cell_pos;
+        LLAMA_LOG_DEBUG("%s: checkpoint of seq %d at %d inside the batch (%zu rows, %.3f MiB, %zu backends)\n",
+                __func__, c->seq_id, c->pos, rows.size(), total / 1024.0 / 1024.0, by_backend.size());
+    }
+}
+
+size_t llama_context::pipe_checkpoint_get(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size) {
+    auto it = std::find_if(pipe_ckpts.begin(), pipe_ckpts.end(), [&](const auto & c) { return c->seq_id == seq_id && c->pos == pos; });
+    if (it == pipe_ckpts.end() || !(*it)->taken || (*it)->cell_pos < 0) {
+        return 0;
+    }
+    llama_memory_recurrent * mem_recr = memory ? memory->partial_state_recurrent() : nullptr;
+    if (mem_recr == nullptr || mem_recr->seq_pos_max(seq_id) < 0) {
+        return 0;
+    }
+
+    // the copies land when the queues have run past them
+    synchronize();
+
+    const pipe_ckpt & c = **it;
+    llama_memory_recurrent::snap_override ov;
+    ov.seq_id = seq_id;
+    ov.pos    = c.cell_pos;
+    for (const auto & r : c.rows) {
+        ov.rows.push_back({ r.t, r.offs, r.size });
+        ov.data.push_back(r.dst);
+    }
+
+    mem_recr->snap = &ov;
+    const size_t n = dst ? state_seq_get_data(seq_id, dst, size, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                         : state_seq_get_size(seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    mem_recr->snap = nullptr;
+
+    if (dst) {
+        if ((*it)->buf) {
+            pipe_ckpt_free.push_back(std::move((*it)->buf));
+        }
+        pipe_ckpts.erase(it);
+    }
+    return n;
+}
+
+void llama_context::pipe_checkpoints_clear(llama_seq_id seq_id) {
+    bool any = false;
+    for (const auto & c : pipe_ckpts) {
+        any = any || ((seq_id < 0 || c->seq_id == seq_id) && c->taken);
+    }
+    if (any) {
+        synchronize(); // copies may still be queued
+    }
+    for (auto it = pipe_ckpts.begin(); it != pipe_ckpts.end(); ) {
+        if (seq_id < 0 || (*it)->seq_id == seq_id) {
+            if ((*it)->buf) {
+                pipe_ckpt_free.push_back(std::move((*it)->buf));
+            }
+            it = pipe_ckpts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    while (pipe_ckpt_free.size() > 4) {
+        pipe_ckpt_free.erase(pipe_ckpt_free.begin());
+    }
 }
 
 uint32_t llama_context::n_seq_max() const {
@@ -2403,6 +2603,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         memory->set_batch_shapes_stable(true);
     }
 
+    // [TAG_PIPE_CHECKPOINTS] a ubatch ends at every requested checkpoint inside this batch
+    if (!pipe_ckpts.empty()) {
+        std::vector<std::pair<llama_seq_id, llama_pos>> bounds;
+        for (const auto & c : pipe_ckpts) {
+            if (!c->taken && c->pos > balloc->seq_pos_min(c->seq_id) && c->pos <= balloc->seq_pos_max(c->seq_id)) {
+                bounds.emplace_back(c->seq_id, c->pos);
+            }
+        }
+        balloc->set_split_bounds(std::move(bounds));
+    }
+
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch_cur, embd_all);
         if (!mctx) {
@@ -2551,6 +2762,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        if (!pipe_ckpts.empty()) {
+            pipe_ckpt_ubatch(ubatch);
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -4990,6 +5205,22 @@ uint32_t llama_prompt_chunk(const llama_context * ctx, uint32_t n_tokens) {
 
 bool llama_prompt_pipe(const llama_context * ctx) {
     return ctx->prompt_pipe_on();
+}
+
+bool llama_pipe_checkpoints_supported(const llama_context * ctx) {
+    return ctx->pipe_checkpoints_supported();
+}
+
+bool llama_pipe_checkpoint_request(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    return ctx->pipe_checkpoint_request(seq_id, pos);
+}
+
+size_t llama_pipe_checkpoint_get(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size) {
+    return ctx->pipe_checkpoint_get(seq_id, pos, dst, size);
+}
+
+void llama_pipe_checkpoints_clear(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->pipe_checkpoints_clear(seq_id);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

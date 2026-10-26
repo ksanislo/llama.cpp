@@ -184,6 +184,8 @@ public:
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
+    llama_swa_type get_swa_type() const { return swa_type; }
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

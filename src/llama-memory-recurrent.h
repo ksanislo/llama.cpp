@@ -66,6 +66,29 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    llama_memory_recurrent * partial_state_recurrent() const override { return const_cast<llama_memory_recurrent *>(this); }
+
+    // [TAG_PIPE_CHECKPOINTS] a checkpoint taken between two ubatches of a batch: the rows state_write(seq_id) would write
+    // now are copied in stream order by the device that owns them, and written later in place of the cell and its rows
+    struct snap_row {
+        ggml_tensor * t;
+        size_t        offs;
+        size_t        size;
+    };
+    // false unless seq_id has exactly one cell
+    bool snapshot_rows(llama_seq_id seq_id, llama_pos & pos, std::vector<snap_row> & rows) const;
+
+    struct snap_override {
+        llama_seq_id                  seq_id = -1;
+        llama_pos                     pos    = -1;
+        std::vector<snap_row>         rows;
+        std::vector<const uint8_t *>  data; // one per row
+    };
+    // while set, state_write(snap->seq_id) writes snap's position and rows (in snapshot_rows' order, the cell may have moved)
+    const snap_override * snap = nullptr;
+    mutable bool   snap_on   = false; // state_write is writing snap->seq_id
+    mutable size_t snap_next = 0;     // the next row of snap, in state_write_data's order
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -131,6 +154,8 @@ private:
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
     size_t size_p_bytes() const;
+
+    void state_write_rows(llama_io_write_i & io, ggml_tensor * t, size_t offs, size_t size) const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;

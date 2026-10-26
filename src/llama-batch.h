@@ -179,6 +179,10 @@ public:
     // levels[s] for every sequence in the batch, cleared by init(), so without it every ubatch is level 0
     void set_seq_rope_levels(const std::vector<uint8_t> & levels);
 
+    // a ubatch never runs across one of these (seq, pos) points: the token of seq at pos starts a new ubatch
+    // (the state of seq can then be checkpointed between the two ubatches, see llama_pipe_checkpoint_request)
+    void set_split_bounds(std::vector<std::pair<llama_seq_id, llama_pos>> bounds);
+
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
@@ -242,6 +246,21 @@ private:
     // rope level of batch token i, all the sequences of a token share it
     uint32_t tok_rope_level(int32_t i) const {
         return seq_rope_lvl.empty() ? 0 : seq_rope_lvl[batch.seq_id[i][0]];
+    }
+
+    std::vector<std::pair<llama_seq_id, llama_pos>> split_bounds; // see set_split_bounds()
+
+    // batch token i starts a new ubatch
+    bool is_split_bound(int32_t i) const {
+        if (split_bounds.empty() || i < 0 || i >= batch.n_tokens) {
+            return false;
+        }
+        for (const auto & [s, p] : split_bounds) {
+            if (batch.pos[i] == p && batch.seq_id[i][0] == s) {
+                return true;
+            }
+        }
+        return false;
     }
 
     using pos_set_t = std::set<llama_pos>;
