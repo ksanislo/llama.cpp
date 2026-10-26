@@ -147,7 +147,8 @@ static bool pipe_tail_checkpoint() {
 // tokens between the context checkpoint before the prompt tail and the one 4 tokens before the end (0 = only that one)
 // a checkpoint synchronizes the context, so the batch after it runs alone on the devices:
 // - prompt pipe on (LLAMA_PROMPT_PIPE): one planned chunk of a prompt of n_prompt tokens, or none (LLAMA_PROMPT_PIPE_TAIL=0)
-// - otherwise n_ubatch, 512 with pipeline parallelism; LLAMA_CKPT_PRE_END=N sets it
+// - otherwise n_ubatch, 512 with pipeline parallelism (not with experts in host memory: each ubatch streams about all of
+//   them, a prompt of one ubatch split in two takes twice as long); LLAMA_CKPT_PRE_END=N sets it
 static int32_t server_ckpt_pre_end(const llama_context * ctx, int32_t n_prompt) {
     if (llama_prompt_pipe(ctx)) {
         return pipe_tail_checkpoint() ? (int32_t) llama_prompt_chunk(ctx, n_prompt) : 0;
@@ -157,7 +158,7 @@ static int32_t server_ckpt_pre_end(const llama_context * ctx, int32_t n_prompt) 
         return std::max(0, atoi(env));
     }
     const int32_t n_ubatch = llama_n_ubatch(ctx);
-    return llama_pipeline_parallel(ctx) ? std::min(n_ubatch, 512) : n_ubatch;
+    return llama_pipeline_parallel(ctx) && !llama_moe_streams_experts(ctx) ? std::min(n_ubatch, 512) : n_ubatch;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283

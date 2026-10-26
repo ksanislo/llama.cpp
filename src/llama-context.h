@@ -73,6 +73,7 @@ struct llama_context {
     // the ubatch size LLAMA_PROMPT_PIPE gives a batch of n_tokens (n_ubatch when it does not apply)
     uint32_t prompt_chunk(uint32_t n_tokens) const;
     bool     prompt_pipe_on() const;
+    bool     moe_cache_on() const { return moe_cache != nullptr; }
 
     uint32_t n_seq_max() const;
 

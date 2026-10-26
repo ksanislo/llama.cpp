@@ -4857,6 +4857,10 @@ bool llama_pipeline_parallel(const llama_context * ctx) {
     return ctx->get_cparams().pipeline_parallel;
 }
 
+bool llama_moe_streams_experts(const llama_context * ctx) {
+    return ctx->moe_cache_on();
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
