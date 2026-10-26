@@ -3325,6 +3325,90 @@ struct ggml_cuda_graph_stats {
     }
 };
 
+// GGML_CUDA_OP_PROF=N (with GGML_CUDA_DISABLE_GRAPHS=1): device time of the launches of each op, by the graph's token
+// count, from an event before each launch group (single node or fusion) on the main stream; every N graphs of a token
+// count the device logs ms per graph by op (the first op of a fusion) and resets. The end-of-graph sync perturbs the
+// overlap between devices, not the per-op times. Debug only.
+struct ggml_cuda_op_prof {
+    struct acc { double ms = 0.0; uint64_t n = 0; };
+    struct per_n { uint64_t graphs = 0; double ms = 0.0; std::map<std::string, acc> ops; };
+    std::map<int64_t, per_n> by_n;
+    std::vector<cudaEvent_t> events;
+    std::vector<std::string> keys;
+    size_t used = 0;
+    int64_t n_tok = 0;
+    bool    small = false; // a graph of < 1000 nodes (a draft / MTP layer beside the target's splits)
+
+    static int every() {
+        static const int n = [] { const char * e = getenv("GGML_CUDA_OP_PROF"); return e ? std::max(0, atoi(e)) : 0; }();
+        return n;
+    }
+
+    void begin(const ggml_cgraph * cgraph) {
+        used = 0;
+        keys.clear();
+        n_tok = 0;
+        small = cgraph->n_nodes < 1000;
+        for (int i = 0; i < cgraph->n_nodes && n_tok == 0; ++i) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            if (t->op == GGML_OP_MUL_MAT && t->src[1]) {
+                n_tok = t->src[1]->ne[1]*t->src[1]->ne[2]*t->src[1]->ne[3];
+            } else if (t->op == GGML_OP_MUL_MAT_ID && t->src[1]) {
+                n_tok = t->src[1]->ne[2];
+            }
+        }
+    }
+
+    void mark(cudaStream_t stream, const std::string & key) {
+        if (used == events.size()) {
+            cudaEvent_t ev;
+            CUDA_CHECK(cudaEventCreate(&ev));
+            events.push_back(ev);
+        }
+        CUDA_CHECK(cudaEventRecord(events[used++], stream));
+        keys.push_back(key);
+    }
+
+    void end(int device, cudaStream_t stream) {
+        if (keys.empty()) {
+            return;
+        }
+        mark(stream, "");
+        CUDA_CHECK(cudaEventSynchronize(events[used - 1]));
+        per_n & pn = by_n[2*n_tok + small];
+        for (size_t i = 0; i + 1 < used; ++i) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, events[i], events[i + 1]));
+            acc & a = pn.ops[keys[i]];
+            a.ms += ms;
+            a.n++;
+            pn.ms += ms;
+        }
+        if (++pn.graphs < (uint64_t) every()) {
+            return;
+        }
+        std::vector<std::pair<double, std::string>> v;
+        for (const auto & [k, a] : pn.ops) {
+            v.emplace_back(a.ms, k + " " + std::to_string(a.n/pn.graphs));
+        }
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        std::string top;
+        char buf[160];
+        for (size_t k = 0; k < v.size() && k < 14; ++k) {
+            snprintf(buf, sizeof(buf), " %s=%.3f", v[k].second.c_str(), v[k].first/pn.graphs);
+            top += buf;
+        }
+        GGML_LOG_INFO("ggml_cuda_op_prof: CUDA%d n=%" PRId64 "%s: %" PRIu64 " graphs, %.3f ms a graph; ms a graph by op (launches):%s\n",
+            device, n_tok, small ? "(small)" : "", pn.graphs, pn.ms/pn.graphs, top.c_str());
+        pn = per_n();
+    }
+};
+
+static ggml_cuda_op_prof * ggml_cuda_op_prof_get(int device) {
+    static ggml_cuda_op_prof prof[GGML_CUDA_MAX_DEVICES];
+    return ggml_cuda_op_prof::every() > 0 ? &prof[device] : nullptr;
+}
+
 static ggml_cuda_graph_stats * ggml_cuda_graph_stats_get(int device) {
     static const bool enabled = getenv("GGML_CUDA_GRAPH_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_STATS")) != 0;
     static ggml_cuda_graph_stats stats[GGML_CUDA_MAX_DEVICES];
@@ -5918,6 +6002,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (gstats) {
                 gstats->begin_eval();
             }
+            ggml_cuda_op_prof * oprof = use_cuda_graph ? nullptr : ggml_cuda_op_prof_get(cuda_ctx->device);
+            if (oprof) {
+                oprof->begin(cgraph);
+            }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -5975,6 +6063,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         gstats->n_skipped++;
                     }
                     continue;
+                }
+                if (oprof && cuda_ctx->curr_stream_no == 0) {
+                    std::string key = ggml_op_desc(node);
+                    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                        key += node->src[3] ? "(mapped)" : node->src[0]->buffer && ggml_backend_buft_is_cuda_host(node->src[0]->buffer->buft) ? "(host)" : "";
+                        key += std::string("[") + ggml_type_name(node->src[0]->type) + "]";
+                    }
+                    oprof->mark(cuda_ctx->stream(), key);
                 }
                 // views: the decode fusions see past the no-op nodes (their scans already skip them), then every
                 // fusion on the graph as it is, then the rest past the no-op nodes
@@ -6073,6 +6169,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
+            if (oprof) {
+                oprof->end(cuda_ctx->device, cuda_ctx->stream());
+            }
             cuda_ctx->q8_active = false;
             cuda_ctx->q8_clear();
             cuda_ctx->gdn_state_remap.clear();

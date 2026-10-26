@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1524,6 +1525,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_MTP_DEFER_CATCHUP=1: the catch-up over a verified batch is not decoded in process(); its rows wait until accept()
+    // says how many were kept, and the kept ones go into the first draft step's batch (one draft decode a step instead of two)
+    struct defer_row { llama_token id; llama_pos pos; };
+    std::vector<std::vector<defer_row>> defer_rows; // [n_seq]
+    std::vector<std::vector<float>>     defer_h;    // [n_seq][rows * n_embd], the h each row is paired with
+    std::vector<int32_t>                defer_keep; // [n_seq] rows kept by accept(), -1 before it
+    static bool defer_catchup() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MTP_DEFER_CATCHUP"); return e != nullptr && atoi(e) != 0; }();
+        return on;
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1598,6 +1610,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        defer_rows.assign(n_seq, {});
+        defer_h.assign(n_seq, {});
+        defer_keep.assign(n_seq, -1);
+    }
+
+    // decode the kept deferred rows of a sequence on their own (when no draft step takes them)
+    bool flush_deferred(llama_seq_id seq_id) {
+        auto & rows = defer_rows[seq_id];
+        const int32_t keep = defer_keep[seq_id];
+        bool ok = true;
+        if (!rows.empty() && keep > 0) {
+            common_batch b(params.ctx_dft);
+            for (int32_t r = 0; r < keep && r < (int32_t) rows.size(); ++r) {
+                const int32_t idx = b.add(rows[r].id, rows[r].pos, seq_id, false);
+                b.set_embd_state(idx, { defer_h[seq_id].data() + (size_t) r * n_embd, 1, (size_t) n_embd });
+            }
+            ok = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
+        }
+        rows.clear();
+        defer_keep[seq_id] = -1;
+        return ok;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1617,6 +1651,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        defer_rows[seq_id].clear();
+        defer_keep[seq_id] = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1666,8 +1702,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // deferred rows of an earlier verified batch that no draft step took: decode them first
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (!defer_rows[seq_id].empty() && !flush_deferred(seq_id)) {
+                return false;
+            }
+        }
+
+        // a verified batch (a few text rows): keep its catch-up for the next draft step (LLAMA_MTP_DEFER_CATCHUP)
+        bool deferred = false;
+        if (defer_catchup() && !is_mem_shared && !chain_heads && n_tokens >= 2 && n_tokens <= 16) {
+            deferred = true;
+            for (int k = 0; k < n_tokens && deferred; ++k) {
+                deferred = batch_in.tokens[k].id != LLAMA_TOKEN_NULL && batch_in.tokens[k].seq_ids_extra.empty();
+            }
+        }
+        if (deferred) {
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            for (int k = 0; k < n_tokens; ++k) {
+                const auto & t = batch_in.tokens[k];
+                const llama_seq_id seq_id = t.seq_id;
+                if (k == i_batch_beg[seq_id]) {
+                    defer_rows[seq_id].clear();
+                    defer_h[seq_id].clear();
+                    defer_keep[seq_id] = -1;
+                }
+                const float * h_row = k == i_batch_beg[seq_id] ? pending_h[seq_id].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                defer_rows[seq_id].push_back({ t.id, t.pos[0] });
+                defer_h[seq_id].insert(defer_h[seq_id].end(), h_row, h_row + n_embd);
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !deferred) {
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1678,10 +1745,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
+            // LLAMA_MTP_PROMPT_TAIL=N: a fresh sequence's first batch (the prompt) gives the draft only its last N rows:
+            // the draft's attention then sees N tokens of context, its h input carries the rest (fewer K/V rows to build;
+            // only acceptance can change, the target verifies every token). Later batches stay consecutive.
+            static const int32_t prompt_tail = [] { const char * e = getenv("LLAMA_MTP_PROMPT_TAIL"); return e ? std::max(0, atoi(e)) : 0; }();
+            std::vector<int32_t> k_first(i_batch_beg);
+            if (prompt_tail > 0) {
+                auto * mem = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0 && i_batch_end[seq_id] - i_batch_beg[seq_id] + 1 > prompt_tail &&
+                            llama_memory_seq_pos_max(mem, seq_id) < 0) {
+                        k_first[seq_id] = i_batch_end[seq_id] - prompt_tail + 1;
+                    }
+                }
+            }
+
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
                 const llama_seq_id seq_id = t.seq_id;
+
+                if (k < k_first[seq_id]) {
+                    continue;
+                }
 
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
@@ -1781,6 +1867,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            // the kept rows of the last verified batch (LLAMA_MTP_DEFER_CATCHUP) go first, if they end right before pos0
+            if (!defer_rows[seq_id].empty()) {
+                const auto & rows = defer_rows[seq_id];
+                const int32_t keep = std::min<int32_t>(defer_keep[seq_id], (int32_t) rows.size());
+                if (keep > 0 && rows[keep - 1].pos + 1 == dp.pos0) {
+                    for (int32_t r = 0; r < keep; ++r) {
+                        const int32_t ridx = batch.add(rows[r].id, rows[r].pos, seq_id, false);
+                        batch.set_embd_state(ridx, { defer_h[seq_id].data() + (size_t) r * n_embd, 1, (size_t) n_embd });
+                    }
+                    defer_keep[seq_id] = 0; // taken: cleared after the decode (the batch points at defer_h)
+                } else if (!flush_deferred(seq_id)) {
+                    SPC_ERR("failed to decode the deferred catch-up of seq %d\n", (int) seq_id);
+                }
+            }
+
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -1811,6 +1912,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (i == 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (defer_keep[seq_id] == 0) {
+                        defer_rows[seq_id].clear();
+                        defer_keep[seq_id] = -1;
+                    }
+                }
+            }
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -1929,6 +2038,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        if (!defer_rows[seq_id].empty()) {
+            defer_keep[seq_id] = std::min<int32_t>(n_accepted + 1, (int32_t) defer_rows[seq_id].size());
+        }
     }
 };
 

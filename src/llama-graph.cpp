@@ -2455,7 +2455,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     if (lane != nullptr) {
         lane_n_expert = (int32_t) (gate_up_exps ? gate_up_exps : up_exps)->ne[2];
-        slots = ggml_moe_doorbell(ctx0, slots, cur, lane, lane_n_expert, moe_cache->cpu_lane_max_tokens(), moe_cache->cpu_lane_frac());
+        slots = ggml_moe_doorbell(ctx0, slots, cur, lane, lane_n_expert, moe_cache->cpu_lane_max_tokens(), moe_cache->cpu_lane_frac(n_tokens));
         ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
         cb(slots, "ffn_moe_lane_slots", il);
     }
