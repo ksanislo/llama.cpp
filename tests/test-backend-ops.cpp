@@ -12770,6 +12770,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q8_0, 512, 10, false, 2560, 3584,  640, sl, 0.7f));
     }
     test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, 100, 640, false, 1.5f)); // sparse, skewed
+    // a server's warm-up / odd chunk sizes (the 8-warp ids helper once failed its launch on every shape: static shared memory)
+    for (int n : {501, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q4_K, 512, 10, true,   640, n, 2560, true,  0.7f));
+        test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, n,  640, false, 0.7f));
+    }
     // LLAMA_MOE_RING_BYTES: the staging tensor is the whole byte ring, more places than experts, the staged ones anywhere in it
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 16, 200, true, 8, true, 128, 512, 512));
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 64, 96, 16, 200, true, 8, false, 256, 512, 640));
