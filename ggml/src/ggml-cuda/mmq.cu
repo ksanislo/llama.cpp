@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <string>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -131,6 +132,96 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+// GGML_CUDA_MMQ_MOE (MUL_MAT_ID / MUL_MAT_ID_SLOTS through MMQ, off by default): a comma list of
+//   grid   one block per row tile and column tile that holds tokens (a tile list built from the expert bounds) instead of
+//          n_experts * ceil(n_tokens/J) column tiles of which ~96% exit at once at prompt shapes (512 experts, ~70 tokens each)
+//   tail   skip the second half of the last K tile when no block of it is in the row (640-wide down: 2.5 tiles of 256)
+//   ids    the ids helper with 8 warps per expert (same output)
+//   jmean  the tile width J against the mean tokens per expert instead of all tokens (as on RDNA3/4)
+//   j=N    the tile width J = N when a config exists for it
+//   1 = grid,tail,ids   2 = grid,tail,ids,jmean
+struct ggml_cuda_mmq_moe_opts {
+    bool grid = false, tail = false, ids = false, jmean = false;
+    int  j = 0;
+};
+
+static ggml_cuda_mmq_moe_opts ggml_cuda_mmq_moe_env() {
+    ggml_cuda_mmq_moe_opts o;
+    const char * env = getenv("GGML_CUDA_MMQ_MOE");
+    if (env == nullptr) {
+        return o;
+    }
+    std::string v = env;
+    if (v == "1") {
+        v = "grid,tail,ids";
+    } else if (v == "2") {
+        v = "grid,tail,ids,jmean";
+    }
+    size_t pos = 0;
+    while (pos <= v.size()) {
+        size_t end = v.find(',', pos);
+        if (end == std::string::npos) {
+            end = v.size();
+        }
+        const std::string t = v.substr(pos, end - pos);
+        if (t == "grid") {
+            o.grid = true;
+        } else if (t == "tail") {
+            o.tail = true;
+        } else if (t == "ids") {
+            o.ids = true;
+        } else if (t == "jmean") {
+            o.jmean = true;
+        } else if (t.rfind("j=", 0) == 0) {
+            o.j = atoi(t.c_str() + 2);
+        } else if (!t.empty() && t != "0") {
+            GGML_LOG_WARN("%s: GGML_CUDA_MMQ_MOE: unknown item '%s' (grid, tail, ids, jmean, j=N, 1, 2)\n", __func__, t.c_str());
+        }
+        pos = end + 1;
+    }
+    GGML_LOG_INFO("%s: GGML_CUDA_MMQ_MOE: grid %d tail %d ids %d jmean %d j %d\n", __func__, o.grid, o.tail, o.ids, o.jmean, o.j);
+    return o;
+}
+
+static const ggml_cuda_mmq_moe_opts & ggml_cuda_mmq_moe() {
+    static const ggml_cuda_mmq_moe_opts o = ggml_cuda_mmq_moe_env();
+    return o;
+}
+
+// the column tiles that hold tokens: entry zt*ntx + jt for every expert zt and jt < ceil(count/J), in expert order, -1 after
+// the last; one block, each thread a run of consecutive experts, a scan over the threads
+static __global__ void mmq_moe_tile_list(const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_list,
+        const int n_experts, const int J, const int ntx, const int n_tiles_max) {
+    __shared__ int scan[1024];
+    const int tid = threadIdx.x;
+    const int per = (n_experts + blockDim.x - 1) / blockDim.x;
+    const int e0  = min(tid*per, n_experts);
+    const int e1  = min(e0 + per, n_experts);
+    int own = 0;
+    for (int e = e0; e < e1; ++e) {
+        own += (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J;
+    }
+    scan[tid] = own;
+    __syncthreads();
+    for (int off = 1; off < (int) blockDim.x; off *= 2) {
+        const int add = tid >= off ? scan[tid - off] : 0;
+        __syncthreads();
+        scan[tid] += add;
+        __syncthreads();
+    }
+    int pos = scan[tid] - own;
+    const int total = scan[blockDim.x - 1];
+    for (int e = e0; e < e1; ++e) {
+        const int nt = (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J;
+        for (int jt = 0; jt < nt; ++jt) {
+            tile_list[pos++] = e*ntx + jt;
+        }
+    }
+    for (int i = total + tid; i < n_tiles_max; i += blockDim.x) {
+        tile_list[i] = -1;
+    }
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -207,7 +298,7 @@ void ggml_cuda_mul_mat_q(
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_mmq_moe().jmean) {
                 ncols_opt = (ne12*n_expert_used + n_experts - 1) / n_experts;
             }
         }
@@ -230,6 +321,16 @@ void ggml_cuda_mul_mat_q(
                 J_best = J;
                 nthreads_best = config.nthreads;
                 ntiles_J_best = ntiles_x;
+            }
+        }
+
+        // GGML_CUDA_MMQ_MOE=j=N
+        const int jf = ids ? ggml_cuda_mmq_moe().j : 0;
+        if (jf > 0 && jf <= 128 && jf % 8 == 0) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, jf, fallback, cc, prec_src1);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best        = jf;
+                nthreads_best = config.nthreads;
             }
         }
     }
@@ -305,8 +406,11 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        if (!ggml_cuda_mmq_moe().ids || !ggml_cuda_launch_mm_ids_helper_par((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(),
+                expert_bounds.get(), n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream)) {
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -364,6 +468,22 @@ void ggml_cuda_mul_mat_q(
         args.x_alt      = dst->src[3] ? (const char *) dst->src[3]->data : nullptr;
         args.x_host     = dst->src[5] ? (const char *) dst->src[5]->data : nullptr;
         args.n_alt      = dst->src[3] ? (int) dst->src[3]->ne[2] : 0;
+    }
+
+    // GGML_CUDA_MMQ_MOE=grid: at most one partial column tile per expert with tokens plus the full ones
+    ggml_cuda_pool_alloc<int32_t> tile_list(ctx.pool());
+    const ggml_cuda_mmq_moe_opts & moe = ggml_cuda_mmq_moe();
+    args.tail_half = moe.tail;
+    if (moe.grid) {
+        const int64_t ntx         = (ne12 + J_best - 1) / J_best;
+        const int64_t n_tiles_max = std::min<int64_t>(n_experts, ne_get_rows) + (ne_get_rows + J_best - 1) / J_best;
+        if (n_tiles_max <= 65535 && n_experts*ntx < INT_MAX) {
+            tile_list.alloc(n_tiles_max);
+            mmq_moe_tile_list<<<1, 1024, 0, stream>>>(expert_bounds.get(), tile_list.get(), n_experts, J_best, ntx, n_tiles_max);
+            CUDA_CHECK(cudaGetLastError());
+            args.tile_list   = tile_list.get();
+            args.n_tiles_max = n_tiles_max;
+        }
     }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
