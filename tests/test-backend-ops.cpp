@@ -6801,6 +6801,7 @@ struct test_moe_cpu_lane : public test_case {
     const int64_t n;   // tokens
     const float frac;
     const float clamp; // > 0: swiglu_clamp
+    const float ov;    // >= 0: the host's share override in the channel (GGML_MOE_LANE_FRAC, LLAMA_MOE_WARMUP_LANE)
 
     ggml_backend_buffer_ptr chan_buf;
     uint8_t * chan = nullptr;
@@ -6809,7 +6810,7 @@ struct test_moe_cpu_lane : public test_case {
     std::unique_ptr<llama_moe_lane> lane;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, n_mats, n_slots, n_used, n_embd, n_ff, n, frac, clamp);
+        return VARS_TO_STR9(type_a, n_mats, n_slots, n_used, n_embd, n_ff, n, frac, clamp) + (ov >= 0.0f ? ",ov=" + std::to_string(ov) : "");
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6834,12 +6835,16 @@ struct test_moe_cpu_lane : public test_case {
             printf("[the join timed out] ");
             return INFINITY;
         }
+        if (lane && ov > 0.0f && frac == 0.0f && lane->get_stats().experts == 0) {
+            printf("[the share override was not used: no lane experts] ");
+            return INFINITY;
+        }
         return nmse(a, b, n);
     }
 
     test_moe_cpu_lane(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 16, int n_slots = 6, int n_used = 4,
-            int64_t n_embd = 512, int64_t n_ff = 256, int64_t n = 1, float frac = 0.7f, float clamp = 0.0f)
-        : type_a(type_a), n_mats(n_mats), n_slots(n_slots), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n(n), frac(frac), clamp(clamp) {
+            int64_t n_embd = 512, int64_t n_ff = 256, int64_t n = 1, float frac = 0.7f, float clamp = 0.0f, float ov = -1.0f)
+        : type_a(type_a), n_mats(n_mats), n_slots(n_slots), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n(n), frac(frac), clamp(clamp), ov(ov) {
         GGML_ASSERT(n_used <= n_mats && n_slots <= n_mats);
     }
 
@@ -6955,6 +6960,7 @@ struct test_moe_cpu_lane : public test_case {
             host[i] = ggml_new_tensor(host_ctx.get(), w->type, 3, w->ne);
             host[i]->data = host_data[i].data();
         }
+        reinterpret_cast<std::atomic<uint32_t> *>(chan)[GGML_MOE_LANE_FRAC].store(ov >= 0.0f ? 1 + (uint32_t) lroundf(ov*1000.0f) : 0);
         lane = std::make_unique<llama_moe_lane>(1, 4, 0);
         llama_moe_lane_layer l;
         l.chan       = chan;
@@ -12727,6 +12733,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_cpu_lane(ta, 64, 20, 10, 1024, 512, 1, 0.7f));
     }
     test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 6, 4, 512, 256, 1, 0.0f)); // no lane
+    // the host's share override (LLAMA_MOE_WARMUP_LANE): op share 0 sent to the lane by the channel word, and the reverse
+    test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 6, 4, 512, 256, 4, 0.0f, 0.0f, 0.7f));
+    test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 6, 4, 512, 256, 4, 0.0f, 0.0f, 1.0f));
+    test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 6, 4, 512, 256, 4, 0.7f, 0.0f, 0.0f));
     test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_Q4_K, 16, 16, 4, 512, 256, 4, 1.0f)); // all hits
     test_cases.emplace_back(new test_moe_cpu_lane(GGML_TYPE_IQ2_XS, 16, 6, 4, 512, 256, 2, 0.7f, 7.0f)); // swiglu_clamp
 
