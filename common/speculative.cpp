@@ -1866,6 +1866,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         backend_chains.clear();
     }
 
+    // per-sequence state saved with checkpoints and slot / session files: the h the next draft entry pairs with
+    // (without it a restored slot pairs its first catch-up row with the previous occupant's h)
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        const auto & h = pending_h[seq_id];
+        data.resize(h.size() * sizeof(float));
+        std::memcpy(data.data(), h.data(), data.size());
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() != (size_t) n_embd * sizeof(float)) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
+        defer_rows[seq_id].clear();
+        defer_keep[seq_id] = -1;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
