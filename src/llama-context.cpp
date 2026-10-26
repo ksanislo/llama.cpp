@@ -659,6 +659,29 @@ llama_context::llama_context(
             }
         }
 
+        // LLAMA_DECODE_GROUPS=G (or auto = one per layer-split stage): see decode_group
+        if (const char * env = getenv("LLAMA_DECODE_GROUPS")) {
+            int32_t n_stages = 0;
+            {
+                std::vector<ggml_backend_dev_t> devs;
+                for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                    ggml_backend_dev_t dev = model.dev_layer(il);
+                    if (dev != nullptr && std::find(devs.begin(), devs.end(), dev) == devs.end()) {
+                        devs.push_back(dev);
+                    }
+                }
+                n_stages = (int32_t) devs.size();
+            }
+            n_decode_groups = strcmp(env, "auto") == 0 ? (cparams.pipeline_parallel ? n_stages : 0) : std::max(0, atoi(env));
+            if (n_decode_groups == 1) {
+                n_decode_groups = 0;
+            }
+            if (n_decode_groups > 0) {
+                LLAMA_LOG_INFO("%s: decode groups: up to %d groups of generating sequences in flight (LLAMA_DECODE_GROUPS=%s, %d stages, "
+                        "pipeline parallelism %s)\n", __func__, n_decode_groups, env, n_stages, cparams.pipeline_parallel ? "on" : "off - groups run one after another");
+            }
+        }
+
         if (const char * env = getenv("LLAMA_MOE_GATHER")) {
             moe_gather = atoi(env) != 0;
         }
@@ -1118,6 +1141,9 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
     copy_experts.in_flight = false;
+    for (auto & gs : groups) {
+        gs.in_flight = false;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1144,6 +1170,125 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+}
+
+void llama_context::synchronize_out() {
+    if (out_owner >= 0 && (size_t) out_owner < groups.size()) {
+        if (groups[out_owner].in_flight) {
+            decode_group_wait(out_owner);
+        }
+        return;
+    }
+    synchronize();
+}
+
+void llama_context::out_switch(int32_t owner) {
+    if (owner == out_owner) {
+        return;
+    }
+    if (group_out.empty()) {
+        group_out.resize(std::max(n_decode_groups, 1) + 1);
+    }
+    auto entry = [&](int32_t o) -> out_state & { return o < 0 ? group_out.back() : group_out.at(o); };
+
+    out_state & from = entry(out_owner);
+    from.buf_output      = std::move(buf_output);
+    from.logits          = logits;
+    from.embd            = embd;
+    from.embd_nextn      = embd_nextn;
+    from.output_ids      = std::move(output_ids);
+    from.output_swaps    = std::move(output_swaps);
+    from.embd_batch_idxs = std::move(embd_batch_idxs);
+    from.n_outputs       = n_outputs;
+
+    out_state & to = entry(owner);
+    buf_output      = std::move(to.buf_output);
+    logits          = to.logits;
+    embd            = to.embd;
+    embd_nextn      = to.embd_nextn;
+    output_ids      = std::move(to.output_ids);
+    output_swaps    = std::move(to.output_swaps);
+    embd_batch_idxs = std::move(to.embd_batch_idxs);
+    n_outputs       = to.n_outputs;
+    to = out_state();
+
+    out_owner = owner;
+}
+
+int32_t llama_context::decode_groups() const {
+    if (n_decode_groups < 2 || !memory || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn ||
+            !sampling.samplers.empty()) {
+        return 0;
+    }
+    for (bool e : cparams.embeddings_layer_inp) {
+        if (e) {
+            return 0;
+        }
+    }
+    int32_t n = n_decode_groups;
+    if (cparams.pipeline_parallel && sched) {
+        // more groups than pipeline copies would make the scheduler wait on the host for a copy to be free
+        n = std::min<int32_t>(n, ggml_backend_sched_get_n_copies(sched.get()));
+    }
+    return n >= 2 ? n : 0;
+}
+
+int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
+    if (g < 0 || g >= decode_groups()) {
+        LLAMA_LOG_ERROR("%s: decode group %d of %d\n", __func__, g, decode_groups());
+        return -1;
+    }
+    if (groups.size() < (size_t) n_decode_groups) {
+        groups.resize(n_decode_groups);
+    }
+    group_state & gs = groups[g];
+    if (gs.in_flight) {
+        decode_group_wait(g);
+    }
+
+    out_switch(g);
+    group_cur   = g;
+    out_backend = nullptr;
+    const int ret = decode(batch);
+    group_cur = -1;
+    if (ret != 0) {
+        synchronize();
+        return ret;
+    }
+
+    // the group's outputs are complete once the work queued on their backend so far is done
+    if (out_backend != nullptr) {
+        if (!gs.ev || gs.ev_backend != out_backend) {
+            gs.ev.reset(ggml_backend_event_new(ggml_backend_get_device(out_backend)));
+            gs.ev_backend = out_backend;
+        }
+        if (gs.ev) {
+            ggml_backend_event_record(gs.ev.get(), out_backend);
+        }
+    } else {
+        gs.ev.reset();
+        gs.ev_backend = nullptr;
+    }
+    gs.in_flight = true;
+
+    return 0;
+}
+
+int32_t llama_context::decode_group_wait(int32_t g) {
+    if (g < 0 || (size_t) g >= groups.size()) {
+        return -1;
+    }
+    group_state & gs = groups[g];
+    if (gs.in_flight) {
+        if (gs.ev) {
+            ggml_backend_event_synchronize(gs.ev.get());
+            gs.in_flight = false;
+        } else {
+            synchronize(); // no events (CPU): everything
+        }
+    }
+    out_switch(g);
+    return 0;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1806,7 +1951,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // (a reused graph synchronizes the scheduler under pipeline parallelism, so the prompt pipe's chunks are rebuilt)
-    if (!graph_reuse_disable && prompt_pipe_chunk == 0 && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // (decode groups: the other groups' graphs are in flight, so they are rebuilt too)
+    if (!graph_reuse_disable && prompt_pipe_chunk == 0 && !(group_cur >= 0 && cparams.pipeline_parallel) &&
+            gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1876,6 +2023,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    out_switch(-1);
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2238,6 +2387,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } decode_timing_log_on_exit { decode_timing && (batch_inp.tokens.size() >= 512 || batch_inp.tokens.size() <= 8), t_dt0, t_dt1, t_ph,
             batch_inp.tokens.size(), (int) cparams.ctx_type };
+    // LLAMA_DECODE_GROUPS: the outputs of a group decode go to the group's buffer, the others to the plain one
+    out_switch(group_cur);
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2463,6 +2615,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
     t_dt1 = ggml_time_us();
 
+    // decode groups: the graphs of the other groups are in flight (the MoE cache reads its device logs without waiting)
+    if (moe_cache) {
+        moe_cache->set_pipelined(group_cur >= 0 && cparams.pipeline_parallel);
+    }
+
     // LLAMA_MTP_PIPE: the consumer follows this batch ubatch by ubatch until one does not fit (nextn_chunk_notify)
     nextn_chunk_on = (int32_t) n_tokens_all >= nextn_chunk_min;
 
@@ -2571,6 +2728,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
+            out_backend = backend_res;
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
@@ -5054,13 +5212,13 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     float * res = nullptr;
 
@@ -5074,19 +5232,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5116,19 +5274,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5138,43 +5296,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
@@ -5538,6 +5696,18 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+int32_t llama_decode_groups(const llama_context * ctx) {
+    return ctx->decode_groups();
+}
+
+int32_t llama_decode_group(llama_context * ctx, llama_batch_ext * batch, int32_t group) {
+    return ctx->decode_group(*batch, group);
+}
+
+int32_t llama_decode_group_wait(llama_context * ctx, int32_t group) {
+    return ctx->decode_group_wait(group);
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {

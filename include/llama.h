@@ -1114,6 +1114,20 @@ extern "C" {
                              enum llama_process_type   type,
                               struct llama_batch_ext * batch);
 
+    // LLAMA_DECODE_GROUPS=G (auto = one group per layer-split stage): pipelined decode groups. The generating sequences are
+    // decoded in up to G groups, each with llama_decode_group; the graphs of several groups are in flight at once, so with
+    // pipeline parallelism stage s computes one group while stage s+1 computes another. A group's outputs stay apart until
+    // llama_decode_group_wait, which waits for that group only and makes its outputs the ones llama_get_logits* read
+    // (indexed by the group's batch). Any other decode or llama_synchronize waits for all groups.
+    // Returns G if groups can be used now (no embeddings, no backend samplers, no nextn outputs), else 0.
+    LLAMA_API int32_t llama_decode_groups(const struct llama_context * ctx);
+    // Return values are the same as llama_decode(); a failure waits for every group
+    LLAMA_API int32_t llama_decode_group(
+                                struct llama_context * ctx,
+                              struct llama_batch_ext * batch,
+                                             int32_t   group);
+    LLAMA_API int32_t llama_decode_group_wait(struct llama_context * ctx, int32_t group);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

@@ -1368,6 +1368,20 @@ struct llama_moe_cache::impl {
     fill_stats stats_fill;
     int64_t dh_log_cap  = 0;
     bool    dh_logged   = false; // the last graph logs selected experts
+    // LLAMA_DECODE_GROUPS (set_pipelined): the log of each graph is read back into pinned host memory right after it on its
+    // device's stream, and a later begin() processes the oldest read that landed (several graphs of other groups are in flight,
+    // a synchronization per graph would serialize them); logs still in flight when the pipelining ends are dropped
+    struct dh_log_read {
+        std::vector<ggml_backend_buffer_ptr> bufs; // [dh_devs] pinned copy of the device's log
+        std::vector<ggml_backend_event_ptr>  evs;  // [dh_devs] the copy landed
+    };
+    bool dh_pipelined = false;
+    std::vector<dh_log_read> dh_lr; // ring
+    size_t dh_lr_head = 0;
+    size_t dh_lr_n    = 0;
+    std::vector<ggml_backend_buffer_ptr> dh_clear_bufs; // [dh_devs] pinned -1s
+    size_t dh_lr_dropped = 0;
+    event_query_t dh_ev_query = nullptr;
     std::vector<dh_device> dh_devs; // [devices]
     dh_stats stats_dh;
     // by tokens in the graph (1..8): layer lookups, (token, slot) pairs, distinct experts, hits, misses
@@ -5378,9 +5392,122 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // queue the read of the device logs of the last graph on each device's stream (pipelined)
+    void dh_log_queue() {
+        static constexpr size_t cap = 16;
+        if (dh_lr.empty()) {
+            dh_lr.resize(cap);
+            dh_clear_bufs.resize(dh_devs.size());
+            for (size_t id = 0; id < dh_devs.size(); ++id) {
+                dh_device & dd = dh_devs[id];
+                if (dd.rows.empty()) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+                ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
+                if (hbuft == nullptr) {
+                    hbuft = ggml_backend_cpu_buffer_type();
+                }
+                dh_clear_bufs[id].reset(ggml_backend_buft_alloc_buffer(hbuft, ggml_nbytes(dd.log)));
+                GGML_ASSERT(dh_clear_bufs[id]);
+                memcpy(ggml_backend_buffer_get_base(dh_clear_bufs[id].get()), dd.log_clear.data(), ggml_nbytes(dd.log));
+                for (dh_log_read & e : dh_lr) {
+                    e.bufs.resize(dh_devs.size());
+                    e.evs.resize(dh_devs.size());
+                    e.bufs[id].reset(ggml_backend_buft_alloc_buffer(hbuft, ggml_nbytes(dd.log)));
+                    e.evs[id].reset(ggml_backend_event_new(dev));
+                    GGML_ASSERT(e.bufs[id]);
+                }
+                if (dh_ev_query == nullptr) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    dh_ev_query = reg ? (event_query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_query") : nullptr;
+                }
+            }
+        }
+        if (dh_lr_n == dh_lr.size()) {
+            // the oldest read is still unprocessed: drop it (only the fill policy reads the logs)
+            dh_lr_wait(dh_lr[dh_lr_head]);
+            dh_lr_head = (dh_lr_head + 1) % dh_lr.size();
+            dh_lr_n--;
+            dh_lr_dropped++;
+        }
+        dh_log_read & e = dh_lr[(dh_lr_head + dh_lr_n) % dh_lr.size()];
+        for (size_t id = 0; id < dh_devs.size(); ++id) {
+            dh_device & dd = dh_devs[id];
+            if (dd.rows.empty()) {
+                continue;
+            }
+            ggml_backend_t backend = devices[id].backend;
+            ggml_backend_tensor_get_async(backend, dd.log, ggml_backend_buffer_get_base(e.bufs[id].get()), 0, ggml_nbytes(dd.log));
+            ggml_backend_tensor_set_async(backend, dd.log, ggml_backend_buffer_get_base(dh_clear_bufs[id].get()), 0, ggml_nbytes(dd.log));
+            if (e.evs[id]) {
+                ggml_backend_event_record(e.evs[id].get(), backend);
+            } else {
+                ggml_backend_synchronize(backend);
+            }
+        }
+        dh_lr_n++;
+        dh_logged = false;
+    }
+
+    void dh_lr_wait(dh_log_read & e) {
+        for (auto & ev : e.evs) {
+            if (ev) {
+                ggml_backend_event_synchronize(ev.get());
+            }
+        }
+    }
+
+    // the oldest log read, if it landed (pipelined) / waited for (else), copied to the devices' log_host
+    bool dh_log_take(bool wait) {
+        if (dh_lr_n == 0) {
+            return false;
+        }
+        dh_log_read & e = dh_lr[dh_lr_head];
+        if (wait) {
+            dh_lr_wait(e);
+        } else {
+            for (auto & ev : e.evs) {
+                if (ev && !(dh_ev_query ? dh_ev_query(ev.get()) : (ggml_backend_event_synchronize(ev.get()), true))) {
+                    return false;
+                }
+            }
+        }
+        for (size_t id = 0; id < dh_devs.size(); ++id) {
+            if (!dh_devs[id].rows.empty()) {
+                memcpy(dh_devs[id].log_host.data(), ggml_backend_buffer_get_base(e.bufs[id].get()), ggml_nbytes(dh_devs[id].log));
+            }
+        }
+        dh_lr_head = (dh_lr_head + 1) % dh_lr.size();
+        dh_lr_n--;
+        return true;
+    }
+
+    void set_pipelined(bool on) {
+        dh_pipelined = on && !dh_devs.empty();
+    }
+
     void dh_begin(ggml_cgraph * gf) {
         if (dh_devs.empty()) {
             return;
+        }
+        // decode groups: the logs come from the ring, read without a synchronization; when the pipelining ends, the reads
+        // still in the ring are dropped (waited for, so their buffers are free) and the next logs are read as before
+        bool have_log = dh_logged;
+        bool sync_read = dh_logged;
+        if (dh_pipelined) {
+            if (dh_logged) {
+                dh_log_queue(); // the last graph ran without pipelining: its log is read like the others
+            }
+            have_log  = dh_log_take(false);
+            sync_read = false;
+        } else if (dh_lr_n > 0) {
+            while (dh_lr_n > 0) {
+                dh_lr_wait(dh_lr[dh_lr_head]);
+                dh_lr_head = (dh_lr_head + 1) % dh_lr.size();
+                dh_lr_n--;
+                dh_lr_dropped++;
+            }
         }
         // does this graph log selected experts? (a reused graph is not rebuilt, so look at the graph itself)
         bool logs = false;
@@ -5397,7 +5524,7 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_t backend = devices[id].backend;
             // read the log first: the synchronization waits for the last graph, not for the fills
-            if (dh_logged) {
+            if (sync_read) {
                 ggml_backend_tensor_get_async(backend, dd.log, dd.log_host.data(), 0, ggml_nbytes(dd.log));
                 ggml_backend_synchronize(backend);
                 ggml_backend_tensor_set_async(backend, dd.log, dd.log_clear.data(), 0, ggml_nbytes(dd.log));
@@ -5416,7 +5543,7 @@ struct llama_moe_cache::impl {
                 dh_rebuild_map(dd);
                 dd.resync = false;
             }
-            if (dh_logged && !ad_on) {
+            if (have_log && !ad_on) {
                 dh_process(id);
             }
             if (!ad_on) {
@@ -5426,7 +5553,7 @@ struct llama_moe_cache::impl {
         }
         if (ad_on) {
             // the policy ranks the candidates of all devices against one per-token cap
-            if (dh_logged) {
+            if (have_log) {
                 dh_process_adaptive();
             }
             for (size_t id = 0; id < dh_devs.size(); ++id) {
@@ -5436,7 +5563,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        if (dh_logged) {
+        if (have_log) {
             stats_dh.graphs++;
             if (fill_min_misses > 1 && stats_dh.graphs % 256 == 0) {
                 for (uint8_t & c : miss_cnt) {
@@ -5456,6 +5583,9 @@ struct llama_moe_cache::impl {
 
     void launched() {
         ring_end();
+        if (dh_pipelined && dh_logged) {
+            dh_log_queue(); // this graph's log, after it on each device
+        }
         if (dh_mode != 1) {
             return;
         }
@@ -7106,6 +7236,10 @@ void llama_moe_cache::set_prediction(const ggml_tensor * lookup, const ggml_tens
 
 void llama_moe_cache::begin(bool prev_in_flight, ggml_cgraph * graph) {
     pimpl->begin(prev_in_flight, graph);
+}
+
+void llama_moe_cache::set_pipelined(bool on) {
+    pimpl->set_pipelined(on);
 }
 
 void llama_moe_cache::launched() {
