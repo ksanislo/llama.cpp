@@ -45,6 +45,7 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    std::function<void()>                     callback_idle_tick;
 
 public:
     ~server_queue() { worker_stop(); }
@@ -132,6 +133,11 @@ public:
     // entering sleep: queue.sleeping = true --> cb0(true) --> cb1(true) --> cb2(true)
     // leaving sleep: cb2(false) --> cb1(false) --> cb0(false) --> queue.sleeping = false
     // note: caller will hold mutex_tasks while calling the callbacks
+    // called about once a second while there is nothing to do (not while sleeping)
+    void on_idle_tick(std::function<void()> callback) {
+        callback_idle_tick = std::move(callback);
+    }
+
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
     }

@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-session.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -405,6 +406,9 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // t_last_used of the state last snapshotted for --session-dir (-2 = none)
+    int64_t t_persisted = -2;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -462,6 +466,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool prefer_prefix) {
+        t_persisted = -2;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, prefer_prefix);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -1205,7 +1210,11 @@ private:
 
     int n_empty_consecutive = 0;
 
+    int32_t batch_n_gen = 0; // tokens of generating slots at the head of the current batch
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    std::unique_ptr<server_session_dir> session_dir;
 
     server_metrics metrics;
 
@@ -1242,6 +1251,9 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+
+        // writes what is still pending
+        session_dir.reset();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1252,6 +1264,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            session_persist_all("entering sleeping state");
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1732,6 +1745,10 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
+        if (!params_base.session_dir.empty()) {
+            session_open();
+        }
+
         // propagate new defaults back to caller
         params = params_base;
 
@@ -1762,6 +1779,9 @@ private:
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
+        });
+        queue_tasks.on_idle_tick([this]() {
+            session_idle_tick();
         });
 
         metrics.init();
@@ -1976,6 +1996,12 @@ private:
             }
         }
 
+        // the slot's conversation is about to leave the device: to disk once it has been away for the delay
+        if (ret && session_dir && !task.is_stateless() && !ret->prompt.tokens.empty() &&
+            ret->prompt.tokens.get_common_prefix(task.tokens) < ret->prompt.tokens.size() / 2) {
+            session_snapshot(*ret, ggml_time_us() + (int64_t) session_dir->get_params().delay_s * 1000000, "parked");
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -2003,6 +2029,8 @@ private:
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            session_select(*ret, task);
         }
 
         return ret;
@@ -2026,6 +2054,8 @@ private:
             if (slot->prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot->id, slot->prompt.tokens.size());
 
+                session_snapshot(*slot, ggml_time_us() + (int64_t) (session_dir ? session_dir->get_params().delay_s : 0) * 1000000, "purged");
+
                 if (params_base.kv_elastic && prompt_cache && slot->prompt_save(*prompt_cache)) {
                     prompt_cache->update();
                 }
@@ -2040,6 +2070,143 @@ private:
         }
 
         return res;
+    }
+
+    //
+    // --session-dir
+    //
+
+    // what a saved state is only valid for: model, draft, mmproj, cache types, build
+    std::string session_identity() const {
+        char desc[256];
+        llama_model_desc(model_tgt, desc, sizeof(desc));
+        std::string id = string_format("llama.cpp session 1|%s|%" PRIu64 "|%" PRIu64 "|k %s|v %s|%s",
+                desc, llama_model_size(model_tgt), llama_model_n_params(model_tgt),
+                ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v), llama_build_info());
+        if (model_dft) {
+            llama_model_desc(model_dft, desc, sizeof(desc));
+            id += string_format("|draft %s %" PRIu64, desc, llama_model_size(model_dft));
+        }
+        if (!params_base.mmproj.path.empty()) {
+            std::error_code ec;
+            id += string_format("|mmproj %" PRIu64, (uint64_t) std::filesystem::file_size(std::filesystem::u8path(params_base.mmproj.path), ec));
+        }
+        return id;
+    }
+
+    void session_open() {
+        server_session_params sp;
+        sp.dir        = params_base.session_dir;
+        sp.max_bytes  = (size_t) std::max(0.0, params_base.session_dir_gib) * 1073741824.0;
+        sp.max_files  = params_base.session_dir_files;
+        sp.max_days   = params_base.session_dir_days;
+        sp.delay_s    = params_base.session_dir_delay;
+        sp.min_tokens = params_base.session_dir_min;
+        session_dir = std::make_unique<server_session_dir>(sp, session_identity(), mctx != nullptr);
+    }
+
+    // queue the slot's state to be written t_due_us from now (0 = at once), unless it already was
+    bool session_snapshot(server_slot & slot, int64_t t_due_us, const char * why) {
+        if (!session_dir || slot.t_persisted == slot.t_last_used ||
+            slot.prompt.tokens.size() < (size_t) std::max(1, session_dir->get_params().min_tokens)) {
+            return false;
+        }
+        if (slot.task && (slot.task->is_child() || slot.task->is_stateless())) {
+            return false;
+        }
+        if (session_dir->has(slot.prompt.tokens)) {
+            slot.t_persisted = slot.t_last_used; // e.g. resumed from disk, then parked unchanged
+            return false;
+        }
+
+        const int64_t t0 = ggml_time_us();
+
+        server_session_job job;
+        try {
+            job.packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "sessions: not saved: %s\n", e.what());
+            slot.t_persisted = slot.t_last_used;
+            return false;
+        }
+        job.state.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+        llama_state_seq_get_data_ext(ctx_tgt, job.state.data(), job.state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        job.checkpoints = slot.prompt.checkpoints;
+        get_slot_draft(slot, job.data_dft, job.data_spec);
+        job.tokens  = slot.prompt.tokens.clone();
+        job.t_due_us = std::max<int64_t>(t0, t_due_us);
+
+        SLT_INF(slot, "sessions: %zu-token conversation copied off the device (%.2f GiB, %.2f s, %s), written %s\n",
+                job.tokens.size(), job.size() / 1073741824.0, (ggml_time_us() - t0) / 1e6, why,
+                job.t_due_us > t0 ? string_format("in %.0f s unless taken back", (job.t_due_us - t0) / 1e6).c_str() : "now");
+
+        slot.t_persisted = slot.t_last_used;
+        session_dir->push(std::move(job));
+        return true;
+    }
+
+    // a conversation that will not come back on the device by itself: every slot to disk, now
+    void session_persist_all(const char * why) {
+        if (!session_dir || !ctx_tgt) {
+            return;
+        }
+        for (auto & slot : slots) {
+            session_snapshot(slot, 0, why);
+        }
+        session_dir->flush();
+    }
+
+    // idle server: write the conversations the slots hold once they have been idle for the delay
+    void session_idle_tick() {
+        if (!session_dir || sleeping || !ctx_tgt) {
+            return;
+        }
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                return; // never stall a running request for a copy
+            }
+        }
+        const int64_t t_now = ggml_time_us();
+        const int64_t delay = (int64_t) session_dir->get_params().delay_s * 1000000;
+        for (auto & slot : slots) {
+            if (slot.t_last_used >= 0 && t_now - slot.t_last_used >= delay) {
+                session_snapshot(slot, 0, "idle");
+            }
+        }
+    }
+
+    // the slot is about to take a task: resume the conversation from disk when a file continues the prompt
+    // further than the slot (after the prompt cache) does
+    void session_select(server_slot & slot, const server_task & task) {
+        if (!session_dir || task.is_stateless() || task.tokens.size() < (size_t) std::max(1, session_dir->get_params().min_tokens)) {
+            return;
+        }
+        const size_t lcp_slot = slot.prompt.tokens.get_common_prefix(task.tokens);
+
+        // a hybrid / recurrent / SWA state can only be cut back at a checkpoint
+        const bool rm_full = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa == 0;
+
+        std::string path;
+        size_t n_usable = 0;
+        size_t n_file   = 0;
+        if (!session_dir->find(task.tokens, rm_full, lcp_slot + 256, path, n_usable, n_file)) {
+            session_dir->cancel(task.tokens, slot.prompt.tokens);
+            return;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        size_t nread = 0;
+        std::string err;
+        if (!slot_restore_file(slot, path, nread, err)) {
+            SLT_WRN(slot, "sessions: '%s' could not be restored (%s), the prompt is read in full\n", path.c_str(), err.c_str());
+            session_dir->remove(path);
+            return;
+        }
+        session_dir->touch(path);
+        slot.t_persisted = slot.t_last_used;
+        SLT_INF(slot, "sessions: resumed a %zu-token conversation from disk (%.2f GiB in %.2f s): %zu of the prompt's %zu tokens reused (held: %zu)\n",
+                n_file, nread / 1073741824.0, (ggml_time_us() - t0) / 1e6, n_usable, task.tokens.size(), lcp_slot);
+        session_dir->cancel(task.tokens, slot.prompt.tokens);
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -3010,19 +3177,6 @@ private:
         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
     }
 
-    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
-        ofs.write((const char *) src, size);
-        n_written += size;
-    }
-
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
-        const uint64_t n = buf.size();
-        ckpt_write(ofs, &n, sizeof(n), n_written);
-        if (n > 0) {
-            ckpt_write(ofs, buf.data(), n, n_written);
-        }
-    }
-
     // returns false if the appendix could not be written completely
     bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
         n_written = 0;
@@ -3034,27 +3188,14 @@ private:
             SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
             return false;
         }
-        const uint32_t magic   = SLOT_CKPT_MAGIC;
-        const uint32_t version = SLOT_CKPT_VERSION;
-        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
-        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
-        ckpt_write(ofs, &version, sizeof(version), n_written);
-        ckpt_write(ofs, &count,   sizeof(count),   n_written);
-        for (const auto & cur : slot.prompt.checkpoints) {
-            ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
-            ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
-            ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
-            ckpt_write_buf(ofs, cur.data_dft,  n_written);
-            ckpt_write_buf(ofs, cur.data_spec, n_written);
-        }
+        server_slot_write_checkpoints(ofs, slot.prompt.checkpoints, n_written);
         ofs.flush();
         if (!ofs) {
             SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
             return false;
         }
-        SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
-                count, (float) n_written / 1024 / 1024, filepath.c_str());
+        SLT_INF(slot, "appended %zu context checkpoint(s) (%.3f MiB) to '%s'\n",
+                slot.prompt.checkpoints.size(), (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
     }
 
@@ -3127,11 +3268,7 @@ private:
         n_written = 0;
         std::vector<uint8_t> data_dft;
         std::vector<uint8_t> data_spec;
-        if (ctx_dft != nullptr) {
-            data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
-            llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-        common_speculative_get_state(spec.get(), slot.id, data_spec);
+        get_slot_draft(slot, data_dft, data_spec);
         if (data_dft.empty() && data_spec.empty()) {
             return true;
         }
@@ -3140,12 +3277,7 @@ private:
             SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
             return false;
         }
-        const uint32_t magic   = SLOT_DRAFT_MAGIC;
-        const uint32_t version = SLOT_DRAFT_VERSION;
-        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
-        ckpt_write(ofs, &version, sizeof(version), n_written);
-        ckpt_write_buf(ofs, data_dft,  n_written);
-        ckpt_write_buf(ofs, data_spec, n_written);
+        server_slot_write_draft(ofs, data_dft, data_spec, n_written);
         ofs.flush();
         if (!ofs) {
             SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
@@ -3153,6 +3285,14 @@ private:
         }
         SLT_INF(slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
+    }
+
+    void get_slot_draft(const server_slot & slot, std::vector<uint8_t> & data_dft, std::vector<uint8_t> & data_spec) const {
+        if (ctx_dft != nullptr) {
+            data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+            llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        common_speculative_get_state(spec.get(), slot.id, data_spec);
     }
 
     // returns the number of bytes consumed, 0 if there is no usable draft state
@@ -3196,6 +3336,47 @@ private:
         }
         SLT_INF(slot, "restored the draft state (%.3f MiB) from '%s'\n", (float) n_read / 1024 / 1024, filepath.c_str());
         return n_read;
+    }
+
+    // restores a slot save file (target state, checkpoints, draft), nread = bytes used
+    bool slot_restore_file(server_slot & slot, const std::string & filepath, size_t & nread, std::string & err) {
+        nread = 0;
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("No available space in KV cache or invalid slot save file");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("Restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("Invalid tokens in slot save file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & e) {
+            slot.prompt_clear();
+            err = e.what();
+            return false;
+        }
+
+        // nread is the end offset of the llama state payload within the file
+        const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
+        const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
+        nread += nread_ckpt + nread_dft;
+        return true;
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3275,6 +3456,9 @@ private:
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
+                                    if (session_dir) {
+                                        session_snapshot(slot, ggml_time_us() + (int64_t) session_dir->get_params().delay_s * 1000000, "parked");
+                                    }
                                     slot.prompt_clear();
                                 }
                             }
@@ -3475,40 +3659,11 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    std::string err;
+                    if (!slot_restore_file(*slot, filepath, nread, err)) {
+                        send_error(task, std::string("Unable to restore slot: ") + err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-
-                    // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3519,7 +3674,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3790,7 +3945,10 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            if (off == 0 && params_base.n_batch_split > 0 && batch_n_gen > 0 && batch.size() - batch_n_gen >= params_base.n_batch_split) {
+                n_tokens = std::min(n_tokens, batch_n_gen);
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -4122,6 +4280,9 @@ private:
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
+
+        // the generating slots' tokens come first in the batch (see --batch-split)
+        batch_n_gen = batch.size();
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
@@ -5469,6 +5630,9 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    // the loop is over: the conversations still on the device go to disk before the contexts are freed
+    impl->session_persist_all("shutting down");
 }
 
 void server_context::terminate() {

@@ -580,6 +580,7 @@ struct common_params {
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     int32_t n_batch_beside = 0;     // max prompt tokens per batch while other slots generate (0 = n_batch)
+    int32_t n_batch_split  = 512;   // decode generating slots' tokens apart from >= N prompt tokens of the same batch (0 = off)
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
@@ -717,6 +718,12 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string session_dir;            // every conversation persisted here (empty = off)
+    double      session_dir_gib   = 64; // size cap, least recently used first
+    int32_t     session_dir_files = 64; // file count cap
+    int32_t     session_dir_days  = 7;  // unused this long = removed
+    int32_t     session_dir_delay = 30; // seconds a conversation is idle / parked before it is written
+    int32_t     session_dir_min   = 512; // shorter conversations are not written
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
