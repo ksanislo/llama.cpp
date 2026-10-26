@@ -40,8 +40,10 @@ public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
     // profile: expert usage profile (see --moe-cache-profile), empty = LLAMA_MOE_CACHE_PROFILE or none
+    // draft: the cache of a draft / MTP context (--moe-cache-draft): device hits from a small cache, no ring / staging / decode memory,
+    // settings read from LLAMA_MOE_DRAFT_X first; LLAMA_MOE_DRAFT_CACHE_DEVICE=<name> caches the layers on that GPU instead of theirs
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
-            const std::string & profile = "", const llama_moe_cache_compute & compute = {});
+            const std::string & profile = "", const llama_moe_cache_compute & compute = {}, bool draft = false);
     ~llama_moe_cache();
 
     // whether the context should measure its compute buffers first (LLAMA_MOE_DECODE_MEM, LLAMA_MOE_CACHE_SPLIT=miss)

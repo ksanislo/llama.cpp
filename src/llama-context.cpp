@@ -414,6 +414,7 @@ llama_context::llama_context(
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.moe_cache_profile   = params.moe_cache_profile ? params.moe_cache_profile : "";
+    cparams.moe_cache_draft = params.moe_cache_draft;
     cparams.moe_cache_reserve.clear();
     if (params.moe_cache_reserve != nullptr) {
         cparams.moe_cache_reserve.assign(params.moe_cache_reserve, params.moe_cache_reserve + ggml_backend_dev_count());
@@ -678,7 +679,8 @@ llama_context::llama_context(
                     }
                 }
             }
-            if ((llama_moe_cache::wants_compute_sizes() || reserve) && !model.hparams.no_alloc) {
+            // a draft cache has no decode memory or split to plan: nothing to measure
+            if ((llama_moe_cache::wants_compute_sizes() || reserve) && !model.hparams.no_alloc && !cparams.moe_cache_draft) {
                 compute.measure = true;
                 moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share,
                     cparams.moe_cache_profile, compute);
@@ -687,7 +689,7 @@ llama_context::llama_context(
                 compute.measure = false;
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share,
-                cparams.moe_cache_profile, compute);
+                cparams.moe_cache_profile, compute, cparams.moe_cache_draft);
         }
 
         sched_reserve();
@@ -4686,6 +4688,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.moe_cache_profile           =*/ nullptr,
         /*.moe_cache_reserve           =*/ nullptr,
+        /*.moe_cache_draft             =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
