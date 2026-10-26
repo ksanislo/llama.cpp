@@ -2767,7 +2767,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    // at least 16 rows of logits: a speculative verify batch (2..n_max+1 outputs) after a 1-output prompt would otherwise
+    // reallocate the whole output buffer (with an unmasked nextn embedding it holds n_batch rows: ~1.4 GB of pinned host
+    // memory for Flash-Next MTP, allocated and cleared in ~1.3 s at the first verify of the first long request)
+    // (the floor never exceeds the context's output limit: without a draft the server allows n_parallel outputs)
+    const int64_t n_outputs_max = std::max<int64_t>({ (int64_t) n_outputs, (int64_t) n_seq_max(),
+            std::min<int64_t>(16, cparams.n_outputs_max) });
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -2848,12 +2853,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
+        const int64_t t_alloc = ggml_time_us();
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+        if (prev_size > 0 || new_size > 256u*1024*1024) {
+            LLAMA_LOG_INFO("%s: output buffer %.2f -> %.2f MiB (%s, %d outputs) in %.1f ms\n", __func__, prev_size/1024.0/1024.0,
+                    new_size/1024.0/1024.0, ggml_backend_buft_name(buft), n_outputs, (ggml_time_us() - t_alloc)/1000.0);
+        }
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
