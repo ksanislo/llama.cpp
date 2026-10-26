@@ -1532,15 +1532,27 @@ static void * ggml_cuda_host_malloc(size_t size) {
     void * ptr = nullptr;
     const bool numa = size >= 64ull*1024*1024 && ggml_cuda_numa_pinned_mode() == GGML_CUDA_NUMA_PINNED_POLICY &&
         ggml_numa_thread_interleave_begin();
+    // NUMA device-local: the caller's thread policy places the pages (ggml_numa_thread_node_begin)
+    const int node = size >= 64ull*1024*1024 ? ggml_numa_thread_node() : -1;
     int64_t free_before[8];
-    const int n_nodes = numa ? ggml_numa_free_bytes(free_before, 8) : 0;
+    const int n_nodes = numa || node >= 0 ? ggml_numa_free_bytes(free_before, 8) : 0;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    if (err != cudaSuccess && node >= 0 && ggml_numa_thread_node_relax()) {
+        // the node could not hold it: preferred, the rest goes to other nodes
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: %.2f MiB of pinned memory did not fit on node %d, retrying with the preferred policy\n", __func__, size/1024.0/1024.0, node);
+        err = cudaMallocHost((void **) &ptr, size);
+    }
     if (numa) {
         ggml_numa_thread_interleave_end();
+    }
+    if (numa || node >= 0) {
         // the driver may hand out pooled pages of the local node, so show where the pages went
         int64_t free_after[8];
         if (err == cudaSuccess && ggml_numa_free_bytes(free_after, n_nodes) == n_nodes && n_nodes > 1) {
-            GGML_LOG_INFO("%s: %.2f MiB pinned, interleaved: node0 %.0f MiB, node1 %.0f MiB%s\n", __func__, size/1024.0/1024.0,
+            char where[32];
+            snprintf(where, sizeof(where), numa ? "interleaved" : "for node %d", node);
+            GGML_LOG_INFO("%s: %.2f MiB pinned, %s: node0 %.0f MiB, node1 %.0f MiB%s\n", __func__, size/1024.0/1024.0, where,
                 (free_before[0] - free_after[0])/1024.0/1024.0, (free_before[1] - free_after[1])/1024.0/1024.0, n_nodes > 2 ? ", ..." : "");
         }
     }

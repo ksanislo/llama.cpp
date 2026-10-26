@@ -147,15 +147,20 @@ struct llama_model_loader {
     };
 
     // lazy tensors need dedicated context
+    // NUMA device-local: host experts get a context per node, allocated on that node
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        int  node = -1;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.node != rhs.node) {
+                return lhs.node < rhs.node;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }
@@ -165,6 +170,9 @@ struct llama_model_loader {
 
     // MoE expert weights (used with MUL_MAT_ID), these are interleaved over the NUMA nodes when kept in host memory
     std::unordered_set<const ggml_tensor *> expert_tensors;
+
+    // NUMA device-local: node of the device that computes each layer (-1: none); set before the tensors are created
+    std::vector<int> layer_numa_node;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

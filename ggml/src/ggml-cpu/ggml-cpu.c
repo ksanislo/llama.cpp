@@ -652,6 +652,9 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     if (numa_flag == GGML_NUMA_STRATEGY_INTERLEAVE) {
         ggml_numa_set_interleave(true);
     }
+    if (numa_flag == GGML_NUMA_STRATEGY_DEVICE_LOCAL) {
+        ggml_numa_set_device_local(true);
+    }
 
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
 
@@ -2266,6 +2269,7 @@ static void set_numa_thread_affinity(int thread_n) {
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
         case GGML_NUMA_STRATEGY_INTERLEAVE:
+        case GGML_NUMA_STRATEGY_DEVICE_LOCAL:
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
             break;
