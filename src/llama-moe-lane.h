@@ -22,6 +22,7 @@ struct llama_moe_lane_layer {
     const ggml_tensor * down    = nullptr;
     const ggml_tensor * gate_up = nullptr;
     float clamp = 0.0f; // > 0: swiglu_clamp with this limit, else swiglu
+    int32_t pool = 0;   // the thread pool that computes this layer (one per NUMA node with the multi-pool constructor)
 };
 
 class llama_moe_lane {
@@ -29,6 +30,10 @@ public:
     // n_slots channels, served by a pool of n_threads (the polling thread included), ggml threadpool polling level poll;
     // cpus not empty: every thread of the lane runs on these CPUs (one NUMA node's, for the devices of that node)
     llama_moe_lane(size_t n_slots, int n_threads, int poll, const std::vector<int> & cpus = {});
+    // one polling thread (one OpenMP team) and a thread pool per entry of pool_cpus (empty entry: the default affinity), a layer
+    // computed by the pool of its llama_moe_lane_layer::pool; numa_affinity false: the pools' threads keep their cpumask instead
+    // of being placed by the --numa strategy on every graph
+    llama_moe_lane(size_t n_slots, int n_threads, int poll, const std::vector<std::vector<int>> & pool_cpus, bool numa_affinity);
     ~llama_moe_lane();
 
     // sets slot i, once (later calls are ignored); the thread polls its channel from then on
