@@ -1531,6 +1531,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<defer_row>> defer_rows; // [n_seq]
     std::vector<std::vector<float>>     defer_h;    // [n_seq][rows * n_embd], the h each row is paired with
     std::vector<int32_t>                defer_keep; // [n_seq] rows kept by accept(), -1 before it
+    std::vector<bool>                   defer_ok;   // [n_seq] a draft was made: the next batch of the seq is its verify batch
     static bool defer_catchup() {
         static const bool on = [] { const char * e = getenv("LLAMA_MTP_DEFER_CATCHUP"); return e != nullptr && atoi(e) != 0; }();
         return on;
@@ -1614,6 +1615,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         defer_rows.assign(n_seq, {});
         defer_h.assign(n_seq, {});
         defer_keep.assign(n_seq, -1);
+        defer_ok.assign(n_seq, false);
     }
 
     // decode the kept deferred rows of a sequence on their own (when no draft step takes them)
@@ -1653,6 +1655,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         common_sampler_reset(smpls[seq_id].get());
         defer_rows[seq_id].clear();
         defer_keep[seq_id] = -1;
+        defer_ok[seq_id] = false;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1714,8 +1717,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         bool deferred = false;
         if (defer_catchup() && !is_mem_shared && !chain_heads && n_tokens >= 2 && n_tokens <= 16) {
             deferred = true;
+            // only a verify batch (its seq drafted since its last batch): a prompt's last few tokens get no accept() and would
+            // be dropped (a hole in the draft K/V: "non-consecutive token position" at the first draft step)
             for (int k = 0; k < n_tokens && deferred; ++k) {
-                deferred = batch_in.tokens[k].id != LLAMA_TOKEN_NULL && batch_in.tokens[k].seq_ids_extra.empty();
+                const auto & t = batch_in.tokens[k];
+                deferred = t.id != LLAMA_TOKEN_NULL && t.seq_ids_extra.empty() && t.seq_id >= 0 && t.seq_id < (llama_seq_id) n_seq &&
+                    defer_ok[t.seq_id];
+            }
+        }
+        for (int k = 0; k < n_tokens; ++k) {
+            const llama_seq_id sid = batch_in.tokens[k].seq_id;
+            if (sid >= 0 && sid < (llama_seq_id) n_seq) {
+                defer_ok[sid] = false;
             }
         }
         if (deferred) {
@@ -1859,6 +1872,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
+            defer_ok[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;

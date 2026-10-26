@@ -2198,9 +2198,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     static const bool decode_timing = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
     const int64_t t_dt0 = ggml_time_us();
     int64_t t_dt1 = 0;
+    int64_t t_ph[4] = { 0, 0, 0, 0 }; // after balloc init, after sched_reserve, after memory_update, after init_batch
     // small batches (1..8 tokens): host ms of setup / graph build+launch summed per batch size and context type, logged every 100
     struct decode_timing_log {
-        bool on; int64_t t0; const int64_t & t1; size_t n; int type;
+        bool on; int64_t t0; const int64_t & t1; const int64_t * ph; size_t n; int type;
         ~decode_timing_log() {
             if (!on || t1 <= 0) {
                 return;
@@ -2210,18 +2211,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 LLAMA_LOG_INFO("decode timing: %zu tokens (ctx type %d): setup %.1f ms, ubatches %.1f ms (host, unsynced)\n",
                         n, type, (t1 - t0)/1000.0, (t2 - t1)/1000.0);
             } else if (n <= 8 && type >= 0 && type < 8) {
-                static double   acc[8][9][2] = {};
+                static double   acc[8][9][6] = {};
                 static uint64_t cnt[8][9]    = {};
                 acc[type][n][0] += (t1 - t0)/1000.0;
                 acc[type][n][1] += (t2 - t1)/1000.0;
+                int64_t prev = t0;
+                for (int k = 0; k < 4; ++k) {
+                    const int64_t t = ph[k] > 0 ? ph[k] : prev;
+                    acc[type][n][2 + k] += (t - prev)/1000.0;
+                    prev = t;
+                }
                 if (++cnt[type][n] % 100 == 0) {
-                    LLAMA_LOG_INFO("decode timing: %zu-token batches (ctx type %d), last 100: setup %.2f ms, graph build + launch %.2f ms a batch (host)\n",
-                            n, type, acc[type][n][0]/100, acc[type][n][1]/100);
-                    acc[type][n][0] = acc[type][n][1] = 0.0;
+                    LLAMA_LOG_INFO("decode timing: %zu-token batches (ctx type %d), last 100: setup %.2f ms (batch %.2f, reserve %.2f, "
+                            "memory update %.2f, memory init %.2f), graph build + launch %.2f ms a batch (host)\n",
+                            n, type, acc[type][n][0]/100, acc[type][n][2]/100, acc[type][n][3]/100, acc[type][n][4]/100,
+                            acc[type][n][5]/100, acc[type][n][1]/100);
+                    for (double & a : acc[type][n]) {
+                        a = 0.0;
+                    }
                 }
             }
         }
-    } decode_timing_log_on_exit { decode_timing && (batch_inp.tokens.size() >= 512 || batch_inp.tokens.size() <= 8), t_dt0, t_dt1,
+    } decode_timing_log_on_exit { decode_timing && (batch_inp.tokens.size() >= 512 || batch_inp.tokens.size() <= 8), t_dt0, t_dt1, t_ph,
             batch_inp.tokens.size(), (int) cparams.ctx_type };
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2284,6 +2295,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+    t_ph[0] = decode_timing ? ggml_time_us() : 0;
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -2317,6 +2329,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     embd_batch_idxs.clear();
 
     sched_reserve();
+    t_ph[1] = decode_timing ? ggml_time_us() : 0;
 
     bool did_optimize = false;
 
@@ -2326,6 +2339,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // handle any pending shifts/copies (and rope level moves)
     memory_update(false);
+    t_ph[2] = decode_timing ? ggml_time_us() : 0;
 
     llama_memory_context_ptr mctx;
 
@@ -2416,6 +2430,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         break;
     }
+
+    t_ph[3] = decode_timing ? ggml_time_us() : 0;
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {

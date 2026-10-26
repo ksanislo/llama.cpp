@@ -628,6 +628,14 @@ struct server_slot {
             return 0;
         }
 
+        // LLAMA_SPEC_DELAY=N: no drafts for the first N generated tokens of a request. Right after a long prompt the MoE cache
+        // is still refilling (decode memory gives its lent tails back empty) and a 4-token verify misses ~3x a token's experts
+        // there, so single-token steps are cheaper until the cache is warm.
+        static const int spec_delay = [] { const char * e = getenv("LLAMA_SPEC_DELAY"); return e ? std::max(0, atoi(e)) : 0; }();
+        if (spec_delay > 0 && stats.n_gen < (uint64_t) spec_delay) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
