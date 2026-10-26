@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <cinttypes>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <cmath>
@@ -3595,6 +3596,89 @@ static void ubatch_prepare_reserve(
     }
 }
 
+// LLAMA_GRAPH_MEM_PROFILE=1: a liveness walk over a reserved graph per backend (node order, a tensor lives from its node to
+// its last consumer, views count for their source; inputs, weights, the scheduler's split input copies and the output head
+// (result_*) not counted): each backend's peak of intermediate bytes and what is live there, grouped by name without the layer
+// suffix. An estimate of what ggml-alloc packs into the compute buffers (no in-place reuse), to find the large prompt
+// activations per ubatch size; printed to stderr (also under the fit's quiet log)
+static void llama_graph_mem_profile(ggml_cgraph * gf, uint32_t n_tokens, ggml_backend_sched_t sched) {
+    const int n = ggml_graph_n_nodes(gf);
+    auto base = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+    std::unordered_map<const ggml_tensor *, int> idx;
+    std::unordered_map<const ggml_tensor *, int> last;
+    for (int i = 0; i < n; ++i) {
+        idx[ggml_graph_node(gf, i)] = i;
+    }
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (t->src[j]) {
+                last[base(t->src[j])] = i;
+            }
+        }
+    }
+    auto counted = [&](const ggml_tensor * t) {
+        return !t->view_src && idx.count(t) && strncmp(t->name, "result_", 7) != 0;
+    };
+    auto backend_of = [&](ggml_tensor * t) -> std::string {
+        ggml_backend_t b = sched ? ggml_backend_sched_get_tensor_backend(sched, t) : nullptr;
+        return b ? ggml_backend_name(b) : "graph";
+    };
+    struct acc { size_t live = 0, peak = 0; int peak_at = -1; };
+    std::map<std::string, acc> per;
+    std::vector<std::vector<ggml_tensor *>> frees(n);
+    std::unordered_map<const ggml_tensor *, std::string> where;
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (counted(t)) {
+            const std::string b = backend_of(t);
+            where[t] = b;
+            acc & a = per[b];
+            a.live += ggml_nbytes(t);
+            if (a.live > a.peak) {
+                a.peak = a.live;
+                a.peak_at = i;
+            }
+            frees[last.count(t) ? std::max(last[t], i) : i].push_back(t);
+        }
+        for (ggml_tensor * f : frees[i]) {
+            per[where[f]].live -= ggml_nbytes(f);
+        }
+    }
+    for (const auto & [b, a] : per) {
+        if (a.peak_at < 0) {
+            continue;
+        }
+        std::map<std::string, std::pair<size_t, int>> at;
+        for (int i = 0; i <= a.peak_at; ++i) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (!counted(t) || where[t] != b) {
+                continue;
+            }
+            const int l = last.count(t) ? std::max(last[t], i) : i;
+            if (l >= a.peak_at) {
+                std::string name = t->name;
+                const size_t dash = name.rfind('-');
+                if (dash != std::string::npos) {
+                    name = name.substr(0, dash);
+                }
+                at[name].first += ggml_nbytes(t);
+                at[name].second++;
+            }
+        }
+        std::vector<std::pair<size_t, std::string>> v;
+        for (const auto & x : at) {
+            v.push_back({ x.second.first, x.first + " x" + std::to_string(x.second.second) });
+        }
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "%s: %u tokens, %s: peak %.2f MiB live at node %d of %d (%s, %s); live there:\n", __func__, n_tokens,
+            b.c_str(), a.peak/1024.0/1024.0, a.peak_at, n, ggml_graph_node(gf, a.peak_at)->name, ggml_op_desc(ggml_graph_node(gf, a.peak_at)));
+        for (size_t k = 0; k < v.size() && k < 12; ++k) {
+            fprintf(stderr, "%s:   %9.2f MiB  %s\n", __func__, v[k].first/1024.0/1024.0, v[k].second.c_str());
+        }
+    }
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -3667,6 +3751,9 @@ ggml_cgraph * llama_context::graph_reserve(
             n_seqs_worst_case = n_seqs;
         }
         copy_experts.in_flight = false; // the reserve synchronizes the scheduler
+    }
+    if (gf && getenv("LLAMA_GRAPH_MEM_PROFILE")) {
+        llama_graph_mem_profile(gf, n_tokens, sched.get());
     }
 
     return gf;

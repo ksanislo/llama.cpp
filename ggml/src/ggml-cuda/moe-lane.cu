@@ -55,13 +55,15 @@ static __global__ void moe_doorbell_kernel(
     __syncthreads();
 
     if (tid == 0) {
+        const uint32_t ov = moe_lane_get(chan, GGML_MOE_LANE_FRAC);
+        const float f = ov != 0 ? (ov - 1)*0.001f : frac;
         int32_t r = 0;
         for (int i = 0; i < n; ++i) {
             if (s_rank[i] >= 0) {
                 s_rank[i] = r++;
             }
         }
-        s_lane = min(r, (int32_t) floorf(r*frac + 0.5f));
+        s_lane = min(r, (int32_t) floorf(r*f + 0.5f));
     }
     __syncthreads();
 

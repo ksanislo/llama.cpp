@@ -8,6 +8,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -1141,6 +1143,8 @@ struct llama_moe_cache::impl {
         std::vector<std::pair<size_t, size_t>> lend_ranges; // (offset, size) in the device buffer, whole granules
         std::vector<size_t> bank_offs;                 // offset of each bank in the device buffer
         bool tail_out = false;                         // the tail stayed out after a give (no memory to back it), see dm_switch
+        int32_t lent_end = -1;                         // while lent: slots [lend_first, lent_end) are out of the cache
+        std::vector<int32_t> lent_keys;                // the experts they held (LLAMA_MOE_LEND_SAME)
         std::vector<std::pair<int32_t, int32_t>> refill; // (layer, expert) hottest first, uploaded into the returned slots
         size_t refill_pos = 0;
     };
@@ -1328,6 +1332,7 @@ struct llama_moe_cache::impl {
         size_t  n_done_batches   = 0; //        and committed
         size_t  rf_seq    = 0;  // ASYNC: the refill is done when n_done_batches reaches this
         int64_t rf_t0     = -1; // a refill after a give is under way since (us), -1 none
+        uint32_t lane_ov  = 0;  // LLAMA_MOE_WARMUP_LANE: the override word last written to the device's lane channels
         int32_t rf_graphs = 0;  // graphs since
         size_t  rf_n      = 0;  // experts refilled since
         bool    rf_sealed = false; // ASYNC: rf_seq covers the last refill
@@ -1387,6 +1392,10 @@ struct llama_moe_cache::impl {
     // projection) spins on the done word and copies the CPU's rows in. No host step, no stream sync, CUDA graphs stay on.
     float   lane_frac       = 0.0f;
     float   lane_frac_multi = -1.0f; // LLAMA_MOE_CPU_LANE_MULTI: the share for graphs of 2+ tokens (default: lane_frac)
+    // LLAMA_MOE_WARMUP_LANE=f: while a device refills after a give, its doorbells send the share f of the misses to the CPU lane
+    // (Strata: misses cost CPU time, not PCIe, while the link carries the refill); written to the channels, no graph change
+    float   warmup_lane     = -1.0f;
+    size_t  warmup_graphs   = 0;     // graph-devices run with the override
     int32_t lane_timeout_ms = 2000;
     std::vector<ggml_backend_buffer_ptr> lane_bufs;   // the channels of each device, pinned host memory
     std::vector<ggml_backend_buffer_ptr> lane_mapped; // the same mapped to the device
@@ -1492,6 +1501,24 @@ struct llama_moe_cache::impl {
     vmm_commit_t vmm_chunk    = nullptr;
     vmm_alias_t  vmm_alias_fn = nullptr;
     bool         dm_alias     = false; // LLAMA_MOE_DECODE_MEM_ALIAS (default 1 where the backend can)
+    // small lend (Strata: the prompt borrows what its chunk needs, from the cold end, and gets the same experts back):
+    // LLAMA_MOE_LEND=used: a large graph takes only the tail slots under the memory it uses (staging if it stages, the
+    //   compute buffer up to its plan's extent), a larger one later takes more; the give returns and refills only those
+    // LLAMA_MOE_LEND_COLD=1: the experts that leave are the lowest by dm_score (routing counts, then the profile), not SLRU
+    // LLAMA_MOE_LEND_SAME=1: the refill puts back the experts that left (hottest first), not the hottest missing ones
+    bool dm_lend_used = false;
+    bool dm_lend_cold = false;
+    bool dm_lend_same = false;
+    std::vector<int32_t> dm_want; // [group] the end of the tail slots the graph being allocated needs out of the cache
+    struct dm_lend_stats {
+        size_t grows = 0;          // larger graphs while lent that took more
+        size_t slots = 0;          // tail slots taken, all takes and grows
+        size_t slots_full = 0;     // what whole tails would have been
+        size_t bytes = 0;
+        size_t bytes_full = 0;
+        size_t logged = 0;
+    };
+    dm_lend_stats stats_lend;
     std::vector<dm_device> dm_devs;
     dm_stats stats_dm;
     bool dm_warned = false;
@@ -2031,6 +2058,9 @@ struct llama_moe_cache::impl {
         if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_MULTI")) {
             lane_frac_multi = std::clamp((float) atof(env), 0.0f, 1.0f);
         }
+        if (const char * env = moe_env("LLAMA_MOE_WARMUP_LANE")) {
+            warmup_lane = std::clamp((float) atof(env), 0.0f, 1.0f);
+        }
         if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_TIMEOUT_MS")) {
             lane_timeout_ms = std::max(1, atoi(env));
         }
@@ -2426,6 +2456,18 @@ struct llama_moe_cache::impl {
             vmm_chunk    = (vmm_commit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_commit_chunk");
             vmm_alias_fn = (vmm_alias_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_alias");
             dm_alias     = vmm_chunk && vmm_alias_fn && env_i("LLAMA_MOE_DECODE_MEM_ALIAS", 1) != 0;
+            if (const char * v = moe_env("LLAMA_MOE_LEND")) {
+                dm_lend_used = strcmp(v, "used") == 0;
+                if (!dm_lend_used && strcmp(v, "all") != 0) {
+                    LLAMA_LOG_WARN("%s: LLAMA_MOE_LEND=%s is not one of used / all, all is used\n", __func__, v);
+                }
+            }
+            if (dm_lend_used && !dm_alias) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_LEND=used needs LLAMA_MOE_DECODE_MEM_ALIAS, it is off\n", __func__);
+                dm_lend_used = false;
+            }
+            dm_lend_cold = env_i("LLAMA_MOE_LEND_COLD", 0) != 0;
+            dm_lend_same = env_i("LLAMA_MOE_LEND_SAME", 0) != 0;
             dm.gran  = g;
             dm.cbuft = cb;
             dm.large = compute.large[d.ib];
@@ -3008,24 +3050,55 @@ struct llama_moe_cache::impl {
         dm.tails.clear();
         const char * env_p = moe_env("LLAMA_MOE_DECODE_MEM_PIECE_MIB");
         const size_t piece = std::max<size_t>(1, (size_t) (env_p ? std::max(1, atoi(env_p)) : 64)*1024*1024/dm.gran)*dm.gran;
-        size_t pos = 0;
+        // LLAMA_MOE_LEND=used: the pieces in the order of their slots' place in the tails (all banks and groups interleaved), so
+        // a prefix of the tail space is the low part of every tail and a graph that uses less takes fewer slots out
+        std::vector<std::pair<size_t, size_t>> pieces;
+        std::vector<double> key;
         for (const group & g : groups) {
             if (g.id != (int32_t) id) {
                 continue;
             }
+            const std::vector<size_t> nb = bank_nb(g);
             for (const auto & r : g.lend_ranges) {
                 for (size_t off = 0; off < r.second; ) {
-                    size_t n = std::min(piece, r.second - off);
-                    if (pos < dm.stage && pos + n > dm.stage) {
-                        n = dm.stage - pos;
+                    const size_t n = std::min(piece, r.second - off);
+                    double k = (double) pieces.size();
+                    for (size_t ip = 0; dm_lend_used && ip < nb.size() && ip < g.bank_offs.size(); ++ip) {
+                        const size_t o = r.first + off;
+                        if (o >= g.bank_offs[ip] && o < g.bank_offs[ip] + (size_t) g.n_slots*nb[ip]) {
+                            const double s = (double) (o - g.bank_offs[ip])/nb[ip];
+                            k = (s - g.lend_first)/std::max(1, g.n_slots - g.lend_first);
+                        }
                     }
-                    if (dm_alias && !vmm_chunk(d.buf.get(), r.first + off, n)) {
-                        throw std::runtime_error("failed to allocate the MoE cache buffers");
-                    }
-                    dm.tails.push_back({ r.first + off, n });
+                    pieces.push_back({ r.first + off, n });
+                    key.push_back(k);
                     off += n;
-                    pos += n;
                 }
+            }
+        }
+        if (dm_lend_used) {
+            std::vector<size_t> order(pieces.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return key[a] < key[b]; });
+            std::vector<std::pair<size_t, size_t>> sorted;
+            for (size_t i : order) {
+                sorted.push_back(pieces[i]);
+            }
+            pieces.swap(sorted);
+        }
+        size_t pos = 0;
+        for (const auto & pc : pieces) {
+            for (size_t off = 0; off < pc.second; ) {
+                size_t n = pc.second - off;
+                if (pos < dm.stage && pos + n > dm.stage) {
+                    n = dm.stage - pos;
+                }
+                if (dm_alias && !vmm_chunk(d.buf.get(), pc.first + off, n)) {
+                    throw std::runtime_error("failed to allocate the MoE cache buffers");
+                }
+                dm.tails.push_back({ pc.first + off, n });
+                off += n;
+                pos += n;
             }
         }
         if (!vmm_commit(d.buf.get(), 0, total)) {
@@ -4185,8 +4258,8 @@ struct llama_moe_cache::impl {
                 src.push_back(s);
             }
         }
-        for (int32_t s = 0; s < first; ++s) {
-            if (drop[s]) {
+        for (int32_t s = 0; s < g.n_slots; ++s) {
+            if (drop[s] && (s < first || s >= end)) { // above end: tail slots still cached (LLAMA_MOE_LEND=used)
                 dst.push_back(s);
             }
         }
@@ -4668,6 +4741,25 @@ struct llama_moe_cache::impl {
     }
     // END fill policy slots
 
+    // LLAMA_MOE_WARMUP_LANE: the lane share of the device's layers while its refill is under way, the op's share after it
+    void warmup_lane_set(size_t id) {
+        if (warmup_lane < 0.0f || lane_frac <= 0.0f) {
+            return;
+        }
+        dh_device & dd = dh_devs[id];
+        const uint32_t w = dd.rf_t0 >= 0 ? 1 + (uint32_t) lroundf(warmup_lane*1000.0f) : 0;
+        warmup_graphs += w != 0;
+        if (w == dd.lane_ov) {
+            return;
+        }
+        for (int32_t il : dd.rows) {
+            if (layers[il].lane_host) {
+                reinterpret_cast<std::atomic<uint32_t> *>(layers[il].lane_host)[GGML_MOE_LANE_FRAC].store(w, std::memory_order_release);
+            }
+        }
+        dd.lane_ov = w;
+    }
+
     // a fill is done: the expert is cached from the next graph on, unless the cache path uploaded it meanwhile
     void dh_commit(const dh_fill & f) {
         moe_cache_slru & slru = groups[layers[f.il].ig].slru;
@@ -4815,7 +4907,9 @@ struct llama_moe_cache::impl {
         }
         std::vector<size_t> take;
         std::vector<size_t> give;
+        std::vector<size_t> grow;
         std::vector<size_t> need(devices.size(), 0);
+        dm_want.assign(groups.size(), -1);
         for (size_t id = 0; id < devices.size(); ++id) {
             dm_device & dm = dm_devs[id];
             if (dm.lend == 0) {
@@ -4870,15 +4964,146 @@ struct llama_moe_cache::impl {
                             ggml_backend_name(devices[id].backend), used/1024.0/1024.0, dm.small/1024.0/1024.0);
                         dm_warned = true;
                     }
+                    dm_used_ends(id, stages, used);
                     take.push_back(id);
-                } else if (used > dm.committed) {
-                    dm_commit_compute(id, used);
+                } else {
+                    if (used > dm.committed) {
+                        dm_commit_compute(id, used);
+                    }
+                    if (dm_lend_used) {
+                        dm_used_ends(id, stages, used);
+                        bool more = false;
+                        for (const group & g : groups) {
+                            more = more || (g.id == (int32_t) id && dm_want[&g - groups.data()] > g.lent_end);
+                        }
+                        if (more) {
+                            grow.push_back(id);
+                        }
+                    }
                 }
             }
         }
         if (!take.empty() || !give.empty()) {
             dm_switch(sched, take, give, need);
         }
+        if (!grow.empty()) {
+            dm_grow(sched, grow);
+        }
+    }
+
+    // LLAMA_MOE_LEND=used: dm_want[group] = the end of the tail slots of the device whose memory a graph touches: the staging
+    // slots (the first part of the tail space) if it stages, and the compute buffer's [small, used) (the tail space after
+    // them); a slot is out if any of its banks' lent bytes is; without LLAMA_MOE_LEND=used the whole tails
+    void dm_used_ends(size_t id, bool stages, size_t used) {
+        const dm_device & dm = dm_devs[id];
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            if (g.id == (int32_t) id && g.lend_first < g.n_slots) {
+                dm_want[ig] = dm_lend_used ? g.lend_first : g.n_slots;
+            }
+        }
+        if (!dm_lend_used) {
+            return;
+        }
+        std::vector<std::pair<size_t, size_t>> iv; // tail space
+        if (stages && dm.alias_stage > 0) {
+            iv.push_back({ 0, dm.alias_stage });
+        }
+        if (used > dm.small && dm.alias_comp > 0) {
+            iv.push_back({ dm.alias_stage, dm.alias_stage + std::min(dm.alias_comp, used - dm.small) });
+        }
+        dm_tail_ends(id, iv, dm_want);
+    }
+
+    // the cache-buffer bytes of the tail space intervals iv -> per group the end of the slots they touch (dm_want, raised)
+    void dm_tail_ends(size_t id, const std::vector<std::pair<size_t, size_t>> & iv, std::vector<int32_t> & want) const {
+        const dm_device & dm = dm_devs[id];
+        size_t pos = 0;
+        for (const auto & r : dm.tails) {
+            for (const auto & v : iv) {
+                const size_t a = std::max(v.first, pos);
+                const size_t b = std::min(v.second, pos + r.second);
+                if (a >= b) {
+                    continue;
+                }
+                const size_t lo = r.first + (a - pos);
+                const size_t hi = r.first + (b - pos);
+                for (size_t ig = 0; ig < groups.size(); ++ig) {
+                    const group & g = groups[ig];
+                    if (g.id != (int32_t) id || g.lend_first >= g.n_slots) {
+                        continue;
+                    }
+                    const std::vector<size_t> nb = bank_nb(g);
+                    for (size_t ip = 0; ip < nb.size() && ip < g.bank_offs.size(); ++ip) {
+                        const size_t off = g.bank_offs[ip];
+                        if (lo >= off && lo < off + (size_t) g.n_slots*nb[ip]) {
+                            const int32_t e = (int32_t) std::min<size_t>(g.n_slots, (hi - off + nb[ip] - 1)/nb[ip]);
+                            want[ig] = std::max(want[ig], std::max(e, g.lend_first));
+                        }
+                    }
+                }
+            }
+            pos += r.second;
+        }
+    }
+
+    // the slots [lent_end, want) of a group leave the cache too (a take: from lend_first)
+    void dm_take_group(size_t ig) {
+        group & g = groups[ig];
+        if (g.lent_end < 0) {
+            g.lent_end = g.lend_first;
+            g.lent_keys.clear();
+        }
+        const int32_t want = dm_want.size() > ig && dm_want[ig] >= 0 ? dm_want[ig] : g.n_slots;
+        if (want <= g.lent_end) {
+            return;
+        }
+        dm_evict_range(g, g.lent_end, want, dm_lend_cold, dm_lend_same ? &g.lent_keys : nullptr);
+        size_t per_slot = 0;
+        for (size_t nb : bank_nb(g)) {
+            per_slot += nb;
+        }
+        const bool first = g.lent_end == g.lend_first;
+        stats_lend.slots += want - g.lent_end;
+        stats_lend.bytes += (size_t) (want - g.lent_end)*per_slot;
+        if (first) {
+            stats_lend.slots_full += g.n_slots - g.lend_first;
+            stats_lend.bytes_full += (size_t) (g.n_slots - g.lend_first)*per_slot;
+        }
+        if (++stats_lend.logged <= 24) {
+            LLAMA_LOG_INFO("%s: %s group %zu: %d of %d tail slots out of the cache (%s, %.2f MiB; slots %d..%d)\n", __func__,
+                ggml_backend_name(devices[g.id].backend), ig, want - g.lend_first, g.n_slots - g.lend_first, first ? "take" : "grow",
+                (want - g.lent_end)*per_slot/1024.0/1024.0, g.lend_first, want);
+        }
+        g.lent_end = want;
+    }
+
+    // LLAMA_MOE_LEND=used: a larger graph while lent takes more of the tails (everything synchronized first: the slots may be
+    // read by graphs in flight)
+    void dm_grow(ggml_backend_sched_t sched, const std::vector<size_t> & ids) {
+        dm_sync_all(sched);
+        for (size_t id : ids) {
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (groups[ig].id == (int32_t) id && !groups[ig].tail_out) {
+                    dm_take_group(ig);
+                }
+            }
+            device & d = devices[id];
+            if (dm_devs[id].stage > 0 && !d.slot_layer.empty()) {
+                std::fill(d.slot_layer.begin(), d.slot_layer.end(), -1);
+                d.last_slot  = -1;
+                d.ring_fence = true;
+            }
+            if (id < dh_devs.size() && !dh_devs[id].rows.empty()) {
+                dh_device & dd = dh_devs[id];
+                dh_rebuild_map(dd);
+                dd.resync = false;
+                ggml_backend_tensor_set_async(d.backend, dd.map, dd.map_host.data(), 0, ggml_nbytes(dd.map));
+                dd.map_dirty = false;
+            }
+            ggml_backend_synchronize(d.backend); // the moves out of the slots before the graph writes them
+        }
+        stats_lend.grows++;
     }
 
     void dm_commit_compute(size_t id, size_t end) {
@@ -4929,31 +5154,61 @@ struct llama_moe_cache::impl {
     // move to the freed slots below it (D2D on the compute stream); every slot of the group is in the SLRU lists here, except
     // the transient ones at its start
     void dm_evict_tail(group & g) {
+        dm_evict_range(g, g.lend_first, g.n_slots, false, nullptr);
+    }
+
+    // the slots [from, to) leave the cache (LLAMA_MOE_LEND=used: only those whose memory the graph uses, from <= the next
+    // still cached tail slot): as many experts as the range holds slots are evicted, the coldest of the group's listed slots
+    // (SLRU order, or by_score: lowest dm_score first, Strata's profile-ranked tail); the others in the range move to the
+    // freed slots outside it. evicted: the keys that left the cache (for a refill of the same experts)
+    void dm_evict_range(group & g, int32_t from, int32_t to, bool by_score, std::vector<int32_t> * evicted) {
         moe_cache_slru & c = g.slru;
-        const int32_t first = g.lend_first;
-        const int32_t k     = g.n_slots - first;
+        const int32_t k = to - from;
         if (k <= 0) {
             return;
         }
         std::vector<bool> drop(g.n_slots, false);
         int32_t n_drop = 0;
-        for (int seg = 0; seg < 2 && n_drop < k; ++seg) {
-            for (int32_t s = c.head[seg]; s >= 0 && n_drop < k; s = c.next[s]) {
-                drop[s] = true;
-                n_drop++;
+        if (by_score) {
+            // empty listed slots first, then the lowest scores; a slot in the range wins a tie (no move)
+            std::vector<std::pair<std::pair<int, std::pair<double, double>>, int32_t>> cand;
+            for (int seg = 0; seg < 2; ++seg) {
+                for (int32_t s = c.head[seg]; s >= 0; s = c.next[s]) {
+                    const int32_t key = c.key_of[s];
+                    const auto sc = key >= 0 ? dm_score(key / c.n_expert, key % c.n_expert) : std::make_pair(-1.0, -1.0);
+                    cand.push_back({ { s >= from && s < to ? 0 : 1, sc }, s });
+                }
+            }
+            auto colder = [](const auto & a, const auto & b) {
+                if (a.first.second.first  != b.first.second.first)  { return a.first.second.first  < b.first.second.first; }
+                if (a.first.second.second != b.first.second.second) { return a.first.second.second < b.first.second.second; }
+                return a.first.first < b.first.first;
+            };
+            GGML_ASSERT((int32_t) cand.size() >= k);
+            std::partial_sort(cand.begin(), cand.begin() + k, cand.end(), colder);
+            for (int32_t i = 0; i < k; ++i) {
+                drop[cand[i].second] = true;
+            }
+            n_drop = k;
+        } else {
+            for (int seg = 0; seg < 2 && n_drop < k; ++seg) {
+                for (int32_t s = c.head[seg]; s >= 0 && n_drop < k; s = c.next[s]) {
+                    drop[s] = true;
+                    n_drop++;
+                }
             }
         }
         GGML_ASSERT(n_drop == k);
 
         std::vector<int32_t> src;
         std::vector<int32_t> dst;
-        for (int32_t s = first; s < g.n_slots; ++s) {
+        for (int32_t s = from; s < to; ++s) {
             if (!drop[s]) {
                 src.push_back(s);
             }
         }
-        for (int32_t s = 0; s < first; ++s) {
-            if (drop[s]) {
+        for (int32_t s = 0; s < g.n_slots; ++s) {
+            if (drop[s] && (s < from || s >= to)) {
                 dst.push_back(s);
             }
         }
@@ -4961,6 +5216,9 @@ struct llama_moe_cache::impl {
 
         auto evict = [&](int32_t s) {
             if (c.key_of[s] >= 0) {
+                if (evicted) {
+                    evicted->push_back(c.key_of[s]);
+                }
                 c.slot_map[c.key_of[s] / c.n_expert][c.key_of[s] % c.n_expert] = c.empty;
                 c.key_of[s] = -1;
                 c.n_filled--;
@@ -4987,7 +5245,7 @@ struct llama_moe_cache::impl {
         }
         src.resize(n_move);
         dst.resize(n_move);
-        for (int32_t s = first; s < g.n_slots; ++s) {
+        for (int32_t s = from; s < to; ++s) {
             if (drop[s]) {
                 evict(s);
                 c.unlink(s);
@@ -5028,21 +5286,36 @@ struct llama_moe_cache::impl {
 
     // the returned tail: free slots, the next victims, and the hottest experts missing to put there
     void dm_return_tail(group & g) {
+        dm_return_range(g, g.n_slots, nullptr);
+    }
+
+    // the returned slots [lend_first, end) are free; the refill: the evicted experts if given (the same experts back, Strata),
+    // else the hottest missing ones; hottest first, at most one per returned slot
+    void dm_return_range(group & g, int32_t end, const std::vector<int32_t> * evicted) {
         moe_cache_slru & c = g.slru;
-        for (int32_t s = g.n_slots - 1; s >= g.lend_first; --s) {
+        for (int32_t s = end - 1; s >= g.lend_first; --s) {
             GGML_ASSERT(c.key_of[s] < 0);
             c.push_front(s);
         }
-        const size_t k = (size_t) (g.n_slots - g.lend_first);
+        const size_t k = (size_t) std::max(0, end - g.lend_first);
         std::vector<std::pair<std::pair<double, double>, std::pair<int32_t, int32_t>>> cand;
-        for (int32_t il : g.layers) {
-            for (int32_t e = 0; e < c.n_expert; ++e) {
-                if (c.slot_map[il][e] < c.n_slots || dh_inflight.count(il*c.n_expert + e) > 0) {
-                    continue;
-                }
-                const auto sc = dm_score(il, e);
-                if (sc.first > 0.0 || sc.second > 0.0) {
-                    cand.push_back({ sc, { il, e } });
+        auto consider = [&](int32_t il, int32_t e, bool any) {
+            if (c.slot_map[il][e] < c.n_slots || dh_inflight.count(il*c.n_expert + e) > 0) {
+                return;
+            }
+            const auto sc = dm_score(il, e);
+            if (any || sc.first > 0.0 || sc.second > 0.0) {
+                cand.push_back({ sc, { il, e } });
+            }
+        };
+        if (evicted) {
+            for (int32_t key : *evicted) {
+                consider(key / c.n_expert, key % c.n_expert, true);
+            }
+        } else {
+            for (int32_t il : g.layers) {
+                for (int32_t e = 0; e < c.n_expert; ++e) {
+                    consider(il, e, false);
                 }
             }
         }
@@ -5190,9 +5463,9 @@ struct llama_moe_cache::impl {
                 dh_flight_clear(dh_devs[id]);
                 refill_check(id, true); // a refill cut short by the take ends here
             }
-            for (group & g : groups) {
-                if (g.id == (int32_t) id && !g.tail_out) {
-                    dm_evict_tail(g);
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (groups[ig].id == (int32_t) id && !groups[ig].tail_out) {
+                    dm_take_group(ig);
                 }
             }
             if (id < dh_devs.size() && !dh_devs[id].rows.empty()) {
@@ -5317,7 +5590,11 @@ struct llama_moe_cache::impl {
         for (size_t id : give) {
             for (group & g : groups) {
                 if (g.id == (int32_t) id && !g.tail_out) {
-                    dm_return_tail(g);
+                    dm_return_range(g, g.lent_end >= 0 ? g.lent_end : g.n_slots, dm_lend_same ? &g.lent_keys : nullptr);
+                }
+                if (g.id == (int32_t) id) {
+                    g.lent_end = -1;
+                    g.lent_keys.clear();
                 }
             }
         }
@@ -5410,6 +5687,7 @@ struct llama_moe_cache::impl {
                 dd.queued.clear();
             }
             refill_check(id);
+            warmup_lane_set(id);
             if (dd.resync) {
                 dh_rebuild_map(dd);
                 dd.resync = false;
@@ -6942,6 +7220,13 @@ struct llama_moe_cache::impl {
             };
             cost("take", m.take_cost, m.takes);
             cost("give", m.give_cost, m.gives);
+            if (dm_lend_used || dm_lend_cold || dm_lend_same) {
+                const dm_lend_stats & ls = stats_lend;
+                LLAMA_LOG_INFO("%s: decode memory lend: %zu tail slots (%.2f MiB) taken over the takes + %zu grows, of %zu (%.2f MiB) whole "
+                    "tails (%.1f%%); LLAMA_MOE_LEND=%s, cold %d, same %d\n", log_tag(), ls.slots, ls.bytes/1024.0/1024.0, ls.grows,
+                    ls.slots_full, ls.bytes_full/1024.0/1024.0, 100.0*ls.bytes/std::max<size_t>(1, ls.bytes_full),
+                    dm_lend_used ? "used" : "all", dm_lend_cold ? 1 : 0, dm_lend_same ? 1 : 0);
+            }
             if (m.tails_out > 0) {
                 LLAMA_LOG_INFO("%s: decode memory: %zu times a group tail stayed out after a give (no memory)\n", log_tag(), m.tails_out);
             }
@@ -6977,6 +7262,10 @@ struct llama_moe_cache::impl {
                 fs.refill_runs ? fs.refill_us/1000.0/fs.refill_runs : 0.0, fs.refill_runs ? (double) fs.refill_graphs/fs.refill_runs : 0.0,
                 fill_async ? (refill_bg ? 2 : 1) : 0, fs.batches, fs.polls_busy, fs.max_flight, fill_min_misses, fs.kept_out,
                 fill_budget/1024.0/1024.0, fs.budget_cut, fill_evict ? 1 : 0, fs.no_free);
+            if (warmup_lane >= 0.0f) {
+                LLAMA_LOG_INFO("%s: warm-up lane: %zu graph-devices sent %.0f%% of their misses to the CPU lane while refilling "
+                    "(LLAMA_MOE_WARMUP_LANE)\n", log_tag(), warmup_graphs, 100.0*warmup_lane);
+            }
         }
         for (size_t i = 0; i < lanes.size(); ++i) {
             const llama_moe_lane::stats ls = lanes[i]->get_stats();
