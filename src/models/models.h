@@ -2757,6 +2757,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // LLAMA_MTP_KV_ONLY=2: K/V (and the QSA indexer keys) of every row go to the cache; q, attention and the output
+        // projection run on the out_ids rows only. Returns [n_embd, n_out].
+        ggml_tensor * build_layer_attn_rows(
+              llm_graph_input_attn_kv * inp_attn,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                    ggml_tensor * out_ids,
+                            int * sections,
+                            int   il);
+
         // dense self-attention over the cells the QSA mask keeps, one query chunk at a time
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
