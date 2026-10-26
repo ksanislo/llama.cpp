@@ -70,6 +70,22 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
 
+    // [TAG_PIPE_CHECKPOINTS] partial states taken between the ubatches of a batch, see llama_pipe_checkpoint_request
+    bool   pipe_checkpoints_supported() const;
+    bool   pipe_checkpoint_request(llama_seq_id seq_id, llama_pos pos);
+    size_t pipe_checkpoint_get(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size);
+    void   pipe_checkpoints_clear(llama_seq_id seq_id);
+    struct pipe_ckpt_row {
+        ggml_tensor * t;
+        size_t        offs;
+        size_t        size;
+        uint8_t     * dst;
+    };
+    struct pipe_ckpt_job { // the rows one backend copies
+        std::vector<pipe_ckpt_row> rows;
+        bool async = false;
+    };
+
     // the ubatch size LLAMA_PROMPT_PIPE gives a batch of n_tokens (n_ubatch when it does not apply)
     uint32_t prompt_chunk(uint32_t n_tokens) const;
     bool     prompt_pipe_on() const;
@@ -510,6 +526,22 @@ private:
     // LLAMA_MOE_GATHER (default 1): the experts of a large batch are copied with one gather kernel per weight (cached ones
     // from the MoE cache, the others read from pinned host memory), instead of one copy per run of experts
     bool     moe_gather         = true;
+    // [TAG_PIPE_CHECKPOINTS] a requested checkpoint: the ubatch before pos ends there, then each device holding
+    // recurrent rows of seq_id copies them to host memory in its stream order (a post callback), nothing waits
+    struct pipe_ckpt {
+        llama_seq_id seq_id;
+        llama_pos    pos;
+        bool         taken    = false;
+        llama_pos    cell_pos = -1;
+        std::vector<pipe_ckpt_row>                  rows;
+        std::vector<std::unique_ptr<pipe_ckpt_job>> jobs;
+        ggml_backend_buffer_ptr buf;  // pinned host memory, or
+        std::vector<uint8_t>    host;
+    };
+    std::vector<std::unique_ptr<pipe_ckpt>> pipe_ckpts;
+    std::vector<ggml_backend_buffer_ptr>    pipe_ckpt_free; // pinned buffers of forgotten checkpoints, reused
+    void pipe_ckpt_ubatch(const llama_ubatch & ubatch);
+
     // LLAMA_PROMPT_PIPE_GRAPHS (default 0): the device splits of a piped chunk are captured and launched as CUDA graphs, so
     // one host thread queues ~1500 kernels per device per chunk without blocking on a full launch queue
     bool     prompt_pipe_graphs = false;

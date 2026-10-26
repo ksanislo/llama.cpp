@@ -225,6 +225,10 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 }
 
+llama_memory_recurrent * llama_memory_hybrid::partial_state_recurrent() const {
+    return mem_attn->get_swa_type() == LLAMA_SWA_TYPE_NONE ? mem_recr.get() : nullptr;
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

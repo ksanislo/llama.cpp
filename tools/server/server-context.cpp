@@ -191,6 +191,43 @@ static int32_t server_ckpt_pre_end(const llama_context * ctx, int32_t n_prompt) 
     return llama_pipeline_parallel(ctx) && !llama_moe_streams_experts(ctx) ? std::min(n_ubatch, 512) : n_ubatch;
 }
 
+// LLAMA_PROMPT_CUTS=strata: with the prompt pipe on, a fresh prompt is cut where Strata cuts it - once, at the last
+// <|im_start|> (the reply header, read in its own small batch, where the conversation's checkpoint is taken), and at the
+// system prompt end only when it is >= 2048 tokens; no breaks at user messages or one pipe chunk before the end (each
+// break = one pipe fill + drain). =strata-always applies it without the pipe too (tests). Default off.
+static int prompt_cuts_mode() {
+    static const int mode = [] {
+        const char * env = getenv("LLAMA_PROMPT_CUTS");
+        if (env == nullptr) {
+            return 0;
+        }
+        if (strcmp(env, "strata") == 0) {
+            return 1;
+        }
+        if (strcmp(env, "strata-always") == 0) {
+            return 2;
+        }
+        return 0;
+    }();
+    return mode;
+}
+
+// a system prompt at least this long keeps its cut under LLAMA_PROMPT_CUTS=strata (Strata's --prompt-cache-root)
+static constexpr int32_t PROMPT_CUTS_ROOT_MIN = 2048;
+// the reply header is looked for this far before the prompt end (Strata's --short-read)
+static constexpr int32_t PROMPT_CUTS_TAIL_MAX = 64;
+
+// LLAMA_PIPE_CHECKPOINTS=1: the checkpoints inside a batch (user messages, the system prompt end, one chunk before the
+// end) are taken without breaking it (llama_pipe_checkpoint_request: a ubatch ends there, the devices copy the
+// recurrent state in stream order, no drain). The checkpoint at the last cut stays. Default off.
+static bool pipe_checkpoints_env() {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_PIPE_CHECKPOINTS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -355,6 +392,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // checkpoints requested inside the batch being decoded (LLAMA_PIPE_CHECKPOINTS): {n_tokens, pos}
+    std::vector<std::pair<int64_t, llama_pos>> pipe_ckpt_req;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -1084,6 +1124,9 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
+    // the token that opens a turn (<|im_start|>), LLAMA_TOKEN_NULL if the vocab has none (see prompt_cuts_mode)
+    llama_token tok_turn = LLAMA_TOKEN_NULL;
+
     bool has_cap_tts() const {
         return mctx != nullptr && mtmd_gen_audio_get_info(mctx).type != MTMD_GEN_AUDIO_TYPE_NONE;
     }
@@ -1371,6 +1414,18 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        {
+            const auto toks = common_tokenize(vocab, "<|im_start|>", false, true);
+            tok_turn = toks.size() == 1 ? toks[0] : LLAMA_TOKEN_NULL;
+            if (prompt_cuts_mode() != 0) {
+                SRV_INF("LLAMA_PROMPT_CUTS: %s, turn token %d\n", prompt_cuts_mode() == 2 ? "strata-always" : "strata (with the prompt pipe)", tok_turn);
+            }
+            if (pipe_checkpoints_env()) {
+                SRV_INF("LLAMA_PIPE_CHECKPOINTS: checkpoints inside a batch %s\n",
+                        llama_pipe_checkpoints_supported(ctx_tgt) ? "on" : "not supported by this model's memory");
+            }
+        }
 
         try {
             decision.init(model_tgt);
@@ -2797,8 +2852,73 @@ private:
         prompt_cache->update();
     }
 
-    // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // LLAMA_PIPE_CHECKPOINTS applies: the target's partial state is only its recurrent state (llama decides), the draft's
+    // partial state is empty and the speculative implementation keeps no per-sequence state (both are taken at the end
+    // of the batch, not where the checkpoint is)
+    bool pipe_checkpoints_ok(const server_slot & slot) const {
+        if (!llama_pipe_checkpoints_supported(ctx_tgt) || slot.task->tokens.has_mtmd) {
+            return false;
+        }
+        if (ctx_dft && llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > sizeof(uint32_t) + sizeof(llama_seq_id)) {
+            return false;
+        }
+        std::vector<uint8_t> data_spec;
+        return !common_speculative_get_state(spec.get(), slot.id, data_spec);
+    }
+
+    // a checkpoint of the slot's state at its current end, taken inside the batch (the batch is not broken there)
+    void pipe_checkpoint_request(server_slot & slot) {
+        const llama_pos pos = slot.prompt.tokens.pos_next();
+        if (!slot.pipe_ckpt_req.empty() && slot.pipe_ckpt_req.back().second == pos) {
+            return;
+        }
+        if (llama_pipe_checkpoint_request(ctx_tgt, slot.id, pos)) {
+            slot.pipe_ckpt_req.emplace_back(slot.prompt.n_tokens(), pos);
+        }
+    }
+
+    // after a decode: the slots' checkpoints taken inside it become context checkpoints; done = the batch is decoded,
+    // the requests it did not reach are dropped
+    void pipe_checkpoints_collect(bool done) {
+        for (auto & slot : slots) {
+            if (slot.pipe_ckpt_req.empty()) {
+                continue;
+            }
+            for (auto it = slot.pipe_ckpt_req.begin(); it != slot.pipe_ckpt_req.end(); ) {
+                const auto [n_tokens, pos] = *it;
+                const size_t n = slot.task ? llama_pipe_checkpoint_get(ctx_tgt, slot.id, pos, nullptr, 0) : 0;
+                if (n == 0) {
+                    if (done) {
+                        SLT_WRN(slot, "checkpoint at n_tokens = %" PRId64 " was not taken inside the batch\n", n_tokens);
+                    }
+                    ++it;
+                    continue;
+                }
+
+                auto & cur = checkpoint_new(slot, n_tokens);
+                cur.id_task = slot.task->id;
+                cur.update_pos(n_tokens, pos - 1, pos - 1);
+                cur.data_tgt.resize(n);
+                if (llama_pipe_checkpoint_get(ctx_tgt, slot.id, pos, cur.data_tgt.data(), n) != n) {
+                    GGML_ABORT("failed to read a checkpoint taken inside the batch\n");
+                }
+                // partial draft state: empty (pipe_checkpoints_ok), no speculative state
+                cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                SLT_INF(slot, "checkpoint inside the batch at n_tokens = %" PRId64 " (pos %d, %.3f MiB), %d of %d\n",
+                        n_tokens, pos - 1, (float) cur.size() / 1024 / 1024, (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints);
+
+                it = slot.pipe_ckpt_req.erase(it);
+            }
+            if (done) {
+                llama_pipe_checkpoints_clear(ctx_tgt, slot.id);
+                slot.pipe_ckpt_req.clear();
+            }
+        }
+    }
+
+    // make room for a checkpoint at n_tokens_new and append it
+    common_prompt_checkpoint & checkpoint_new(server_slot & slot, const int64_t n_tokens_new) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2832,7 +2952,6 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -2843,9 +2962,14 @@ private:
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        return slot.prompt.checkpoints.emplace_back();
+    }
 
-        cur.id_task = id_task;
+    // n_tokens_cur: the number of tokens added to the batch for the current slot
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        auto & cur = checkpoint_new(slot, slot.prompt.n_tokens() - n_tokens_cur);
+
+        cur.id_task = slot.task->id;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3678,6 +3802,9 @@ private:
 #endif
 
                 if (ok) {
+                    // checkpoints taken inside this decode (LLAMA_PIPE_CHECKPOINTS)
+                    pipe_checkpoints_collect(off + n_tokens >= batch.size());
+
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
@@ -4460,7 +4587,32 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // requests left by an aborted batch
+                    if (!slot.pipe_ckpt_req.empty()) {
+                        llama_pipe_checkpoints_clear(ctx_tgt, slot.id);
+                        slot.pipe_ckpt_req.clear();
+                    }
+
                     const int32_t n_ckpt_pre = server_ckpt_pre_end(ctx_tgt, slot.task->n_tokens());
+
+                    // LLAMA_PROMPT_CUTS=strata: one cut at the reply header (n_turn); LLAMA_PIPE_CHECKPOINTS: the checkpoints
+                    // inside the batch are requested from llama instead of breaking it
+                    const bool cuts_strata = prompt_cuts_mode() == 2 || (prompt_cuts_mode() == 1 && llama_prompt_pipe(ctx_tgt));
+                    const bool pipe_ckpt   = do_checkpoint && pipe_checkpoints_env() && pipe_checkpoints_ok(slot);
+                    int32_t n_turn = -1;
+                    if (cuts_strata && do_checkpoint) {
+                        const int32_t n_prompt = slot.task->n_tokens();
+                        n_turn = n_prompt - 4;
+                        if (tok_turn != LLAMA_TOKEN_NULL) {
+                            for (int32_t i = n_prompt - 1; i >= std::max(0, n_prompt - PROMPT_CUTS_TAIL_MAX); --i) {
+                                if (input_tokens[i] == tok_turn) {
+                                    n_turn = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    const char * cut_why = "other";
 
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
@@ -4521,7 +4673,9 @@ private:
 
                     // the end of the system prompt, kept in the prompt cache if it is reached here
                     const int32_t first_user_pos = spans.first_user_message_pos();
-                    const int32_t n_sys_prompt = slot.prompt.n_tokens() <= first_user_pos && want_prefix(slot, first_user_pos) ? first_user_pos : -1;
+                    const int32_t n_sys_prompt = slot.prompt.n_tokens() <= first_user_pos && want_prefix(slot, first_user_pos) &&
+                        (!cuts_strata || first_user_pos >= PROMPT_CUTS_ROOT_MIN) ? first_user_pos : -1;
+                    const int32_t n_batch_start = slot.prompt.n_tokens();
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_cur) {
@@ -4564,16 +4718,26 @@ private:
 
                         // break at the end of the system prompt, its state is saved before the next batch
                         if (slot.prompt.n_tokens() == n_sys_prompt) {
+                            cut_why = "system prompt";
                             break;
                         }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // (LLAMA_PIPE_CHECKPOINTS: a checkpoint requested there instead; LLAMA_PROMPT_CUTS=strata: only a
+                        // system prompt of PROMPT_CUTS_ROOT_MIN+ tokens is cut)
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
+                            const int64_t n_last_ckpt = !slot.pipe_ckpt_req.empty() ? slot.pipe_ckpt_req.back().first :
+                                                        !checkpoints.empty()        ? checkpoints.back().n_tokens : -1;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                break;
+                            if (pos == last_user_pos || n_last_ckpt < 0 || pos > n_last_ckpt + params_base.checkpoint_min_step) {
+                                if (pipe_ckpt) {
+                                    pipe_checkpoint_request(slot);
+                                } else if (!cuts_strata || (pos == first_user_pos && pos >= PROMPT_CUTS_ROOT_MIN)) {
+                                    cut_why = "user message";
+                                    break;
+                                }
                             }
                         }
 
@@ -4582,22 +4746,41 @@ private:
                         //  - 4 + n_ckpt_pre (a planned chunk, n_ubatch or 512, see server_ckpt_pre_end)
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        // LLAMA_PROMPT_CUTS=strata: only at the reply header (n_turn)
+                        if (do_checkpoint && cuts_strata) {
+                            if (slot.prompt.n_tokens() == n_turn) {
+                                cut_why = "reply header";
+                                break;
+                            }
+                        } else if (do_checkpoint) {
                             const int checkpoint_offsets[] = {4 + n_ckpt_pre, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    // LLAMA_PIPE_CHECKPOINTS: the one before the tail is taken inside the batch
+                                    if (pipe_ckpt && offset != 4) {
+                                        pipe_checkpoint_request(slot);
+                                        continue;
+                                    }
                                     should_break = true;
                                     break;
                                 }
                             }
                             if (should_break) {
+                                cut_why = "prompt tail";
                                 break;
                             }
                         }
                     }
+
+                    if (batch.size() >= n_batch_cur && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        cut_why = "batch full";
+                    }
+                    SLT_INF(slot, "prompt batch [%d, %d) of %d, cut: %s, %zu checkpoint(s) requested inside\n",
+                            n_batch_start, slot.prompt.n_tokens(), slot.task->n_tokens(),
+                            slot.prompt.n_tokens() == slot.task->n_tokens() ? "end" : cut_why, slot.pipe_ckpt_req.size());
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;

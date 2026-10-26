@@ -272,6 +272,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
+llama_memory_recurrent * llama_memory_hybrid_idx::partial_state_recurrent() const {
+    if (mem_idx && mem_idx->get_swa_type() != LLAMA_SWA_TYPE_NONE) {
+        return nullptr;
+    }
+    return llama_memory_hybrid::partial_state_recurrent();
+}
+
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     llama_memory_hybrid::state_write(io, seq_id, flags);
 

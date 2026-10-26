@@ -581,6 +581,10 @@ void llama_batch_allocr::set_seq_rope_levels(const std::vector<uint8_t> & levels
     seq_rope_lvl = levels;
 }
 
+void llama_batch_allocr::set_split_bounds(std::vector<std::pair<llama_seq_id, llama_pos>> bounds) {
+    split_bounds = std::move(bounds);
+}
+
 void llama_batch_allocr::split_reset() {
     out_ids.clear();
 
@@ -621,7 +625,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
             break;
         }
 
-        if (idxs.size() >= n_ubatch) {
+        if (idxs.size() >= n_ubatch || is_split_bound(cur_idx)) {
             break;
         }
     }
@@ -703,6 +707,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
         for (uint32_t s = 0; s < n_seqs; ++s) {
             if (cur_idx[s] >= (int32_t) seq_set_map[cur_seq_set[s]].size()) {
+                can_expand = false;
+                break;
+            }
+            if (!idxs_per_seq[s].empty() && is_split_bound(seq_set_map[cur_seq_set[s]][cur_idx[s]])) {
                 can_expand = false;
                 break;
             }
@@ -837,7 +845,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
         } while (cur_idx < get_n_tokens() && (used[cur_idx] || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx]) ||
                     tok_rope_level(cur_idx) != tok_rope_level(idxs[0])));
 
-        if (cur_idx == get_n_tokens()) {
+        if (cur_idx == get_n_tokens() || is_split_bound(cur_idx)) {
             break;
         }
 
@@ -849,6 +857,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+
+    split_bounds.clear();
 
     batch = {};
 
