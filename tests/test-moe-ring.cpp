@@ -4,6 +4,9 @@
 //   the copy is not behind a fence, waits for that release event
 // - every staged layer finds its copies queued at its callback, in plan order, and a full layer is queued ahead when a slot allows
 // - the copy plan covers every selected expert exactly once: uploaded if not cached, uploaded or copied from the cache if cached
+// - LLAMA_MOE_RING_BYTES (llama_moe_ring_bytes_sched): random layer sizes over random ring sizes with wrap-around; a range is never
+//   taken while a layer that may still read it is in flight, every copy over released bytes waits for (or is fenced past) the
+//   release of their last reader, a waited release event still holds that release, and a layer reads the range it was given
 #include "../src/llama-moe-ring.h"
 
 #include <algorithm>
@@ -405,12 +408,337 @@ static void test_inplace(std::mt19937 & rng) {
     CHECK(ip.map[3] == 1 && ip.map[1] == -1 && ip.map[4] == -2 && ip.staged == std::vector<int32_t>({ 1, 4 }), "example without read past");
 }
 
+// LLAMA_MOE_RING_BYTES: the byte ring driven like ring_begin_device / ring_copy_stage / ring_end_device, with per-byte owners
+struct sim_bytes {
+    llama_moe_ring_bytes_sched rb;
+    int32_t n_pos;
+    std::vector<std::vector<int64_t>> owner; // [ip][byte] range (seq) that last took the byte, -1 never
+    std::vector<int64_t> rel_of;             // [seq] release index, -1 not released
+    std::vector<int64_t> ev;                 // [n_ev] release index the event holds
+    int64_t copy_waited = -1;                // the copy stream waited for every release <= this
+    int64_t n_rel = 0;
+    bool ring_prev = false, ring_fence = false;
+    size_t ahead = 0, at_layer = 0, wraps = 0, waits = 0, forced = 0, max_ahead_seen = 0, layers = 0, ahead_sum = 0;
+
+    sim_bytes(const std::vector<size_t> & size, int32_t max_ahead) : n_pos((int32_t) size.size()) {
+        rb.ring.init(size);
+        rb.max_ahead = max_ahead;
+        for (size_t sz : size) {
+            owner.emplace_back(sz, -1);
+        }
+        ev.assign(llama_moe_ring_bytes::n_ev, -1);
+    }
+
+    void wait(int64_t w) {
+        CHECK(ev[w % llama_moe_ring_bytes::n_ev] == w, "wait for release %lld: its event was re-recorded (holds %lld)", (long long) w,
+            (long long) ev[w % llama_moe_ring_bytes::n_ev]);
+        copy_waited = std::max(copy_waited, w);
+    }
+
+    void record_release() {
+        const auto r = rb.release();
+        if (r.force >= 0) {
+            wait(r.force);
+            forced++;
+        }
+        if (r.rel >= 0) {
+            CHECK(r.rel == n_rel, "release index %lld, expected %lld", (long long) r.rel, (long long) n_rel);
+            ev[r.rel % llama_moe_ring_bytes::n_ev] = r.rel;
+            n_rel++;
+        }
+        if (r.rel >= 0) {
+            const int64_t seq = rb.ring.hist.back().seq;
+            rel_of[seq] = r.rel;
+        }
+    }
+
+    // try to issue entry i with n places of es; false without room
+    bool fill(size_t i, int32_t n, const std::vector<size_t> & es, int64_t limit) {
+        const size_t head0 = rb.ring.head[0];
+        int64_t w = -1;
+        if (!rb.issue(i, n, es, limit, w)) {
+            return false;
+        }
+        const auto & e = rb.plan[i];
+        if (w >= 0) {
+            wait(w);
+            waits++;
+        }
+        if (n == 0) {
+            return true;
+        }
+        CHECK(e.base >= 0 && e.base + n <= limit, "range [%lld, %lld) past the limit %lld", (long long) e.base, (long long) (e.base + n), (long long) limit);
+        if (e.base == 0 && head0 > 0) {
+            wraps++;
+        }
+        if ((int64_t) rel_of.size() <= e.seq) {
+            rel_of.resize(e.seq + 1, -1);
+        }
+        for (int32_t ip = 0; ip < n_pos; ++ip) {
+            const size_t o = (size_t) e.base*es[ip], end = (size_t) (e.base + n)*es[ip];
+            CHECK(end <= owner[ip].size(), "range past the ring");
+            for (size_t b = o; b < end && b < owner[ip].size(); ++b) {
+                const int64_t prev = owner[ip][b];
+                if (prev >= 0) {
+                    CHECK(rel_of[prev] != -1, "seq %lld overwrites bytes of seq %lld, which is not released", (long long) e.seq, (long long) prev);
+                    CHECK(rel_of[prev] < 0 || rel_of[prev] <= copy_waited, "seq %lld overwrites bytes of seq %lld before waiting for its release %lld (waited %lld)",
+                        (long long) e.seq, (long long) prev, (long long) rel_of[prev], (long long) copy_waited);
+                }
+                owner[ip][b] = e.seq;
+            }
+        }
+        return true;
+    }
+
+    void begin(std::vector<llama_moe_ring_bytes_sched::entry> plan) {
+        if (plan.empty()) {
+            rb.drop();
+            ring_prev = false;
+            return;
+        }
+        const bool fence = !ring_prev || ring_fence || !rb.ring.idle();
+        if (fence) {
+            // the copy stream waits for the whole compute stream: ranges of a dropped plan were never read or are done
+            copy_waited = n_rel - 1;
+            for (const auto & s : rb.ring.live) {
+                rel_of[s.seq] = -2;
+            }
+        }
+        rb.start(std::move(plan), fence);
+        ring_prev  = true;
+        ring_fence = false;
+    }
+
+    template <typename F> void issue(F size_of) {
+        for (int64_t i = rb.can_issue(); i >= 0; i = rb.can_issue()) {
+            int32_t n; std::vector<size_t> es; int64_t limit;
+            size_of((size_t) i, n, es, limit);
+            if (!fill((size_t) i, n, es, limit)) {
+                break;
+            }
+            ahead++;
+            // the ready events and pinned maps of the layers in flight are reused round robin over n_ev
+            CHECK(rb.ahead() <= (size_t) rb.max_ahead && rb.ahead() < (size_t) llama_moe_ring_bytes::n_ev,
+                "%zu layers in flight, at most %d", rb.ahead(), rb.max_ahead);
+        }
+    }
+
+    // the callback of layer il: false if the ring was dropped
+    template <typename F> bool layer(int32_t il, F size_of) {
+        if (!rb.active()) {
+            return false;
+        }
+        const int64_t i = rb.at_layer(il);
+        if (i < 0) {
+            rb.drop();
+            ring_fence = true;
+            return false;
+        }
+        record_release();
+        if (!rb.plan[i].issued) {
+            int32_t n; std::vector<size_t> es; int64_t limit;
+            size_of((size_t) i, n, es, limit);
+            CHECK(rb.ring.idle(), "a layer not issued finds ranges in flight");
+            const bool ok = fill((size_t) i, n, es, limit);
+            CHECK(ok, "layer %d (%d places) does not fit an idle ring", il, n);
+            at_layer++;
+        }
+        issue(size_of);
+        const auto & e = rb.plan[i];
+        // the layer reads its own range
+        for (int32_t ip = 0; ip < n_pos && e.n > 0; ++ip) {
+            int32_t n; std::vector<size_t> es; int64_t limit;
+            size_of((size_t) i, n, es, limit);
+            for (size_t b = (size_t) e.base*es[ip]; b < (size_t) (e.base + e.n)*es[ip]; ++b) {
+                CHECK(owner[ip][b] == e.seq, "layer %d reads bytes of seq %lld instead of its own %lld", il, (long long) owner[ip][b], (long long) e.seq);
+            }
+        }
+        rb.consume((size_t) i);
+        max_ahead_seen = std::max(max_ahead_seen, rb.ahead());
+        ahead_sum += rb.ahead();
+        layers++;
+        return true;
+    }
+
+    void end() {
+        record_release();
+    }
+};
+
+static void test_bytes(std::mt19937 & rng) {
+    size_t n_wraps = 0, n_waits = 0, n_forced = 0, n_drops = 0, n_graphs = 0;
+    for (int it = 0; it < 3000; ++it) {
+        const int32_t n_pos   = 1 + rng() % 3;
+        const int32_t n_group = 1 + rng() % 3;
+        // per group the bytes of a place in each ring (Flash-Next: gate/up equal, down Q5_1 or Q8_0)
+        std::vector<std::vector<size_t>> es(n_group, std::vector<size_t>(n_pos));
+        for (auto & g : es) {
+            for (auto & x : g) {
+                x = 1 + rng() % 9;
+            }
+        }
+        std::vector<int32_t> cap(n_group);
+        std::vector<size_t> size(n_pos, 0);
+        for (int32_t g = 0; g < n_group; ++g) {
+            cap[g] = 1 + rng() % 20;
+        }
+        // at least two slots of the largest layer, sometimes much more
+        const int32_t mult = 2 + (rng() % 4 == 0 ? rng() % 6 : 0);
+        for (int32_t ip = 0; ip < n_pos; ++ip) {
+            for (int32_t g = 0; g < n_group; ++g) {
+                size[ip] = std::max(size[ip], (size_t) mult*(cap[g] + 1)*es[g][ip] + rng() % 7);
+            }
+        }
+        std::vector<int64_t> limit(n_group);
+        for (int32_t g = 0; g < n_group; ++g) {
+            limit[g] = INT64_MAX;
+            for (int32_t ip = 0; ip < n_pos; ++ip) {
+                limit[g] = std::min<int64_t>(limit[g], (int64_t) (size[ip]/es[g][ip]));
+            }
+            // the staging tensors may hold fewer places than the bytes (the backend pads a tensor's allocation)
+            limit[g] -= rng() % 2;
+        }
+        const int32_t n_layer = 1 + rng() % 14;
+        std::vector<int32_t> group_of(n_layer);
+        for (auto & g : group_of) {
+            g = rng() % n_group;
+        }
+        sim_bytes d(size, 1 + rng() % 40);
+        for (int graph = 0; graph < 8; ++graph) {
+            n_graphs++;
+            // places per layer in this graph: its misses (0 .. cap) + zeros, decided at issue (the cache does not change in a graph)
+            std::vector<int32_t> places(n_layer);
+            for (auto & p : places) {
+                const int32_t g = group_of[&p - places.data()];
+                const int32_t u = rng() % 5 == 0 ? 0 : (int32_t) (rng() % (cap[g] + 1));
+                p = u == 0 ? 0 : u + 1;
+            }
+            std::vector<llama_moe_ring_bytes_sched::entry> plan;
+            for (int32_t il = 0; il < n_layer; ++il) {
+                if (rng() % 8 == 0) {
+                    continue; // not staged in this graph
+                }
+                llama_moe_ring_bytes_sched::entry e;
+                e.il   = il;
+                e.full = rng() % 6 != 0;
+                plan.push_back(e);
+            }
+            if (rng() % 10 == 0) {
+                plan.clear(); // a graph without the ring
+            }
+            if (rng() % 7 == 0) {
+                d.ring_fence = true; // fills, borrow, decode memory switch
+            }
+            auto size_of = [&](size_t i, int32_t & n, std::vector<size_t> & e_s, int64_t & lim) {
+                const int32_t il = d.rb.plan[i].il;
+                n   = places[il];
+                e_s = es[group_of[il]];
+                lim = limit[group_of[il]];
+            };
+            d.begin(plan);
+            d.issue(size_of);
+            for (size_t k = 0; k < plan.size(); ++k) {
+                int32_t il = plan[k].il;
+                if (rng() % 60 == 0) {
+                    il = (il + 1) % n_layer; // not the planned layer: the ring is dropped
+                }
+                if (!d.layer(il, size_of)) {
+                    n_drops++;
+                    break;
+                }
+            }
+            d.end();
+        }
+        n_wraps += d.wraps; n_waits += d.waits; n_forced += d.forced;
+    }
+    CHECK(n_wraps > 1000 && n_waits > 1000 && n_drops > 100, "coverage: %zu wraps, %zu waits, %zu forced, %zu drops in %zu graphs",
+        n_wraps, n_waits, n_forced, n_drops, n_graphs);
+
+    // event reuse: one small layer over a long stream of graphs without fences, ranges overlapped only rarely
+    {
+        sim_bytes d({ 1000 }, 32);
+        for (int graph = 0; graph < 400; ++graph) {
+            std::vector<llama_moe_ring_bytes_sched::entry> plan;
+            for (int32_t il = 0; il < 3; ++il) {
+                plan.push_back({ il, true });
+            }
+            auto size_of = [&](size_t i, int32_t & n, std::vector<size_t> & e_s, int64_t & lim) {
+                n = i == 0 ? 2 : 1; e_s.assign(1, 1); lim = 1000;
+            };
+            d.begin(plan);
+            d.issue(size_of);
+            for (int32_t il = 0; il < 3; ++il) {
+                d.layer(il, size_of);
+            }
+            d.end();
+        }
+        CHECK(d.forced > 0, "no release event was reused (forced %zu)", d.forced);
+    }
+
+    // Flash-Next-like: a ring of two slots of cap + 1 places, layers with about half the cap uncached: more than one layer ahead
+    {
+        const int32_t capf = 410;
+        sim_bytes d({ (size_t) 2*(capf + 1)*3, (size_t) 2*(capf + 1)*3, (size_t) 2*(capf + 1)*4 }, 32);
+        for (int graph = 0; graph < 6; ++graph) {
+            std::vector<llama_moe_ring_bytes_sched::entry> plan;
+            for (int32_t il = 0; il < 12; ++il) {
+                plan.push_back({ il, true });
+            }
+            auto size_of = [&](size_t, int32_t & n, std::vector<size_t> & e_s, int64_t & lim) {
+                n = 200 + 1; e_s.assign({ 3, 3, 4 }); lim = (int64_t) 2*(capf + 1);
+            };
+            d.begin(plan);
+            d.issue(size_of);
+            for (int32_t il = 0; il < 12; ++il) {
+                d.layer(il, size_of);
+            }
+            d.end();
+        }
+        CHECK(d.max_ahead_seen >= 3 && d.at_layer == 0, "Flash-Next-like ring: at most %zu layers ahead, %zu at their layer", d.max_ahead_seen, d.at_layer);
+        printf("test-moe-ring: bytes ring, 2 slots of 411 places, 200 misses a layer: %.2f layers ahead on average, max %zu\n",
+            (double) d.ahead_sum/d.layers, d.max_ahead_seen);
+    }
+
+    // the map of an in-place plan placed in the ring
+    for (int it = 0; it < 2000; ++it) {
+        const int32_t n_expert = 2 + rng() % 40;
+        const int32_t n_slots  = 1 + rng() % 40;
+        std::vector<int32_t> slots(n_expert), key_of(n_slots, -1);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            slots[e] = rng() % 2 ? (int32_t) (rng() % n_slots) : n_slots;
+        }
+        for (auto & k : key_of) {
+            k = rng() % 3 ? 0 : -1;
+        }
+        const int32_t capi = rng() % (n_expert + 1);
+        llama_moe_ring_inplace ip;
+        if (!ip.plan(slots.data(), n_slots, key_of.data(), n_expert, nullptr, nullptr, capi, true, rng() % 2)) {
+            continue;
+        }
+        const auto map0 = ip.map;
+        const int32_t base = rng() % 100, hostp = base + capi + 1 + rng() % 50;
+        ip.place(base, hostp);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (map0[e] >= 0) {
+                CHECK(ip.map[e] == map0[e], "placed map changed a cache slot");
+            } else if (map0[e] == -1 - capi) {
+                CHECK(ip.map[e] == -1 - hostp, "placed map: host read not past all places");
+            } else {
+                CHECK(ip.map[e] == -1 - (base + (-1 - map0[e])), "placed map: staging place not moved by base");
+                CHECK(-1 - ip.map[e] < hostp, "placed map: staging place past the host code");
+            }
+        }
+    }
+    printf("test-moe-ring: bytes ring coverage %zu wraps, %zu waits, %zu forced, %zu drops in %zu graphs\n", n_wraps, n_waits, n_forced, n_drops, n_graphs);
+}
+
 int main() {
     std::mt19937 rng(42);
     test_sched(rng);
     test_lookahead();
     test_copies(rng);
     test_inplace(rng);
+    test_bytes(rng);
     if (fails == 0) {
         printf("test-moe-ring: all OK\n");
     } else {

@@ -12650,6 +12650,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 24, 40, false, 8, false, 128, 512, 512)); // no host
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 128, 600, 100, 20, true, 10, true, 128, 384, 512)); // bank >> experts
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 512, 1500, 120, 300, true, 10, false, 128, 1024, 512)); // Flash-Next shape
+    // LLAMA_MOE_RING_BYTES: the staging tensor is the whole byte ring, more places than experts, the staged ones anywhere in it
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 16, 200, true, 8, true, 128, 512, 512));
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 64, 96, 16, 200, true, 8, false, 256, 512, 640));
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 512, 1500, 120, 822, true, 10, false, 128, 1024, 512)); // Flash-Next ring
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
