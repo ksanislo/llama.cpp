@@ -144,10 +144,11 @@ static __global__ void mm_ids_helper_par(
     const int warp   = threadIdx.y;
     const int lane   = threadIdx.x;
 
+    // all dynamic: static shared memory would lower the dynamic limit below smpbo (cudaFuncSetAttribute: invalid argument)
     extern __shared__ char data_mm_ids_helper[];
-    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
-    __shared__ int warp_count[nwarps];
-    __shared__ int warp_prev[nwarps];
+    int * warp_count = (int *) data_mm_ids_helper;
+    int * warp_prev  = warp_count + nwarps;
+    mm_ids_helper_store * store = (mm_ids_helper_store *) (warp_prev + nwarps);
 
     const int chunk = ((n_tokens + nwarps - 1)/nwarps + tpi - 1)/tpi * tpi;
     const int it_lo = min(warp*chunk, n_tokens);
@@ -227,8 +228,8 @@ static void launch_mm_ids_helper_par(
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
     CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper_par<n_expert_used_template, nwarps>), smpbo);
 
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
-    GGML_ASSERT(nbytes_shared + 2*nwarps*sizeof(int) <= smpbo);
+    const size_t nbytes_shared = 2*nwarps*sizeof(int) + n_tokens*sizeof(mm_ids_helper_store);
+    GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper_par<n_expert_used_template, nwarps><<<dim3(n_experts, 1, 1), dim3(warp_size, nwarps, 1), nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
 }
