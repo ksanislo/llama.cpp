@@ -1285,6 +1285,45 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    // the MoE cache plans the device memory of the main context at its creation; the draft / MTP context comes later, so its
+    // memory (measured like the fit does, without allocating) is left free on each device (LLAMA_MOE_CACHE_RESERVE_DRAFT=0: not)
+    std::vector<size_t> moe_reserve;
+    const char * env_rd = getenv("LLAMA_MOE_CACHE_RESERVE_DRAFT");
+    const bool spec_mtp_any = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (params.moe_cache_size > 0 && !model_only && (params.speculative.has_dft() || spec_mtp_any) && (env_rd == nullptr || atoi(env_rd) != 0)) {
+        common_params params_dft = common_base_params_to_speculative(params);
+        auto mparams_dft = common_model_params_to_llama(params_dft);
+        auto cparams_dft = common_context_params_to_llama(params_dft);
+        if (spec_mtp_any) {
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        }
+        cparams_dft.n_rs_seq       = 0;
+        cparams_dft.moe_cache_size = 0;
+        const bool shares_model = !params.speculative.has_dft(); // an MTP context runs on the weights of the main model
+        std::vector<ggml_backend_dev_t> devs_dft;
+        uint32_t ngl = 0, nct = 0, nex = 0;
+        try {
+            const auto dmd = common_get_device_memory_data(params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                devs_dft, ngl, nct, nex, GGML_LOG_LEVEL_ERROR);
+            moe_reserve.assign(ggml_backend_dev_count(), 0);
+            for (size_t je = 0; je < devs_dft.size() && je < dmd.size(); ++je) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    if (ggml_backend_dev_get(i) == devs_dft[je]) {
+                        moe_reserve[i] += (shares_model ? 0 : dmd[je].model) + dmd[je].context + dmd[je].compute;
+                        if (moe_reserve[i] > 0) {
+                            LOG_INF("%s: %s: %.2f MiB left free by the MoE cache for the draft / MTP context\n", __func__,
+                                ggml_backend_dev_name(devs_dft[je]), moe_reserve[i]/1024.0/1024.0);
+                        }
+                    }
+                }
+            }
+            cparams.moe_cache_reserve = moe_reserve.data();
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: could not measure the draft / MTP context for the MoE cache plan: %s\n", __func__, e.what());
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;

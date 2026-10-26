@@ -30,6 +30,7 @@ struct llama_moe_cache_compute {
     bool measure = false;
     std::vector<size_t> large; // [backends] compute buffer of the worst-case batch
     std::vector<size_t> small; // [backends] compute buffer of a small batch (LLAMA_MOE_DECODE_MEM_TOKENS)
+    std::vector<size_t> reserve; // [backends] memory to leave free (llama_context_params::moe_cache_reserve)
 };
 
 class llama_moe_cache {
@@ -52,6 +53,8 @@ public:
     float compact_ratio() const;
     // ggml_backend_sched alloc callback: back the compute memory the graph uses, lending the cache's tails for large batches
     void on_alloc(ggml_backend_sched_t sched);
+    // a graph was built only to reserve memory (no alloc callback follows): forget what it read
+    void reserved();
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;

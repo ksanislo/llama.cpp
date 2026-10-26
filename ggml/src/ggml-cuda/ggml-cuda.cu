@@ -1140,6 +1140,46 @@ size_t ggml_backend_cuda_vmm_buffer_release(ggml_backend_buffer_t buffer, size_t
 #endif
 }
 
+// release / commit through the device's spare granules: memory moved between buffers of one device keeps its physical
+// granules (no cuMemCreate / cuMemRelease); ggml_backend_cuda_vmm_spare_trim frees what is left over
+size_t ggml_backend_cuda_vmm_buffer_release_spare(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    ggml_cuda_vmm_region * vmm = ggml_backend_cuda_buffer_get_vmm(buffer);
+    return vmm ? ggml_cuda_vmm_region_release_spare(vmm, offset, size) : 0;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return 0;
+#endif
+}
+
+bool ggml_backend_cuda_vmm_buffer_commit_spare(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool zero) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    ggml_cuda_vmm_region * vmm = ggml_backend_cuda_buffer_get_vmm(buffer);
+    return vmm ? ggml_cuda_vmm_region_commit_spare(vmm, offset, size, zero) : true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    GGML_UNUSED(zero);
+    return true;
+#endif
+}
+
+size_t ggml_backend_cuda_vmm_spare_trim(ggml_backend_buffer_type_t buft) {
+#if defined(GGML_CUDA_VMM_BUFFER)
+    if (!ggml_backend_buft_is_cuda(buft)) {
+        return 0;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    return ggml_cuda_vmm_spare_trim(ggml_cuda_get_physical_device(device));
+#else
+    GGML_UNUSED(buft);
+    return 0;
+#endif
+}
+
 size_t ggml_backend_cuda_vmm_buffer_get_backed_size(ggml_backend_buffer_t buffer) {
 #if defined(GGML_CUDA_VMM_BUFFER)
     ggml_cuda_vmm_region * vmm = ggml_backend_cuda_buffer_get_vmm(buffer);
@@ -6859,6 +6899,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_vmm_buffer_release") == 0) {
         return (void *)ggml_backend_cuda_vmm_buffer_release;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_release_spare") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_release_spare;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_commit_spare") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_commit_spare;
+    }
+    if (strcmp(name, "ggml_backend_vmm_spare_trim") == 0) {
+        return (void *)ggml_backend_cuda_vmm_spare_trim;
     }
     if (strcmp(name, "ggml_backend_vmm_buffer_get_backed_size") == 0) {
         return (void *)ggml_backend_cuda_vmm_buffer_get_backed_size;

@@ -682,9 +682,9 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
 
 // BEGIN moe_cache_plan (extracted by the CPU harness)
 // slots a group keeps below its lent tail and the staging slots borrowed under it: the cache path of the largest batch it
-// serves (up to n_used_batch distinct experts, at most a layer's) and the transient slots (at most n_slots/8)
-static int32_t moe_cache_keep_slots(int32_t n_expert, int64_t n_used_batch, int32_t n_slots) {
-    return (int32_t) std::min<int64_t>(n_expert, n_used_batch) + n_slots/8;
+// serves (up to n_used_batch distinct experts, at most a layer's) and its transient slots (adaptive policy, else 0)
+static int32_t moe_cache_keep_slots(int32_t n_expert, int64_t n_used_batch, int32_t n_transient) {
+    return (int32_t) std::min<int64_t>(n_expert, n_used_batch) + n_transient;
 }
 
 // the slots a group needs so that batches of n_used_batch selected experts take the cache path (use_cache) beside the transient slots
@@ -889,6 +889,7 @@ struct llama_moe_cache::impl {
         size_t  plan_stage_own = 0;
         double  fit_cut        = 0.0;
         double  fit_last_cut   = 0.0;
+        std::vector<std::pair<size_t, double>> fit_saved; // (group, budget) before the last cut
         double  fit_excess     = 0.0;
         bool    fit_stuck      = false;
 
@@ -957,6 +958,7 @@ struct llama_moe_cache::impl {
         int32_t lend_first = 0;
         std::vector<std::pair<size_t, size_t>> lend_ranges; // (offset, size) in the device buffer, whole granules
         std::vector<size_t> bank_offs;                 // offset of each bank in the device buffer
+        bool tail_out = false;                         // the tail stayed out after a give (no memory to back it), see dm_switch
         std::vector<std::pair<int32_t, int32_t>> refill; // (layer, expert) hottest first, uploaded into the returned slots
         size_t refill_pos = 0;
     };
@@ -1200,8 +1202,12 @@ struct llama_moe_cache::impl {
         size_t committed = 0;                        // backed prefix of cbuf
         bool   lent      = false;                    // the bank tails are released
         int32_t n_small  = 0;                        // small graphs in a row while lent
+        int32_t n_retry  = 0;                        // small graphs while not lent (retry of the tails that stayed out)
         size_t used_small_max = 0;
         size_t used_large_max = 0;
+    };
+    struct dm_cost { // microseconds, all switches
+        int64_t sync = 0, evict = 0, tail = 0, comp = 0, stage = 0, rest = 0;
     };
     struct dm_stats {
         size_t  takes    = 0;
@@ -1214,6 +1220,9 @@ struct llama_moe_cache::impl {
         size_t  refilled = 0;
         size_t  refill_bytes  = 0;
         size_t  refill_graphs = 0;
+        size_t  tails_out = 0;   // group tails a give could not back
+        dm_cost take_cost;
+        dm_cost give_cost;
     };
     typedef ggml_backend_buffer_t      (*vmm_alloc_t)(ggml_backend_buffer_type_t, size_t);
     typedef bool                       (*vmm_commit_t)(ggml_backend_buffer_t, size_t, size_t);
@@ -1227,6 +1236,13 @@ struct llama_moe_cache::impl {
     vmm_alloc_t   vmm_alloc   = nullptr;
     vmm_commit_t  vmm_commit  = nullptr;
     vmm_release_t vmm_release = nullptr;
+    // spare granules: the memory moves between the banks, the compute buffer and the staging slots without cuMemCreate/Release
+    typedef size_t (*vmm_release_spare_t)(ggml_backend_buffer_t, size_t, size_t);
+    typedef bool   (*vmm_commit_spare_t)(ggml_backend_buffer_t, size_t, size_t, bool);
+    typedef size_t (*vmm_trim_t)(ggml_backend_buffer_type_t);
+    vmm_release_spare_t vmm_release_spare = nullptr;
+    vmm_commit_spare_t  vmm_commit_spare  = nullptr;
+    vmm_trim_t          vmm_trim          = nullptr;
     std::vector<dm_device> dm_devs;
     dm_stats stats_dm;
     bool dm_warned = false;
@@ -1428,7 +1444,7 @@ struct llama_moe_cache::impl {
                 break;
             }
         }
-        fit_report();
+        fit_report(compute);
 
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
@@ -1908,6 +1924,14 @@ struct llama_moe_cache::impl {
             vmm_alloc   = alloc;
             vmm_commit  = commit;
             vmm_release = release;
+            vmm_release_spare = (vmm_release_spare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_release_spare");
+            vmm_commit_spare  = (vmm_commit_spare_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_commit_spare");
+            vmm_trim          = (vmm_trim_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_spare_trim");
+            if (!vmm_release_spare || !vmm_commit_spare || !vmm_trim) {
+                vmm_release_spare = nullptr;
+                vmm_commit_spare  = nullptr;
+                vmm_trim          = nullptr;
+            }
             dm.gran  = g;
             dm.cbuft = cb;
             dm.large = compute.large[d.ib];
@@ -1958,6 +1982,20 @@ struct llama_moe_cache::impl {
 
     int64_t n_used_batch() const {
         return max_batch*n_expert_used;
+    }
+
+    // the transient slots init_policy will give a group of n slots (LLAMA_MOE_CACHE_POLICY=adaptive without device hits)
+    int32_t transient_slots(int32_t n) const {
+        const char * pol = getenv("LLAMA_MOE_CACHE_POLICY");
+        const bool ad = pol != nullptr && (strcmp(pol, "adaptive") == 0 || strcmp(pol, "1") == 0) && cpu_share <= 0.0f;
+        if (!ad) {
+            return 0;
+        }
+        const char * dh_env = getenv("LLAMA_MOE_DEVICE_HITS");
+        const bool dh = dh_env != nullptr && atoi(dh_env) > 0;
+        const char * tr_env = getenv("LLAMA_MOE_CACHE_TRANSIENT");
+        const int32_t want = std::max(0, tr_env != nullptr && *tr_env != '\0' ? atoi(tr_env) : (dh ? 0 : 2*n_expert_used));
+        return std::min(want, n/8);
     }
 
     // every group gets the slots for the cache path of max_batch tokens, from the larger groups of its device: a group of one
@@ -2075,7 +2113,7 @@ struct llama_moe_cache::impl {
                     const int32_t k = moe_cache_stage_slots(bank_nb(g), sec, n_stage);
                     // lending: room for the slots kept, the staging slots and one for the alignment of their start below the tail;
                     // otherwise the staging slots end at the last slot (plan_borrow)
-                    const int32_t need = lends ? moe_cache_keep_slots(g.ref[0]->ne[2], n_used_batch(), g.n_slots) + k + 1 : k + 1;
+                    const int32_t need = lends ? moe_cache_keep_slots(g.ref[0]->ne[2], n_used_batch(), transient_slots(g.n_slots)) + k + 1 : k + 1;
                     if (g.n_slots >= need) {
                         d.plan_lender  = ig;
                         d.plan_stage_k = k;
@@ -2111,7 +2149,7 @@ struct llama_moe_cache::impl {
                     }
                 }
                 p.n_slots   = g.n_slots;
-                p.min_first = moe_cache_keep_slots(g.ref[0]->ne[2], n_used_batch(), g.n_slots) +
+                p.min_first = moe_cache_keep_slots(g.ref[0]->ne[2], n_used_batch(), transient_slots(g.n_slots)) +
                     ((int32_t) ig == d.plan_lender ? d.plan_stage_k + 1 : 0);
                 p.lend      = g.lend;
                 igs.push_back(ig);
@@ -2127,18 +2165,28 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // the planned peak of each device against its free memory (with a margin for the CUDA pools, LLAMA_MOE_CACHE_MARGIN_MIB, 512);
+    // the planned peak of each device against its free memory (with a margin for the CUDA pools and contexts loaded later,
+    // LLAMA_MOE_CACHE_MARGIN_MIB, 512, or a comma list by device);
     // a device over it has its budget cut by the excess, true if any was cut (plan again). A cut that did not lower the peak
     // (the slots kept under the lent tails and the staging slots, not the budget, set it) is undone and the device left as it is.
     bool fit(const llama_moe_cache_compute & compute) {
         if (compute.large.empty()) {
             return false;
         }
+        // one value for every device, or a comma list by device (e.g. room for an MTP draft context loaded after this one)
         const char * env_m = getenv("LLAMA_MOE_CACHE_MARGIN_MIB");
         if (env_m == nullptr) {
             env_m = getenv("LLAMA_MOE_CACHE_SPLIT_MARGIN_MIB");
         }
-        const double margin = (env_m ? std::max(0.0, atof(env_m)) : 512.0)*1024.0*1024.0;
+        std::vector<double> margins;
+        for (const char * p = env_m; p != nullptr && *p != '\0'; ) {
+            margins.push_back(std::max(0.0, atof(p))*1024.0*1024.0);
+            p = strchr(p, ',');
+            p = p ? p + 1 : nullptr;
+        }
+        auto margin_of = [&](size_t id) {
+            return margins.empty() ? 512.0*1024.0*1024.0 : margins[std::min(id, margins.size() - 1)];
+        };
         bool again = false;
         for (size_t id = 0; id < devices.size(); ++id) {
             device & d = devices[id];
@@ -2154,7 +2202,8 @@ struct llama_moe_cache::impl {
             const bool lends = dm_on && id < dm_devs.size() && dm_devs[id].lend > 0;
             const size_t small = lends ? dm_devs[id].small : compute.small[d.ib];
             const size_t stage_lent = lends ? dm_devs[id].stage : 0;
-            const double peak = (double) moe_cache_plan_peak(d.plan_total, d.plan_lent, d.plan_stage_own, stage_lent, compute.large[d.ib], small, lends) + margin;
+            const double peak = (double) moe_cache_plan_peak(d.plan_total, d.plan_lent, d.plan_stage_own, stage_lent, compute.large[d.ib], small, lends) + margin_of(id) +
+                (double) (compute.reserve.size() > d.ib ? compute.reserve[d.ib] : 0);
             const double excess = peak - (double) free;
             if (excess <= 0.0) {
                 continue;
@@ -2174,21 +2223,27 @@ struct llama_moe_cache::impl {
                     sum += g.budget;
                 }
             }
-            if (d.fit_excess > 0.0 && excess > d.fit_excess - d.fit_last_cut/2) {
-                // the last cut did not help: undo it
-                for (size_t ig : igs) {
-                    groups[ig].budget *= (sum + d.fit_last_cut)/std::max(sum, 1.0);
+            const bool no_help = d.fit_excess > 0.0 && d.fit_excess - excess < std::min(64.0*1024.0*1024.0, d.fit_last_cut/4);
+            if (no_help || sum <= 0.0) {
+                // the last cut did not help: undo it; or nothing is left to cut; the device stays over
+                if (!no_help) {
+                    d.fit_saved.clear();
                 }
-                LLAMA_LOG_WARN("%s: %s: the MoE cache plan needs %.2f MiB more than the device has free and a smaller cache does not lower "
-                    "that (the slots kept under the lent tails and the staging slots set it): lower -ub or LLAMA_MOE_CACHE_MARGIN_MIB\n",
-                    __func__, ggml_backend_name(d.backend), d.fit_excess/1024.0/1024.0);
-                d.fit_cut  -= d.fit_last_cut;
+                for (const auto & sv : d.fit_saved) {
+                    groups[sv.first].budget = sv.second;
+                }
+                LLAMA_LOG_WARN("%s: %s: the MoE cache plan needs %.2f MiB more than the device has free, and a smaller cache does not "
+                    "lower that: the compute buffer of -ub, the staging slots, the slots kept below the lent tails and the memory left "
+                    "for a draft / MTP context (--cpu-moe-draft keeps its experts in host memory) set it\n",
+                    __func__, ggml_backend_name(d.backend), excess/1024.0/1024.0);
+                d.fit_cut  -= d.fit_saved.empty() ? 0.0 : d.fit_last_cut;
                 d.fit_stuck = true;
-                again = true;
+                again = !d.fit_saved.empty();
                 continue;
             }
-            if (sum <= 0.0) {
-                continue;
+            d.fit_saved.clear();
+            for (size_t ig : igs) {
+                d.fit_saved.push_back({ ig, groups[ig].budget });
             }
             const double cut = std::min(excess + 16.0*1024.0*1024.0, sum); // a little more: whole slots and granules
             for (size_t ig : igs) {
@@ -2205,8 +2260,12 @@ struct llama_moe_cache::impl {
         return again;
     }
 
-    void fit_report() const {
+    void fit_report(const llama_moe_cache_compute & compute) const {
         for (const device & d : devices) {
+            if (compute.reserve.size() > d.ib && compute.reserve[d.ib] > 0 && d.host_bytes > 0) {
+                LLAMA_LOG_INFO("%s: %s: the MoE cache plan leaves %.2f MiB free for a context created later (draft / MTP)\n", __func__,
+                    ggml_backend_name(d.backend), compute.reserve[d.ib]/1024.0/1024.0);
+            }
             if (d.fit_cut > 0.0) {
                 LLAMA_LOG_WARN("%s: %s: the MoE cache is %.2f MiB smaller than its share of --moe-cache-mib, so that the cache, its lent "
                     "tail, the staging slots and the compute buffers fit the device's free memory\n", __func__,
@@ -2990,7 +3049,7 @@ struct llama_moe_cache::impl {
         // with misses on the CPU, the n_zero slots after the cached ones must stay zero, so the staging slots end before them
         const bool lends = g.lend_first < g.n_slots;
         const int32_t end = lends ? g.lend_first : n_zero > 0 ? g.n_slots : g.n_slots + 1;
-        const int32_t min_first = lends ? moe_cache_keep_slots(g.ref[0]->ne[2], n_used_batch(), g.n_slots) : 0;
+        const int32_t min_first = lends ? moe_cache_keep_slots(g.ref[0]->ne[2], n_used_batch(), transient_slots(g.n_slots)) : 0;
         for (int32_t k = moe_cache_stage_slots(bank_nb(g), sec, n_stage); k <= g.n_slots && end - k >= min_first; ++k) {
             const int32_t first = end - k;
             bool fits = true;
@@ -3522,8 +3581,19 @@ struct llama_moe_cache::impl {
                     if (++dm.n_small >= dm_return_after) {
                         give.push_back(id);
                     }
-                } else if (dm.committed < std::min(dm.small, bsize)) {
-                    dm_commit_compute(id, std::min(dm.small, bsize));
+                } else {
+                    if (dm.committed < std::min(dm.small, bsize)) {
+                        dm_commit_compute(id, std::min(dm.small, bsize));
+                    }
+                    if (++dm.n_retry % 64 == 0) {
+                        bool out = false;
+                        for (const group & g : groups) {
+                            out = out || (g.id == (int32_t) id && g.tail_out);
+                        }
+                        if (out) {
+                            dm_retry_tails(id); // the VMM calls synchronize the device; the tails are out of every map
+                        }
+                    }
                 }
             } else {
                 dm.used_large_max = std::max(dm.used_large_max, used);
@@ -3552,7 +3622,7 @@ struct llama_moe_cache::impl {
         if (end <= dm.committed) {
             return;
         }
-        if (!vmm_commit(dm.cbuf, dm.committed, end - dm.committed)) {
+        if (!dm_commit(dm.cbuf, dm.committed, end - dm.committed)) {
             GGML_ABORT("%s: cannot back %.2f MiB of the compute buffer of %s (LLAMA_MOE_DECODE_MEM): a smaller --moe-cache-mib or "
                 "LLAMA_MOE_DECODE_MEM_SPARE_MIB leaves room", __func__, (end - dm.committed)/1024.0/1024.0, ggml_backend_name(devices[id].backend));
         }
@@ -3786,14 +3856,74 @@ struct llama_moe_cache::impl {
     }
     // END decode_mem slots
 
+    // memory moves between buffers of a device: through the spare granules when the backend has them (no cuMemCreate/Release,
+    // no zeroing); the spares left over after a give are freed by dm_trim
+    size_t dm_release(ggml_backend_buffer_t buf, size_t off, size_t size) {
+        return vmm_release_spare ? vmm_release_spare(buf, off, size) : vmm_release(buf, off, size);
+    }
+    bool dm_commit(ggml_backend_buffer_t buf, size_t off, size_t size) {
+        return vmm_commit_spare ? vmm_commit_spare(buf, off, size, false) : vmm_commit(buf, off, size);
+    }
+    void dm_trim(const device & d) {
+        if (vmm_trim) {
+            vmm_trim(d.buft);
+        }
+    }
+
+    // back a group's tail again; false (nothing backed) if the device has no memory for it
+    bool dm_back_tail(device & d, const group & g) {
+        for (size_t i = 0; i < g.lend_ranges.size(); ++i) {
+            if (!dm_commit(d.buf.get(), g.lend_ranges[i].first, g.lend_ranges[i].second)) {
+                for (size_t j = 0; j < i; ++j) {
+                    dm_release(d.buf.get(), g.lend_ranges[j].first, g.lend_ranges[j].second);
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // a tail that stayed out after a give (another context took the memory meanwhile, e.g. an MTP draft context) is backed
+    // again once there is room, tried every 64 small graphs
+    void dm_retry_tails(size_t id) {
+        device & d = devices[id];
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
+        bool any = false;
+        for (group & g : groups) {
+            if (g.id == (int32_t) id && g.tail_out) {
+                size_t bytes = 0;
+                for (const auto & r : g.lend_ranges) {
+                    bytes += r.second;
+                }
+                if (bytes > free || !dm_back_tail(d, g)) {
+                    break;
+                }
+                free -= bytes;
+                g.tail_out = false;
+                dm_return_tail(g);
+                any = true;
+            }
+        }
+        dm_trim(d);
+        if (any) {
+            LLAMA_LOG_INFO("%s: %s: the MoE cache tails that stayed out are backed again\n", __func__, ggml_backend_name(d.backend));
+            if (id < dh_devs.size() && !dh_devs[id].rows.empty()) {
+                dh_devs[id].resync = true;
+            }
+        }
+    }
+
     void dm_switch(ggml_backend_sched_t sched, const std::vector<size_t> & take, const std::vector<size_t> & give, const std::vector<size_t> & need) {
         const int64_t t0 = ggml_time_us();
         dm_sync_all(sched);
+        const int64_t t_sync = ggml_time_us();
 
         for (size_t id : take) {
             dm_flush_fills(id);
             for (group & g : groups) {
-                if (g.id == (int32_t) id) {
+                if (g.id == (int32_t) id && !g.tail_out) {
                     dm_evict_tail(g);
                 }
             }
@@ -3801,59 +3931,77 @@ struct llama_moe_cache::impl {
                 dh_devs[id].resync = true;
             }
         }
+        const int64_t t_evict = ggml_time_us();
 
-        // the memory moves between the banks and the compute buffer, one thread per device (the VMM calls synchronize the device)
+        // the memory moves between the banks and the compute buffer, one thread per device (the VMM calls synchronize the device;
+        // the moves of dm_evict_tail are queued on the compute stream and done by the first of them)
         std::vector<std::string> err(devices.size());
         std::vector<size_t> released(devices.size(), 0);
+        std::vector<int64_t> us_tail(devices.size(), 0);
+        std::vector<int64_t> us_comp(devices.size(), 0);
+        std::vector<int64_t> us_stage(devices.size(), 0);
+        std::vector<std::vector<size_t>> out(devices.size()); // groups whose tail stays out
         auto work = [&](size_t id, bool is_take) {
             device & d = devices[id];
             dm_device & dm = dm_devs[id];
+            int64_t t = ggml_time_us();
+            auto lap = [&t](int64_t & acc) {
+                const int64_t now = ggml_time_us();
+                acc += now - t;
+                t = now;
+            };
             if (is_take) {
                 for (const group & g : groups) {
                     if (g.id == (int32_t) id) {
                         for (const auto & r : g.lend_ranges) {
-                            released[id] += vmm_release(d.buf.get(), r.first, r.second);
+                            released[id] += dm_release(d.buf.get(), r.first, r.second);
                         }
                     }
                 }
-                if (need[id] > dm.committed && !vmm_commit(dm.cbuf, dm.committed, need[id] - dm.committed)) {
+                lap(us_tail[id]);
+                if (need[id] > dm.committed && !dm_commit(dm.cbuf, dm.committed, need[id] - dm.committed)) {
                     err[id] = "cannot back the compute buffer of a large batch";
                     return;
                 }
                 dm.committed = std::max(dm.committed, need[id]);
+                lap(us_comp[id]);
                 if (dm.stage > 0 && d.buf_stage) {
-                    // the ring's staging slots; zeros like a new buffer (the MMQ reads past the last expert of a slot)
-                    if (!vmm_commit(d.buf_stage.get(), 0, dm.stage)) {
+                    // the ring writes every expert of a slot before a matmul reads it; past the last one the MMQ reads rows it
+                    // does not keep, so the slots need no zeroing
+                    if (!dm_commit(d.buf_stage.get(), 0, dm.stage)) {
                         err[id] = "cannot back the staging slots of a large batch";
                         return;
                     }
-                    ggml_backend_buffer_clear(d.buf_stage.get(), 0);
                 }
+                lap(us_stage[id]);
                 dm.lent = true;
             } else {
                 const size_t keep = std::min(dm.small, ggml_backend_buffer_get_size(dm.cbuf));
-                vmm_release(dm.cbuf, keep, SIZE_MAX/4); // up to the end of the address space
+                dm_release(dm.cbuf, keep, SIZE_MAX/4); // up to the end of the address space
                 dm.committed = std::min(dm.committed, keep);
+                lap(us_comp[id]);
                 if (dm.stage > 0 && d.buf_stage) {
-                    vmm_release(d.buf_stage.get(), 0, dm.stage);
+                    dm_release(d.buf_stage.get(), 0, dm.stage);
                 }
-                for (const group & g : groups) {
-                    if (g.id == (int32_t) id) {
-                        for (const auto & r : g.lend_ranges) {
-                            if (!vmm_commit(d.buf.get(), r.first, r.second)) {
-                                err[id] = "cannot back the MoE cache again after a large batch";
-                                return;
-                            }
-                        }
-                    }
-                }
-                if (need[id] > dm.committed && !vmm_commit(dm.cbuf, dm.committed, need[id] - dm.committed)) {
+                lap(us_stage[id]);
+                if (need[id] > dm.committed && !dm_commit(dm.cbuf, dm.committed, need[id] - dm.committed)) {
                     err[id] = "cannot back the compute buffer of a small batch";
                     return;
                 }
                 dm.committed = std::max(dm.committed, need[id]);
+                // a tail without memory (another context took it while lent) stays out of the cache, retried later
+                for (size_t ig = 0; ig < groups.size(); ++ig) {
+                    group & g = groups[ig];
+                    if (g.id == (int32_t) id && !g.tail_out && !dm_back_tail(d, g)) {
+                        out[id].push_back(ig);
+                    }
+                }
+                lap(us_tail[id]);
                 dm.lent    = false;
                 dm.n_small = 0;
+                // what the tails do not take back goes to the driver; while lent the spares stay ours (the plan counts
+                // them for the cache, a context that took them would leave the tails without memory at the give)
+                dm_trim(d);
             }
         };
         std::vector<std::pair<size_t, bool>> jobs;
@@ -3874,17 +4022,26 @@ struct llama_moe_cache::impl {
                 t.join();
             }
         }
+        const int64_t t_vmm = ggml_time_us();
         for (size_t id = 0; id < devices.size(); ++id) {
             if (!err[id].empty()) {
-                GGML_ABORT("%s: %s: %s (LLAMA_MOE_DECODE_MEM; a smaller --moe-cache-mib or a larger LLAMA_MOE_DECODE_MEM_SPARE_MIB leaves room)",
+                GGML_ABORT("%s: %s: %s (LLAMA_MOE_DECODE_MEM; a smaller --moe-cache-mib or a larger LLAMA_MOE_CACHE_MARGIN_MIB leaves room)",
                     __func__, ggml_backend_name(devices[id].backend), err[id].c_str());
             }
             stats_dm.released += released[id];
+            for (size_t ig : out[id]) {
+                groups[ig].tail_out   = true;
+                groups[ig].refill_pos = groups[ig].refill.size();
+                stats_dm.tails_out++;
+                LLAMA_LOG_WARN("%s: %s: no memory to back %d slots of the MoE cache again after a large batch (another context took it "
+                    "meanwhile): they stay out of the cache and are retried; a larger LLAMA_MOE_CACHE_MARGIN_MIB keeps room\n", __func__,
+                    ggml_backend_name(devices[id].backend), groups[ig].n_slots - groups[ig].lend_first);
+            }
         }
 
         for (size_t id : give) {
             for (group & g : groups) {
-                if (g.id == (int32_t) id) {
+                if (g.id == (int32_t) id && !g.tail_out) {
                     dm_return_tail(g);
                 }
             }
@@ -3911,14 +4068,33 @@ struct llama_moe_cache::impl {
             }
         }
 
-        const int64_t dt = ggml_time_us() - t0;
+        // cost model: host sync of every stream, the evictions (host side; their D2D moves run before the first VMM call),
+        // then per device (slowest one) the tails, the compute buffer and the staging slots
+        const int64_t t1 = ggml_time_us();
+        int64_t m_tail = 0, m_comp = 0, m_stage = 0;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            m_tail  = std::max(m_tail,  us_tail[id]);
+            m_comp  = std::max(m_comp,  us_comp[id]);
+            m_stage = std::max(m_stage, us_stage[id]);
+        }
+        dm_cost & c = take.empty() ? stats_dm.give_cost : stats_dm.take_cost;
+        c.sync  += t_sync - t0;
+        c.evict += t_evict - t_sync;
+        c.tail  += m_tail;
+        c.comp  += m_comp;
+        c.stage += m_stage;
+        c.rest  += t1 - t_vmm;
+        const int64_t dt = t1 - t0;
+        const size_t n_sw = take.empty() ? stats_dm.gives + 1 : stats_dm.takes + 1;
+        if (n_sw <= 2) {
+            LLAMA_LOG_INFO("%s: %s %zu: %zu devices in %.1f ms = sync %.1f + evict %.1f + VMM %.1f (slowest device: tails %.1f, compute %.1f, "
+                "staging %.1f) + rest %.1f ms\n", __func__, take.empty() ? "give" : "take", n_sw, jobs.size(), dt/1000.0,
+                (t_sync - t0)/1000.0, (t_evict - t_sync)/1000.0, (t_vmm - t_evict)/1000.0, m_tail/1000.0, m_comp/1000.0,
+                m_stage/1000.0, (t1 - t_vmm)/1000.0);
+        }
         if (!take.empty()) {
             stats_dm.takes++;
             stats_dm.take_us += dt;
-            if (stats_dm.takes == 1) {
-                LLAMA_LOG_INFO("%s: first large batch: %zu devices lent their cache tails to the compute buffer in %.1f ms\n", __func__,
-                    take.size(), dt/1000.0);
-            }
         } else {
             stats_dm.gives++;
             stats_dm.give_us += dt;
@@ -5095,6 +5271,17 @@ struct llama_moe_cache::impl {
                 "(%.1f ms each), %zu experts moved, %zu evicted, %zu refilled (%.2f MiB) in %zu graph-devices\n",
                 m.takes, m.takes ? m.take_us/1000.0/m.takes : 0.0, m.takes ? m.released/1024.0/1024.0/m.takes : 0.0,
                 m.gives, m.gives ? m.give_us/1000.0/m.gives : 0.0, m.moved, m.evicted, m.refilled, m.refill_bytes/1024.0/1024.0, m.refill_graphs);
+            auto cost = [](const char * what, const dm_cost & c, size_t n) {
+                if (n > 0) {
+                    LLAMA_LOG_INFO("llama_moe_cache: decode memory: %s ms each: sync %.1f, evict %.1f, tails %.1f, compute %.1f, staging %.1f, rest %.1f\n",
+                        what, c.sync/1000.0/n, c.evict/1000.0/n, c.tail/1000.0/n, c.comp/1000.0/n, c.stage/1000.0/n, c.rest/1000.0/n);
+                }
+            };
+            cost("take", m.take_cost, m.takes);
+            cost("give", m.give_cost, m.gives);
+            if (m.tails_out > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: decode memory: %zu times a group tail stayed out after a give (no memory)\n", m.tails_out);
+            }
             for (size_t id = 0; id < dm_devs.size(); ++id) {
                 const dm_device & dm = dm_devs[id];
                 if (dm.lend > 0) {
@@ -5143,6 +5330,10 @@ ggml_backend_buffer_type_t llama_moe_cache::compute_buft(ggml_backend_t backend)
 
 float llama_moe_cache::compact_ratio() const {
     return pimpl->dm_on ? pimpl->dm_compact : 0.0f;
+}
+
+void llama_moe_cache::reserved() {
+    pimpl->graph_stages = false;
 }
 
 void llama_moe_cache::on_alloc(ggml_backend_sched_t sched) {

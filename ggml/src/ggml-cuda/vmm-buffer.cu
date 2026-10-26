@@ -1,5 +1,7 @@
 #include "vmm-buffer.cuh"
 
+#include <mutex>
+
 #if defined(GGML_CUDA_VMM_BUFFER)
 
 static CUresult ggml_cuda_vmm_create(CUmemGenericAllocationHandle * handle, size_t size, int physical_device) {
@@ -74,7 +76,22 @@ void ggml_cuda_vmm_region_free(ggml_cuda_vmm_region * r) {
     delete r;
 }
 
+// spare physical granules per physical device (release_spare / commit_spare): moving memory between regions without
+// cuMemCreate / cuMemRelease, which cost most of a switch of a few GB
+static std::mutex g_vmm_spare_mtx;
+static std::vector<std::pair<CUmemGenericAllocationHandle, size_t>> g_vmm_spare[GGML_CUDA_MAX_DEVICES]; // (handle, granule size)
+
+static bool ggml_cuda_vmm_region_commit_impl(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool spare, bool zero);
+
 bool ggml_cuda_vmm_region_commit(ggml_cuda_vmm_region * r, size_t offset, size_t size) {
+    return ggml_cuda_vmm_region_commit_impl(r, offset, size, false, true);
+}
+
+bool ggml_cuda_vmm_region_commit_spare(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool zero) {
+    return ggml_cuda_vmm_region_commit_impl(r, offset, size, true, zero);
+}
+
+static bool ggml_cuda_vmm_region_commit_impl(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool spare, bool zero) {
     if (size == 0 || offset >= r->size) {
         return true;
     }
@@ -97,10 +114,29 @@ bool ggml_cuda_vmm_region_commit(ggml_cuda_vmm_region * r, size_t offset, size_t
 
     // get all the memory first, so that a failure changes nothing
     std::vector<CUmemGenericAllocationHandle> handles(todo.size());
-    for (size_t i = 0; i < todo.size(); ++i) {
+    size_t n_spare = 0;
+    if (spare) {
+        std::lock_guard<std::mutex> lock(g_vmm_spare_mtx);
+        auto & sp = g_vmm_spare[r->physical_device];
+        for (size_t i = 0; i < sp.size() && n_spare < todo.size(); ) {
+            if (sp[i].second == r->granularity) {
+                handles[n_spare++] = sp[i].first;
+                sp[i] = sp.back();
+                sp.pop_back();
+            } else {
+                i++;
+            }
+        }
+    }
+    for (size_t i = n_spare; i < todo.size(); ++i) {
         if (ggml_cuda_vmm_create(&handles[i], r->granularity, r->physical_device) != CUDA_SUCCESS) {
-            for (size_t j = 0; j < i; ++j) {
+            for (size_t j = n_spare; j < i; ++j) {
                 CU_CHECK(cuMemRelease(handles[j]));
+            }
+            std::lock_guard<std::mutex> lock(g_vmm_spare_mtx);
+            auto & sp = g_vmm_spare[r->physical_device];
+            for (size_t j = 0; j < n_spare; ++j) {
+                sp.push_back({ handles[j], r->granularity });
             }
             return false;
         }
@@ -125,7 +161,9 @@ bool ggml_cuda_vmm_region_commit(ggml_cuda_vmm_region * r, size_t offset, size_t
         CU_CHECK(cuMemSetAccess(ptr, n*r->granularity, r->access.data(), r->access.size()));
 
         // free cells are read by the attention (masked), so they must not hold NaN
-        CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, n*r->granularity, cudaStreamPerThread));
+        if (zero) {
+            CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, n*r->granularity, cudaStreamPerThread));
+        }
 
         i += n;
     }
@@ -136,7 +174,29 @@ bool ggml_cuda_vmm_region_commit(ggml_cuda_vmm_region * r, size_t offset, size_t
     return true;
 }
 
+static size_t ggml_cuda_vmm_region_release_impl(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool spare);
+
 size_t ggml_cuda_vmm_region_release(ggml_cuda_vmm_region * r, size_t offset, size_t size) {
+    return ggml_cuda_vmm_region_release_impl(r, offset, size, false);
+}
+
+size_t ggml_cuda_vmm_region_release_spare(ggml_cuda_vmm_region * r, size_t offset, size_t size) {
+    return ggml_cuda_vmm_region_release_impl(r, offset, size, true);
+}
+
+size_t ggml_cuda_vmm_spare_trim(int physical_device) {
+    std::lock_guard<std::mutex> lock(g_vmm_spare_mtx);
+    auto & sp = g_vmm_spare[physical_device];
+    size_t res = 0;
+    for (const auto & h : sp) {
+        CU_CHECK(cuMemRelease(h.first));
+        res += h.second;
+    }
+    sp.clear();
+    return res;
+}
+
+static size_t ggml_cuda_vmm_region_release_impl(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool spare) {
     if (size == 0 || offset >= r->size) {
         return 0;
     }
@@ -163,6 +223,18 @@ size_t ggml_cuda_vmm_region_release(ggml_cuda_vmm_region * r, size_t offset, siz
             synced = true;
         }
 
+        if (spare) {
+            // keep the physical granules: a handle of each, then the unmap leaves the memory allocated
+            std::vector<CUmemGenericAllocationHandle> hs(n);
+            for (size_t j = 0; j < n; ++j) {
+                CU_CHECK(cuMemRetainAllocationHandle(&hs[j], (void *) (r->base + (g + j)*r->granularity)));
+            }
+            std::lock_guard<std::mutex> lock(g_vmm_spare_mtx);
+            auto & sp = g_vmm_spare[r->physical_device];
+            for (CUmemGenericAllocationHandle h : hs) {
+                sp.push_back({ h, r->granularity });
+            }
+        }
         CU_CHECK(cuMemUnmap(r->base + g*r->granularity, n*r->granularity));
         ggml_cuda_vmm_map_zero(r, g, g + n);
 
