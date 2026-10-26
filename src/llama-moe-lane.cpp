@@ -52,8 +52,11 @@ struct llama_moe_lane::impl {
 
     std::vector<slot> slots;
 
-    ggml_backend_t backend = nullptr;
-    ggml_threadpool_t threadpool = nullptr;
+    struct pool {
+        ggml_backend_t backend = nullptr;
+        ggml_threadpool_t threadpool = nullptr;
+    };
+    std::vector<pool> pools;
     void (*threadpool_free)(ggml_threadpool_t) = nullptr;
     int n_threads = 1;
 
@@ -67,7 +70,7 @@ struct llama_moe_lane::impl {
 
     int64_t spin_us = 50000; // polling without a pause between requests, then sleeps of 100 us
 
-    std::vector<int> cpus; // empty: the default affinity
+    std::vector<int> cpus; // the polling thread's CPUs (one pool only); empty: the default affinity
 
     // pins the calling thread to cpus; with save, its old affinity is kept in old_set first
 #if defined(__linux__)
@@ -89,46 +92,58 @@ struct llama_moe_lane::impl {
     }
 #endif
 
-    impl(size_t n_slots, int n_threads, int poll, const std::vector<int> & cpus) : slots(n_slots), n_threads(std::max(1, n_threads)), cpus(cpus) {
+    impl(size_t n_slots, int n_threads, int poll, const std::vector<std::vector<int>> & pool_cpus, bool numa_affinity) :
+            slots(n_slots), n_threads(std::max(1, n_threads)) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (dev == nullptr) {
             throw std::runtime_error("MoE CPU lane: no CPU backend");
         }
-        backend = ggml_backend_dev_init(dev, nullptr);
-        if (backend == nullptr) {
-            throw std::runtime_error("MoE CPU lane: failed to initialize the CPU backend");
-        }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto tp_new   = (ggml_threadpool_t (*)(ggml_threadpool_params *)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
         auto tp_set   = (void (*)(ggml_backend_t, ggml_threadpool_t))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        auto tp_numa  = (void (*)(ggml_threadpool_t, bool))             ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_set_numa_affinity");
         auto set_nth  = (ggml_backend_set_n_threads_t)                   ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         threadpool_free = (void (*)(ggml_threadpool_t))                  ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
-        if (set_nth) {
-            set_nth(backend, this->n_threads);
+        if (pool_cpus.size() == 1) {
+            cpus = pool_cpus[0];
         }
-        if (tp_new && tp_set && threadpool_free) {
-            ggml_threadpool_params tpp = ggml_threadpool_params_default(this->n_threads);
-            tpp.poll = (uint32_t) std::clamp(poll, 0, 100);
-            for (int c : cpus) {
-                if (c >= 0 && c < GGML_MAX_N_THREADS) {
-                    tpp.cpumask[c] = true;
+        for (const std::vector<int> & pc : pool_cpus.empty() ? std::vector<std::vector<int>>(1) : pool_cpus) {
+            pool p;
+            p.backend = ggml_backend_dev_init(dev, nullptr);
+            if (p.backend == nullptr) {
+                throw std::runtime_error("MoE CPU lane: failed to initialize the CPU backend");
+            }
+            if (set_nth) {
+                set_nth(p.backend, this->n_threads);
+            }
+            if (tp_new && tp_set && threadpool_free) {
+                ggml_threadpool_params tpp = ggml_threadpool_params_default(this->n_threads);
+                tpp.poll = (uint32_t) std::clamp(poll, 0, 100);
+                for (int c : pc) {
+                    if (c >= 0 && c < GGML_MAX_N_THREADS) {
+                        tpp.cpumask[c] = true;
+                    }
+                }
+                tpp.strict_cpu = false;
+#if defined(__linux__)
+                // ggml_threadpool_new also pins the calling thread (the pool's thread 0): keep the caller's affinity
+                cpu_set_t old_set;
+                const bool saved = !pc.empty() && pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &old_set) == 0;
+#endif
+                p.threadpool = tp_new(&tpp);
+#if defined(__linux__)
+                if (saved) {
+                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &old_set);
+                }
+#endif
+                if (p.threadpool) {
+                    if (!numa_affinity && tp_numa) {
+                        tp_numa(p.threadpool, false);
+                    }
+                    tp_set(p.backend, p.threadpool);
                 }
             }
-            tpp.strict_cpu = false;
-#if defined(__linux__)
-            // ggml_threadpool_new also pins the calling thread (the pool's thread 0): keep the caller's affinity
-            cpu_set_t old_set;
-            const bool saved = !cpus.empty() && pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &old_set) == 0;
-#endif
-            threadpool = tp_new(&tpp);
-#if defined(__linux__)
-            if (saved) {
-                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &old_set);
-            }
-#endif
-            if (threadpool) {
-                tp_set(backend, threadpool);
-            }
+            pools.push_back(p);
         }
         if (const char * env = getenv("LLAMA_MOE_CPU_LANE_SPIN_US")) {
             spin_us = std::max<int64_t>(0, atoll(env));
@@ -152,9 +167,11 @@ struct llama_moe_lane::impl {
                 }
             }
         }
-        ggml_backend_free(backend);
-        if (threadpool) {
-            threadpool_free(threadpool);
+        for (pool & p : pools) {
+            ggml_backend_free(p.backend);
+            if (p.threadpool) {
+                threadpool_free(p.threadpool);
+            }
         }
     }
 
@@ -164,6 +181,7 @@ struct llama_moe_lane::impl {
             return;
         }
         GGML_ASSERT(l.chan && l.down && (l.gate_up || (l.up && l.gate)));
+        GGML_ASSERT(l.pool >= 0 && (size_t) l.pool < pools.size());
         s.l = l;
         ggml_moe_lane_layout(l.n_embd, l.n_used, l.max_tokens, &s.off_ids, &s.off_x, &s.off_rows);
         s.last = lane_load(l.chan, GGML_MOE_LANE_SEQ);
@@ -250,7 +268,7 @@ struct llama_moe_lane::impl {
         }
         if (rows > 0) {
             graph & g = get_graph(s, n);
-            ggml_backend_graph_compute(backend, g.gf);
+            ggml_backend_graph_compute(pools[l.pool].backend, g.gf);
             n_requests.fetch_add(1, std::memory_order_relaxed);
             n_experts.fetch_add(experts, std::memory_order_relaxed);
             n_rows.fetch_add(rows, std::memory_order_relaxed);
@@ -295,7 +313,10 @@ struct llama_moe_lane::impl {
 };
 
 llama_moe_lane::llama_moe_lane(size_t n_slots, int n_threads, int poll, const std::vector<int> & cpus) :
-    pimpl(new impl(n_slots, n_threads, poll, cpus)) {}
+    pimpl(new impl(n_slots, n_threads, poll, { cpus }, true)) {}
+
+llama_moe_lane::llama_moe_lane(size_t n_slots, int n_threads, int poll, const std::vector<std::vector<int>> & pool_cpus, bool numa_affinity) :
+    pimpl(new impl(n_slots, n_threads, poll, pool_cpus, numa_affinity)) {}
 
 llama_moe_lane::~llama_moe_lane() = default;
 
