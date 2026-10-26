@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-layer-split.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1683,13 +1684,56 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+
+    // LLAMA_LAYER_SPLIT (llama-layer-split.h): device of every layer (output = the last layer's), empty = splits above
+    std::vector<int> layer_split_dev;
+    if (const char * env = getenv("LLAMA_LAYER_SPLIT"); env && *env) {
+        const int n_dev = (int) n_devices();
+        std::string err;
+        if (split_mode != LLAMA_SPLIT_MODE_LAYER || n_dev < 2 || i_gpu_start != 0 || act_gpu_layers != n_layer_all + 1) {
+            err = "needs the layer split over several devices with every layer offloaded";
+        } else if (!strcmp(env, "even") || !strcmp(env, "cost")) {
+            double w_attn = 1.8;
+            if (const char * e = getenv("LLAMA_LAYER_SPLIT_ATTN")) {
+                w_attn = std::max(0.0, atof(e));
+            }
+            const bool cost = !strcmp(env, "cost");
+            std::vector<double> w(n_layer_all, 0.0);
+            for (int il = 0; il < (int) hparams.n_layer(); ++il) {
+                w[il] = cost && !hparams.is_recr(il) ? w_attn : 1.0;
+            }
+            layer_split_dev = llama_layer_split_balance(w, n_dev);
+        } else {
+            layer_split_dev = llama_layer_split_counts(env, n_layer_all, n_dev, err);
+        }
+        if (layer_split_dev.empty()) {
+            LLAMA_LOG_WARN("%s: LLAMA_LAYER_SPLIT=%s not used: %s\n", __func__, env, err.c_str());
+        } else {
+            layer_split_dev.push_back(layer_split_dev.back()); // the output layer
+            std::string desc;
+            for (int d = 0, il = 0; d < n_dev; ++d) {
+                const int i0 = il;
+                while (il < n_layer_all && layer_split_dev[il] == d) {
+                    ++il;
+                }
+                desc += format("%s%s %d", d ? ", " : "", ggml_backend_dev_name(devices[d].dev), il - i0);
+                if (il > i0) {
+                    desc += format(" (%d-%d)", i0, il - 1);
+                }
+            }
+            LLAMA_LOG_INFO("%s: layer split (LLAMA_LAYER_SPLIT=%s): %s, output on %s\n", __func__, env, desc.c_str(),
+                ggml_backend_dev_name(devices[layer_split_dev.back()].dev));
+        }
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = !layer_split_dev.empty() ? layer_split_dev[il] :
+            std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
