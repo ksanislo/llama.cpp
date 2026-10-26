@@ -2635,6 +2635,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BATCH_BESIDE"));
     add_opt(common_arg(
+        {"--batch-split"}, "N",
+        string_format("a batch carrying generating slots' tokens and at least N prompt tokens is decoded as two: the generating\n"
+                      "slots' tokens first (they get their next token without waiting for the prompt chunk), then the prompt\n"
+                      "(one sequence per decode, as the prompt pipe / MTP pipe / decode memory expect) (default: %d, 0 = one decode)", params.n_batch_split),
+        [](common_params & params, int value) {
+            params.n_batch_split = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_BATCH_SPLIT"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
@@ -3744,6 +3753,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
+    add_opt(common_arg(
+        {"--session-dir"}, "PATH",
+        "persist every conversation in this directory: a conversation is written in the background once it has been\n"
+        "idle or parked for --session-dir-delay seconds and at shutdown, and read back when a prompt continues it\n"
+        "(use one directory per model; default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.session_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSION_DIR"));
+    add_opt(common_arg(
+        {"--session-dir-gib"}, "N",
+        string_format("--session-dir size cap in GiB, least recently used conversations go first (default: %.0f, 0 = no cap)", params.session_dir_gib),
+        [](common_params & params, const std::string & value) {
+            params.session_dir_gib = std::stod(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSION_DIR_GIB"));
+    add_opt(common_arg(
+        {"--session-dir-files"}, "N",
+        string_format("--session-dir file count cap (default: %d, 0 = no cap)", params.session_dir_files),
+        [](common_params & params, int value) {
+            params.session_dir_files = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSION_DIR_FILES"));
+    add_opt(common_arg(
+        {"--session-dir-days"}, "N",
+        string_format("--session-dir: conversations unused for N days are removed (default: %d, 0 = never)", params.session_dir_days),
+        [](common_params & params, int value) {
+            params.session_dir_days = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSION_DIR_DAYS"));
+    add_opt(common_arg(
+        {"--session-dir-delay"}, "N",
+        string_format("--session-dir: seconds a conversation is idle or parked before it is written; one taken back sooner is not written (default: %d)", params.session_dir_delay),
+        [](common_params & params, int value) {
+            params.session_dir_delay = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSION_DIR_DELAY"));
+    add_opt(common_arg(
+        {"--session-dir-min"}, "N",
+        string_format("--session-dir: conversations shorter than N tokens are not written (default: %d)", params.session_dir_min),
+        [](common_params & params, int value) {
+            params.session_dir_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SESSION_DIR_MIN"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
