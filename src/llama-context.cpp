@@ -647,6 +647,12 @@ llama_context::llama_context(
         if (const char * env = getenv("LLAMA_PROMPT_PIPE")) {
             prompt_pipe = std::max(0.0, atof(env));
         }
+        if (const char * env = getenv("LLAMA_PROMPT_PIPE_CAUSAL")) {
+            prompt_pipe_causal = std::max(0, std::min(2, atoi(env)));
+            if (prompt_pipe_causal > 0) {
+                LLAMA_LOG_INFO("%s: prompt pipe: chunks take causal shapes (LLAMA_PROMPT_PIPE_CAUSAL=%d)\n", __func__, prompt_pipe_causal);
+            }
+        }
         if (prompt_pipe > 0.0) {
             std::vector<ggml_backend_dev_t> devs;
             for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
@@ -1798,6 +1804,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LLAMA_PROMPT_PIPE_CAUSAL: the first chunk plans the layout in the batch's end shapes, the chunks run in their own
+    bool causal_plan = false;
+    if (mctx && prompt_pipe_causal_ub >= 0) {
+        const bool first = prompt_pipe_causal_ub++ == 0;
+        if (!first) {
+            mctx->set_shapes_plan(false);
+        } else if (prompt_pipe_causal >= 2) {
+            causal_plan = mctx->set_shapes_plan(true);
+        }
+    }
+
     // with submit threads, the graph of the pipeline copy it is allocated in: free once the threads have queued that
     // copy's previous graph
     llm_graph_result * res = nullptr;
@@ -1817,7 +1834,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // (a reused graph synchronizes the scheduler under pipeline parallelism, so the prompt pipe's chunks are rebuilt)
-    if (!graph_reuse_disable && prompt_pipe_chunk == 0 && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !causal_plan && prompt_pipe_chunk == 0 && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1831,6 +1848,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        const int32_t n_reallocs = n_reallocs_all;
+
+        if (causal_plan) {
+            // the end-shaped graph only plans the layout (reallocating as a stable first chunk would); the causal graph
+            // of every chunk of the batch is no larger in any tensor, so it allocates in that layout
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+            ggml_cgraph * gf_plan = model.build_graph(gparams);
+            if (!gf_plan || !ggml_backend_sched_plan_graph(sched.get(), gf_plan)) {
+                LLAMA_LOG_ERROR("%s: failed to plan the prompt pipe layout\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            mctx->set_shapes_plan(false);
+        }
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1848,7 +1881,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        const int32_t n_reallocs = n_reallocs_all;
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2402,6 +2434,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (pipe_stable) {
         memory->set_batch_shapes_stable(true);
     }
+    // LLAMA_PROMPT_PIPE_CAUSAL: process_ubatch picks the shapes per chunk (with LLAMA_BATCH_SHAPES_STABLE=1 for every
+    // batch of several ubatches: the CPU check that the causal chunks fit the planned layout and match unpiped results)
+    struct causal_reset {
+        int32_t & ub;
+        ~causal_reset() { ub = -1; }
+    } causal_reset_on_exit { prompt_pipe_causal_ub };
+    prompt_pipe_causal_ub = pipe_stable && prompt_pipe_causal > 0 && n_tokens_all > n_ubatch_cur ? 0 : -1;
 
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch_cur, embd_all);

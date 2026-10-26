@@ -452,6 +452,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool set_shapes_plan(bool plan) override;
+
     //
     // llama_kv_cache_context specific API
     //
@@ -501,6 +503,9 @@ private:
 
     // n_kv of every ubatch, set when the cache keeps the batch shapes stable
     uint32_t n_kv_batch = 0;
+
+    // n_kv of the current ubatch's own cells (set_shapes_plan(false))
+    uint32_t n_kv_own = 0;
 
     llama_kv_cache * kv;
     llama_context * lctx;

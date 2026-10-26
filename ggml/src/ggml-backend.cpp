@@ -3009,6 +3009,24 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
+bool ggml_backend_sched_plan_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    GGML_ASSERT(!sched->is_alloc);
+
+    // split in the copy the next graph allocates in, so its inputs take the same nodes
+    const int cur_copy = sched->cur_copy;
+    sched->cur_copy = sched->next_copy;
+
+    ggml_backend_sched_split_graph(sched, graph);
+    const bool ok = ggml_backend_sched_alloc_splits(sched);
+
+    sched->cur_copy = cur_copy;
+    ggml_backend_sched_reset(sched);
+
+    return ok;
+}
+
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);

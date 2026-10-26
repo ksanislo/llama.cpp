@@ -507,6 +507,12 @@ private:
     // LLAMA_PROMPT_PIPE_STABLE (default 1): the chunks of a piped batch keep one graph shape (n_kv and the k-pool sizes of the
     // batch's end) and allocate in the layout of the first, instead of re-reserving the worst case before each chunk
     bool     prompt_pipe_stable = true;
+    // LLAMA_PROMPT_PIPE_CAUSAL (default 0, needs stable shapes): the chunks after the first take their own n_kv and pool
+    // counts (attention, indexer, top-k and selection mask over the cells so far, not the batch's end); they fit the
+    // layout of the first chunk, so they do not reallocate. 1: the first chunk keeps the end shapes; 2: the end-shaped
+    // graph only plans the layout and the first chunk runs causal too
+    int32_t  prompt_pipe_causal = 0;
+    int32_t  prompt_pipe_causal_ub = -1; // ubatch index in the piped decode while causal shapes apply, else -1
     // LLAMA_MOE_GATHER (default 1): the experts of a large batch are copied with one gather kernel per weight (cached ones
     // from the MoE cache, the others read from pinned host memory), instead of one copy per run of experts
     bool     moe_gather         = true;
