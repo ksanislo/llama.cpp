@@ -1369,8 +1369,13 @@ const llama_model::draft_vocab_head * llama_model::get_draft_vocab_head() const 
     if (path == nullptr || *path == '\0') {
         return nullptr;
     }
+    // a model loaded without its weights (the memory fit's dry run, no_alloc) builds graphs with the full head and leaves
+    // the gather to the real model
+    if (output == nullptr || output->data == nullptr || output->buffer == nullptr) {
+        return nullptr;
+    }
     std::call_once(pimpl->dv_once, [&]() {
-        if (output == nullptr || output->buffer == nullptr || output_s != nullptr || output_b != nullptr || !ggml_is_contiguous(output)) {
+        if (output_s != nullptr || output_b != nullptr || !ggml_is_contiguous(output)) {
             LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB: the output head is not a plain matrix, draft vocabulary off\n", __func__);
             return;
         }
