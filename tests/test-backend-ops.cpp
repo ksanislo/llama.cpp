@@ -6565,10 +6565,12 @@ struct test_mul_mat_id_slots : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
+        // bit for bit only where both halves take the same kernel: up to 8 tokens a backend may run plain MUL_MAT_ID with a
+        // vector kernel (CUDA MMVQ) while the slots op is always MMQ; there the CPU comparison checks the map
         const size_t h = n/2;
         const bool exact_a = memcmp(a, a + h, h*sizeof(float)) == 0;
         const bool exact_b = memcmp(b, b + h, h*sizeof(float)) == 0;
-        if (!exact_a && exact_b) {
+        if (!exact_a && exact_b && this->n > 8) {
             printf("[slots != plain on the tested backend] ");
             return INFINITY;
         }
