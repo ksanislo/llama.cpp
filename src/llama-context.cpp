@@ -2759,7 +2759,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // at least 16 rows of logits: a speculative verify batch (2..n_max+1 outputs) after a 1-output prompt would otherwise
     // reallocate the whole output buffer (with an unmasked nextn embedding it holds n_batch rows: ~1.4 GB of pinned host
     // memory for Flash-Next MTP, allocated and cleared in ~1.3 s at the first verify of the first long request)
-    const int64_t n_outputs_max = std::max<int64_t>({ (int64_t) n_outputs, (int64_t) n_seq_max(), (int64_t) 16 });
+    // (the floor never exceeds the context's output limit: without a draft the server allows n_parallel outputs)
+    const int64_t n_outputs_max = std::max<int64_t>({ (int64_t) n_outputs, (int64_t) n_seq_max(),
+            std::min<int64_t>(16, cparams.n_outputs_max) });
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
