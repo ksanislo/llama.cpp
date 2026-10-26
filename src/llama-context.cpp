@@ -388,6 +388,17 @@ llama_context::llama_context(
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
+    // LLAMA_PROMPT_PIPE_SPAN=1 (with LLAMA_PROMPT_PIPE): n_batch = n_ctx, so a prompt is one piped decode with one chunk
+    // plan; each further decode starts with a graph reallocation that synchronizes every device (a full drain + refill).
+    // The output limits stay those of -b (the server sizes them): not for targets that output every prompt row (MTP)
+    if (const char * env = getenv("LLAMA_PROMPT_PIPE_SPAN"); env && atoi(env) != 0 && cparams.causal_attn && !params.embeddings) {
+        const char * pipe = getenv("LLAMA_PROMPT_PIPE");
+        if (pipe && atof(pipe) > 0.0 && cparams.n_batch < cparams.n_ctx) {
+            LLAMA_LOG_INFO("%s: prompt pipe span: n_batch %u -> n_ctx %u (LLAMA_PROMPT_PIPE_SPAN=1)\n", __func__, cparams.n_batch, cparams.n_ctx);
+            cparams.n_batch = cparams.n_ctx;
+        }
+    }
+
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
