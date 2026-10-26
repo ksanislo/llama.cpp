@@ -905,6 +905,15 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // LLAMA_MTP_DRAFT_VOCAB=<file of sorted int32 token ids> (Strata's draft_vocab.bin): the MTP draft head over that subset,
+    // rows of `output` gathered once on first use into a tensor beside it; null without the env or for an unsupported head
+    struct draft_vocab_head {
+        ggml_tensor * head = nullptr; // [n_embd, n] rows of output
+        ggml_tensor * ids  = nullptr; // I32 [n] token ids
+        int64_t       n    = 0;
+    };
+    const draft_vocab_head * get_draft_vocab_head() const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

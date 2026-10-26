@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -1262,6 +1263,12 @@ struct llama_model::impl {
     impl() = default;
     ~impl() = default;
 
+    // LLAMA_MTP_DRAFT_VOCAB
+    std::once_flag                     dv_once;
+    ggml_context_ptr                   dv_ctx;
+    ggml_backend_buffer_ptr            dv_buf;
+    llama_model::draft_vocab_head      dv;
+
     uint64_t n_elements = 0;
 
     size_t n_bytes = 0;
@@ -1355,6 +1362,63 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+}
+
+const llama_model::draft_vocab_head * llama_model::get_draft_vocab_head() const {
+    const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB");
+    if (path == nullptr || *path == '\0') {
+        return nullptr;
+    }
+    std::call_once(pimpl->dv_once, [&]() {
+        if (output == nullptr || output->buffer == nullptr || output_s != nullptr || output_b != nullptr || !ggml_is_contiguous(output)) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB: the output head is not a plain matrix, draft vocabulary off\n", __func__);
+            return;
+        }
+        std::vector<int32_t> ids;
+        if (FILE * f = fopen(path, "rb")) {
+            int32_t v;
+            while (fread(&v, sizeof(v), 1, f) == 1) {
+                ids.push_back(v);
+            }
+            fclose(f);
+        }
+        const int64_t n_vocab = output->ne[1];
+        bool ok = !ids.empty();
+        for (size_t i = 0; i < ids.size() && ok; ++i) {
+            ok = ids[i] >= 0 && ids[i] < n_vocab && (i == 0 || ids[i] > ids[i - 1]);
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB=%s: not a sorted list of int32 token ids below %" PRId64 ", draft vocabulary off\n",
+                    __func__, path, n_vocab);
+            return;
+        }
+        const int64_t n = (int64_t) ids.size();
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        pimpl->dv_ctx.reset(ggml_init(ip));
+        ggml_tensor * head = ggml_new_tensor_2d(pimpl->dv_ctx.get(), output->type, output->ne[0], n);
+        ggml_tensor * tid  = ggml_new_tensor_1d(pimpl->dv_ctx.get(), GGML_TYPE_I32, n);
+        ggml_set_name(head, "draft_vocab_head");
+        ggml_set_name(tid,  "draft_vocab_ids");
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+        pimpl->dv_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pimpl->dv_ctx.get(), buft));
+        if (!pimpl->dv_buf) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB: cannot allocate the draft head (%s), draft vocabulary off\n", __func__,
+                    ggml_backend_buft_name(buft));
+            pimpl->dv_ctx.reset();
+            return;
+        }
+        const size_t row = output->nb[1];
+        std::vector<uint8_t> data((size_t) n*row);
+        for (int64_t i = 0; i < n; ++i) {
+            ggml_backend_tensor_get(output, data.data() + (size_t) i*row, (size_t) ids[i]*row, row);
+        }
+        ggml_backend_tensor_set(head, data.data(), 0, data.size());
+        ggml_backend_tensor_set(tid, ids.data(), 0, ids.size()*sizeof(int32_t));
+        pimpl->dv = { head, tid, n };
+        LLAMA_LOG_INFO("%s: MTP draft head over %" PRId64 " of %" PRId64 " tokens from %s (%.1f MiB on %s, LLAMA_MTP_DRAFT_VOCAB)\n",
+                __func__, n, n_vocab, path, data.size()/1024.0/1024.0, ggml_backend_buft_name(buft));
+    });
+    return pimpl->dv.head ? &pimpl->dv : nullptr;
 }
 
 llama_model::~llama_model() {

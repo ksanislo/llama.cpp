@@ -2198,16 +2198,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     static const bool decode_timing = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
     const int64_t t_dt0 = ggml_time_us();
     int64_t t_dt1 = 0;
+    // small batches (1..8 tokens): host ms of setup / graph build+launch summed per batch size and context type, logged every 100
     struct decode_timing_log {
         bool on; int64_t t0; const int64_t & t1; size_t n; int type;
         ~decode_timing_log() {
-            if (on && t1 > 0) {
-                const int64_t t2 = ggml_time_us();
+            if (!on || t1 <= 0) {
+                return;
+            }
+            const int64_t t2 = ggml_time_us();
+            if (n >= 512) {
                 LLAMA_LOG_INFO("decode timing: %zu tokens (ctx type %d): setup %.1f ms, ubatches %.1f ms (host, unsynced)\n",
                         n, type, (t1 - t0)/1000.0, (t2 - t1)/1000.0);
+            } else if (n <= 8 && type >= 0 && type < 8) {
+                static double   acc[8][9][2] = {};
+                static uint64_t cnt[8][9]    = {};
+                acc[type][n][0] += (t1 - t0)/1000.0;
+                acc[type][n][1] += (t2 - t1)/1000.0;
+                if (++cnt[type][n] % 100 == 0) {
+                    LLAMA_LOG_INFO("decode timing: %zu-token batches (ctx type %d), last 100: setup %.2f ms, graph build + launch %.2f ms a batch (host)\n",
+                            n, type, acc[type][n][0]/100, acc[type][n][1]/100);
+                    acc[type][n][0] = acc[type][n][1] = 0.0;
+                }
             }
         }
-    } decode_timing_log_on_exit { decode_timing && batch_inp.tokens.size() >= 512, t_dt0, t_dt1, batch_inp.tokens.size(), (int) cparams.ctx_type };
+    } decode_timing_log_on_exit { decode_timing && (batch_inp.tokens.size() >= 512 || batch_inp.tokens.size() <= 8), t_dt0, t_dt1,
+            batch_inp.tokens.size(), (int) cparams.ctx_type };
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

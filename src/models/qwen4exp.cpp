@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cinttypes>
 
@@ -646,7 +647,24 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    const auto * dv = model.get_draft_vocab_head();
+    if (dv != nullptr && cur->ne[1] >= 1 && cur->ne[1] <= 8) {
+        // LLAMA_MTP_DRAFT_VOCAB: logits over the subset (draft steps: 1..8 output rows), scattered into full rows of -inf so
+        // the ids and the samplers stay the vocabulary's; each output row is a contiguous column of 1-float rows
+        ggml_tensor * sub = ggml_mul_mat(ctx0, dv->head, cur);                               // [n_sub, n_out]
+        cb(sub, "result_output_sub", -1);
+        const int64_t n_vocab = model.output->ne[1];
+        const int64_t n_out   = sub->ne[1];
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab, n_out), -INFINITY);
+        for (int64_t o = 0; o < n_out; ++o) {
+            ggml_tensor * dst = ggml_view_2d(ctx0, full, 1, n_vocab, sizeof(float), o*full->nb[1]);
+            ggml_tensor * src = ggml_view_2d(ctx0, sub,  1, sub->ne[0], sizeof(float), o*sub->nb[1]);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, src, dv->ids));
+        }
+        cur = full;
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
