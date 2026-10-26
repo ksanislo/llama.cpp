@@ -4,6 +4,8 @@
 //   the copy is not behind a fence, waits for that release event
 // - every staged layer finds its copies queued at its callback, in plan order, and a full layer is queued ahead when a slot allows
 // - the copy plan covers every selected expert exactly once: uploaded if not cached, uploaded or copied from the cache if cached
+// - LLAMA_MOE_RING_TENSORS: the same schedule with an entry per expert tensor of a layer, slots per tensor (flat index
+//   ip*kmax + slot), a callback per tensor; with one slot per tensor every tensor after the first layer is queued ahead
 // - LLAMA_MOE_RING_BYTES (llama_moe_ring_bytes_sched): random layer sizes over random ring sizes with wrap-around; a range is never
 //   taken while a layer that may still read it is in flight, every copy over released bytes waits for (or is fenced past) the
 //   release of their last reader, a waited release event still holds that release, and a layer reads the range it was given
@@ -94,12 +96,12 @@ struct sim_device {
         }
     }
 
-    // returns false if the ring does not serve the layer
-    bool at_layer_cb(int32_t il) {
+    // returns false if the ring does not serve the layer (ip: its expert tensor, LLAMA_MOE_RING_TENSORS)
+    bool at_layer_cb(int32_t il, int32_t ip = -1) {
         if (!rs.active()) {
             return false;
         }
-        const int64_t i = rs.at_layer(il);
+        const int64_t i = rs.at_layer(il, ip);
         if (i < 0) {
             rs.drop();
             ring_fence = true;
@@ -214,6 +216,112 @@ static void test_lookahead() {
         o.end();
     }
     CHECK(o.at_layer == 0, "odd layers: %zu at their layer", o.at_layer);
+}
+
+// LLAMA_MOE_RING_TENSORS: entries per expert tensor; the callbacks come in (layer, tensor) order, a slot is released at the next
+// tensor's callback
+static void test_sched_tensors(std::mt19937 & rng) {
+    for (int iter = 0; iter < 3000; ++iter) {
+        const int32_t n_kinds  = 2 + rng() % 2;
+        std::vector<int32_t> kk(n_kinds);
+        int32_t kmax = 1;
+        for (int32_t & k : kk) {
+            k = 1 + rng() % 3;
+            kmax = std::max(kmax, k);
+        }
+        const int32_t n_layers = 1 + rng() % 14;
+        sim_device d(n_kinds*kmax);
+        const int n_graphs = 1 + rng() % 8;
+        for (int g = 0; g < n_graphs; ++g) {
+            std::vector<llama_moe_ring_sched::entry> plan;
+            const bool decode = rng() % 6 == 0;
+            const bool partial_tail = rng() % 4 == 0;
+            for (int32_t r = 0; r < n_layers && !decode; ++r) {
+                if (r == n_layers - 1 && rng() % 3 == 0) {
+                    continue;
+                }
+                const bool full = !(partial_tail && r >= n_layers - 2) && rng() % 20 != 0;
+                for (int32_t ip = 0; ip < n_kinds; ++ip) {
+                    llama_moe_ring_sched::entry e;
+                    e.il   = 100 + r;
+                    e.ip   = ip;
+                    e.slot = ip*kmax + r % kk[ip];
+                    e.full = full;
+                    plan.push_back(e);
+                }
+            }
+            const std::vector<llama_moe_ring_sched::entry> entries = plan;
+            d.begin(plan);
+            const bool skip = rng() % 10 == 0 && entries.size() > 1;
+            const size_t skip_at = skip ? rng() % entries.size() : entries.size();
+            bool dropped = false;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (i == skip_at) {
+                    continue;
+                }
+                const bool served = d.at_layer_cb(entries[i].il, entries[i].ip);
+                if (!dropped) {
+                    CHECK(served || i > skip_at, "entry %zu not served", i);
+                }
+                if (!served) {
+                    dropped = true;
+                    // the per-tensor staging: the copy stream waits for the compute stream at this callback and writes the slot
+                    for (sim_device::slot_state & st : d.slots) {
+                        st.released = true;
+                        st.waited   = true;
+                    }
+                    sim_device::slot_state & st = d.slots[entries[i].slot];
+                    st = { d.graph, -2, true, false, true };
+                }
+            }
+            if (rng() % 5 == 0) {
+                d.rs.drop();
+                d.ring_fence = true;
+            }
+            d.end();
+        }
+    }
+
+    // one slot per tensor (1 layer of staging), 12 layers x 3 tensors, 4 graphs: every tensor is queued ahead of its callback,
+    // as with LLAMA_MOE_RING=2 whole-layer slots
+    for (int32_t n_kinds : { 2, 3 }) {
+        sim_device d(n_kinds);
+        for (int g = 0; g < 4; ++g) {
+            std::vector<llama_moe_ring_sched::entry> plan;
+            for (int32_t r = 0; r < 12; ++r) {
+                for (int32_t ip = 0; ip < n_kinds; ++ip) {
+                    plan.push_back({ r, ip, true, false, ip });
+                }
+            }
+            d.begin(plan);
+            for (int32_t r = 0; r < 12; ++r) {
+                for (int32_t ip = 0; ip < n_kinds; ++ip) {
+                    CHECK(d.at_layer_cb(r, ip), "tensors: layer %d tensor %d not served", r, ip);
+                }
+            }
+            d.end();
+        }
+        CHECK(d.at_layer == 0 && d.ahead == (size_t) 48*n_kinds, "tensors lookahead (%d tensors): %zu ahead, %zu at their callback",
+            n_kinds, d.ahead, d.at_layer);
+    }
+
+    // a callback of the layer (no tensor) or a tensor out of order drops the ring
+    {
+        sim_device d(3);
+        std::vector<llama_moe_ring_sched::entry> plan;
+        for (int32_t r = 0; r < 4; ++r) {
+            for (int32_t ip = 0; ip < 3; ++ip) {
+                plan.push_back({ r, ip, true, false, ip });
+            }
+        }
+        d.begin(plan);
+        CHECK(d.at_layer_cb(0, 0), "tensors: first entry not served");
+        CHECK(!d.at_layer_cb(0, -1), "tensors: a layer callback served a tensor entry");
+        d.end();
+        d.begin(plan);
+        CHECK(!d.at_layer_cb(0, 1), "tensors: an entry out of order was served");
+        d.end();
+    }
 }
 
 static void test_copies(std::mt19937 & rng) {
@@ -736,6 +844,7 @@ int main() {
     std::mt19937 rng(42);
     test_sched(rng);
     test_lookahead();
+    test_sched_tensors(rng);
     test_copies(rng);
     test_inplace(rng);
     test_bytes(rng);

@@ -3,7 +3,8 @@
 // LLAMA_MOE_RING: bookkeeping of the expert ring of one device, no ggml calls (tests/test-moe-ring.cpp)
 //
 // A graph stages the experts of a device's layers in K layer-sized slots, slot = rank of the layer on its device % K (fixed by
-// the graph). The ring streams every expert of the staged layers that is not in the cache on the device's copy stream, in layer
+// the graph). With LLAMA_MOE_RING_TENSORS an entry is one expert tensor of a layer (gate, up, down) with slots of its own, and a
+// slot is released when the next tensor's callback runs (its matmul is queued), not the next layer's. The ring streams every expert of the staged layers that is not in the cache on the device's copy stream, in layer
 // order and without the routing, as far ahead as the slots allow: the copy into a slot waits for the compute stream to be done
 // with the slot's previous layer. Partial layers (batches below the full-batch rule) need their routing, so they are staged at
 // their own layer and the ring does not pass them.
@@ -19,6 +20,7 @@ struct llama_moe_ring_sched {
         int32_t slot;
         bool    full;
         bool    issued = false;
+        int32_t ip     = -1; // LLAMA_MOE_RING_TENSORS: the expert tensor of the layer (an entry per tensor), -1: the whole layer
     };
 
     int32_t k = 0;
@@ -85,9 +87,10 @@ struct llama_moe_ring_sched {
         return s;
     }
 
-    // the plan index of layer il at its callback, -1 if it is not the next planned layer (the ring is then dropped for the graph)
-    int64_t at_layer(int32_t il) const {
-        return next_consume < plan.size() && plan[next_consume].il == il ? (int64_t) next_consume : -1;
+    // the plan index of layer il (its expert tensor ip) at its callback, -1 if it is not the next planned entry (the ring is then
+    // dropped for the graph)
+    int64_t at_layer(int32_t il, int32_t ip = -1) const {
+        return next_consume < plan.size() && plan[next_consume].il == il && plan[next_consume].ip == ip ? (int64_t) next_consume : -1;
     }
 
     // the layer of plan entry i reads its slot from now on

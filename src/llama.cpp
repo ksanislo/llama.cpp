@@ -366,6 +366,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        if (model->arch == LLM_ARCH_QWEN4EXP) {
+            ml.merge_gate_up_exps(); // LLAMA_MERGE_GATE_UP
+        }
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
