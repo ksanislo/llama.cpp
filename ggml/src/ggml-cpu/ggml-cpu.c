@@ -500,6 +500,7 @@ struct ggml_threadpool {
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+    bool         numa_affinity; // threads placed by the --numa strategy each graph (default); off: the cpumask alone
 
     enum ggml_status ec;
 };
@@ -3219,7 +3220,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else
-    set_numa_thread_affinity(state->ith);
+    if (tp->numa_affinity) {
+        set_numa_thread_affinity(state->ith);
+    }
 #endif
 
     struct ggml_compute_params params = {
@@ -3443,6 +3446,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
+        threadpool->numa_affinity    = true;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -3497,6 +3501,10 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
+}
+
+void ggml_threadpool_set_numa_affinity(struct ggml_threadpool * threadpool, bool numa_affinity) {
+    threadpool->numa_affinity = numa_affinity;
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
@@ -3565,7 +3573,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
     // don't leave affinity set on the main thread
-    clear_numa_thread_affinity();
+    if (threadpool->numa_affinity) {
+        clear_numa_thread_affinity();
+    }
 
     enum ggml_status ret = threadpool->ec;
 
