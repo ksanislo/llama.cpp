@@ -1012,6 +1012,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> slot_layer;              // [n_stage] the layer whose experts are all in the slot, -1 if none
         int32_t last_slot = -1;                       // the slot of the last upload, -1 if the compute stream already waited for it
         size_t slot_size = 0;
+        std::vector<size_t> slot_sec;                 // LLAMA_MOE_RING_BYTES: ring ip is n_stage*slot_sec[ip] bytes
         ggml_context_ptr ctx_stage;
         ggml_backend_buffer_ptr buf_stage;            // nullptr if the slots borrow the cache
 
@@ -1051,7 +1052,10 @@ struct llama_moe_cache::impl {
 
         // LLAMA_MOE_RING: the staging slots are a ring the copy stream fills ahead of the compute stream (see ring_begin)
         llama_moe_ring_sched rs;
-        std::vector<ggml_backend_event_ptr> ev_used;    // [n_stage] the compute stream is done with the slot's last layer
+        std::vector<ggml_backend_event_ptr> ev_used;    // [n_stage] the compute stream is done with the slot's last layer (bytes: [n_ev] by release)
+        llama_moe_ring_bytes_sched rb;                  // LLAMA_MOE_RING_BYTES: the staging memory as a byte ring instead of the K slots
+        uint32_t rb_ev_next  = 0;                       // the next ready event (ev_ready[n_ev]) and pinned map of an issued layer
+        uint32_t rb_map_next = 0;
         std::unique_ptr<std::mutex> mtx;                // the ring state, if the scheduler calls back from a thread per device
         ggml_backend_buffer_ptr buf_pinned;             // identity map and zeros, pinned: a copy from them never waits on the host
         const int32_t * pinned_map   = nullptr;
@@ -1082,6 +1086,9 @@ struct llama_moe_cache::impl {
             size_t ip_host      = 0; // ... read from host memory by the matmul (more than the staging slot holds)
             size_t bytes_inplace = 0;
             size_t bytes_zc      = 0;
+            size_t consumed      = 0; // staged layers read by their matmuls through the ring
+            size_t ahead_sum     = 0; // ... the layers already issued after each of them (lookahead)
+            size_t ahead_max     = 0;
         } rstats;
         ring_stats rstats_graph; // LLAMA_MOE_RING_LOG: rstats at the start of the device's part of the graph
         int64_t    rgraph_t0 = 0;
@@ -1114,6 +1121,14 @@ struct llama_moe_cache::impl {
         bool    ip_on        = false;              // LLAMA_MOE_RING_INPLACE: large batches read cached experts from their slots
         int32_t ip_cap       = 0;                  // places of a staging slot for the uncached experts (all experts without host reads)
         bool    ip_read_past = false;              // MMQ reads past the end of an expert of this layout (rows not a multiple of 512)
+        // LLAMA_MOE_RING_BYTES: stage[0] are the device's byte rings seen with this group's expert size (rb_limit places in all);
+        // host reads are coded past rb_host places; the per-layer staging (ring dropped) uses place rb_slot_base[is] on, rb_slot_cap
+        std::vector<size_t>  rb_es;
+        int64_t              rb_limit = 0;
+        int32_t              rb_host  = 0;
+        int32_t              rb_cap   = 0;   // uncached experts a layer stages through the ring, more are read from host memory
+        std::vector<int64_t> rb_slot_base;
+        int32_t              rb_slot_cap = 0;
         std::vector<bool> pf_unused;      // [n_slots] prefetched and not selected since (LLAMA_MOE_PREFETCH statistics)
         std::vector<bool> dh_ok;                       // [dh_max + 1] the device supports the device-side path for n tokens
         moe_cache_transient tr;                        // LLAMA_MOE_CACHE_POLICY=adaptive
@@ -1207,6 +1222,9 @@ struct llama_moe_cache::impl {
     bool    ring_inplace = false; // LLAMA_MOE_RING_INPLACE=1: large batches read cached experts in place, the ring stages only the others
     double  ip_frac      = 0.8;   // LLAMA_MOE_RING_INPLACE_CAP: staging places per slot, a share of the experts (<= 1) or a count (> 1)
     static constexpr int32_t ip_r = 32; // maps per staging slot in flight
+    bool    ring_bytes = false; // LLAMA_MOE_RING_BYTES=1: the staging memory is one byte ring per expert tensor, a layer takes its misses only
+    double  ring_mib   = 0.0;   // LLAMA_MOE_RING_MIB: its size per device (0: what the K slots take)
+    int32_t ring_ahead = 32;    // LLAMA_MOE_RING_AHEAD: at most this many layers issued beyond the one computing
     typedef void (*copy_blocks_t)(ggml_backend_t, void * const *, const void * const *, int, size_t, int);
     copy_blocks_t copy_blocks = nullptr;
     std::unordered_map<const ggml_tensor *, int32_t> stage_view_layer; // staged experts (the matmul's src[0]) -> layer
@@ -1532,6 +1550,15 @@ struct llama_moe_cache::impl {
         if (const char * env = moe_env("LLAMA_MOE_RING_INPLACE_CAP")) {
             ip_frac = std::max(0.0, atof(env));
         }
+        if (const char * env = moe_env("LLAMA_MOE_RING_BYTES")) {
+            ring_bytes = atoi(env) != 0;
+        }
+        if (const char * env = moe_env("LLAMA_MOE_RING_MIB")) {
+            ring_mib = std::max(0.0, atof(env));
+        }
+        if (const char * env = moe_env("LLAMA_MOE_RING_AHEAD")) {
+            ring_ahead = std::clamp(atoi(env), 1, (int) llama_moe_ring_bytes::n_ev/2);
+        }
         if (const char * env = moe_env("LLAMA_MOE_PREFETCH")) {
             n_pref = std::clamp(atoi(env), 0, (int) model.hparams.n_expert);
             pref_max = n_pref;
@@ -1602,6 +1629,11 @@ struct llama_moe_cache::impl {
             return;
         }
         init_inplace_groups(model); // before the plan: the staging slots of in-place groups are smaller
+        if (ring_bytes && (ring == 0 || !ring_inplace || !std::all_of(groups.begin(), groups.end(), [](const group & g) { return g.ip_on; }))) {
+            // the matmul finds a layer's experts anywhere in the ring only through the in-place map
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_RING_BYTES needs LLAMA_MOE_RING and LLAMA_MOE_RING_INPLACE on every layer, it is off\n", __func__);
+            ring_bytes = false;
+        }
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
         // one extra slot at the end, CUDA MMQ can read past the last expert
@@ -1874,6 +1906,18 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("%s: %10s MoE ring: the %d staging slots stream every uncached expert of the device's layers ahead of "
                     "large batches (LLAMA_MOE_RING=%d, %s)\n", __func__, ggml_backend_buft_name(d.buft), n_stage, ring,
                     copy_blocks && ring_zc ? "one copy kernel per 128 experts, uncached ones read from mapped host memory" : "host copies per run");
+            }
+            if (ring_bytes && d.mtx) {
+                LLAMA_LOG_INFO("%s: %10s MoE ring bytes: %.2f MiB (%s) staging only the uncached experts of each layer, up to %d layers ahead "
+                    "(LLAMA_MOE_RING_BYTES, LLAMA_MOE_RING_MIB, LLAMA_MOE_RING_AHEAD)\n", __func__, ggml_backend_buft_name(d.buft),
+                    n_stage*d.slot_size/1024.0/1024.0, d.lender >= 0 ? "in the cache's bank tails" : "own or lent memory", ring_ahead);
+                for (const group & g : groups) {
+                    if (g.id == (int32_t) id && !g.stage.empty()) {
+                        LLAMA_LOG_INFO("%s: %10s MoE ring bytes: %zu %s layers: %" PRId64 " places, a layer stages up to %d (%.1f layers at the "
+                            "cap fit), per-layer staging %d\n", __func__, ggml_backend_buft_name(d.buft), g.layers.size(),
+                            ggml_type_name(g.ref.back()->type), g.rb_limit, g.rb_cap, (double) g.rb_limit/(g.rb_cap + 1), g.rb_slot_cap);
+                    }
+                }
             }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id && g.ip_on && d.mtx) {
@@ -2540,6 +2584,8 @@ struct llama_moe_cache::impl {
         const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
         std::vector<size_t> sec;
         slot_size = 0;
+        // the byte ring is sized once for all groups (the plan, decode memory and init_stage must agree on it)
+        all = all || ring_bytes;
         for (const group & g : groups) {
             if (g.id != (int32_t) id || (g.n_slots == 0 && !all)) {
                 continue;
@@ -2552,6 +2598,34 @@ struct llama_moe_cache::impl {
                 sec[ip] = std::max(sec[ip], st);
             }
             slot_size = std::max(slot_size, size);
+        }
+        if (ring_bytes && !sec.empty()) {
+            // one byte ring per expert tensor of n_stage*sec[ip] bytes, rescaled to LLAMA_MOE_RING_MIB in all; it keeps one slot of
+            // all experts for groups without host reads (the per-layer staging) and two places of every group
+            std::vector<size_t> need(sec.size(), 0);
+            for (const group & g : groups) {
+                if (g.id != (int32_t) id || (g.n_slots == 0 && !all)) {
+                    continue;
+                }
+                for (size_t ip = 0; ip < g.ref.size() && ip < need.size(); ++ip) {
+                    const int64_t n = g.ip_cap >= g.ref[0]->ne[2] ? stage_places(g) + 1 : 2;
+                    need[ip] = std::max(need[ip], GGML_PAD(expert_alloc_size(d, g.ref[ip], n), alignment));
+                }
+            }
+            if (ring_mib > 0.0) {
+                double total = 0.0;
+                for (size_t x : sec) {
+                    total += (double) n_stage*x;
+                }
+                const double f = ring_mib*1024.0*1024.0/total;
+                for (size_t ip = 0; ip < sec.size(); ++ip) {
+                    sec[ip] = std::max(need[ip], GGML_PAD((size_t) (sec[ip]*f), alignment));
+                }
+            }
+            slot_size = 0;
+            for (size_t x : sec) {
+                slot_size += x;
+            }
         }
         return sec;
     }
@@ -3622,7 +3696,12 @@ struct llama_moe_cache::impl {
 
             const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
             std::vector<size_t> sec; // [expert tensor] the largest staging tensor of the device, the slot spacing in a borrowed bank tail
-            for (size_t ig = 0; ig < groups.size(); ++ig) {
+            if (ring_bytes) {
+                sec = stage_sec(id, d.slot_size);
+                d.slot_sec = sec;
+                init_ring_bytes_tensors(d, id, sec, ctx);
+            }
+            for (size_t ig = 0; ig < groups.size() && !ring_bytes; ++ig) {
                 group & g = groups[ig];
                 if (g.id != (int32_t) id || g.n_slots == 0) {
                     continue;
@@ -3671,9 +3750,16 @@ struct llama_moe_cache::impl {
                 if (g.stage.empty() || g.id != (int32_t) id) {
                     continue;
                 }
-                for (int32_t is = 0; is < n_stage; ++is) {
+                for (int32_t is = 0; is < (int32_t) g.stage.size(); ++is) {
                     size_t offset = is*d.slot_size;
                     for (size_t ip = 0; ip < g.stage[is].size(); ++ip) {
+                        if (ring_bytes) {
+                            // ring ip: n_stage*sec[ip] bytes, after the rings before it (own memory) or where slot 0 was (borrowed)
+                            offset = 0;
+                            for (size_t j = 0; j < ip; ++j) {
+                                offset += (size_t) n_stage*sec[j];
+                            }
+                        }
                         ggml_tensor * st = g.stage[is][ip];
                         uint8_t * addr = nullptr;
                         if (no_alloc) {
@@ -3690,13 +3776,13 @@ struct llama_moe_cache::impl {
                 }
             }
 
-            // the matmuls read the n_expert experts of the slot of their layer
+            // the matmuls read the n_expert experts of the slot of their layer (bytes: any place of the whole ring, by the map)
             for (int32_t il : d.layers) {
                 const layer & l = layers[il];
                 const group & g = groups[l.ig];
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                    ggml_tensor * st = g.stage[l.rank % n_stage][ip];
-                    ggml_tensor * v  = ggml_view_3d(ctx, st, st->ne[0], st->ne[1], st->ne[2] - 1, st->nb[1], st->nb[2], 0);
+                    ggml_tensor * st = g.stage[ring_bytes ? 0 : l.rank % n_stage][ip];
+                    ggml_tensor * v  = ggml_view_3d(ctx, st, st->ne[0], st->ne[1], st->ne[2] - (ring_bytes ? 0 : 1), st->nb[1], st->nb[2], 0);
                     ggml_format_name(v, "moe_stage.%s", l.experts[ip]->name);
                     if (no_alloc) {
                         v->buffer = d.buf_stage.get();
@@ -3737,7 +3823,7 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_WARN("%s: %s: LLAMA_MOE_RING_PRIO=1 not applied (no stream priorities)\n", __func__, ggml_backend_name(d.backend));
                 }
             }
-            for (int32_t is = 0; is < n_stage; ++is) {
+            for (int32_t is = 0; is < (ring_bytes ? std::max<int32_t>(n_stage, llama_moe_ring_bytes::n_ev) : n_stage); ++is) {
                 d.ev_ready.emplace_back(ggml_backend_event_new(dev));
                 if (!d.ev_ready.back()) {
                     throw std::runtime_error("failed to create the MoE staging stream");
@@ -3760,9 +3846,60 @@ struct llama_moe_cache::impl {
     }
 
     // LLAMA_MOE_RING: release events of the slots, the pinned identity map and zeros, the copy kernel
+    // LLAMA_MOE_RING_BYTES: per group the device's rings as staging tensors of its expert size, and where the per-layer staging puts
+    // slot is (the ring's is-th n_stage-th, so two slots never overlap whatever their group)
+    void init_ring_bytes_tensors(device & d, size_t id, const std::vector<size_t> & sec, ggml_context * ctx) {
+        const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.id != (int32_t) id || g.n_slots == 0) {
+                continue;
+            }
+            GGML_ASSERT(g.ref.size() == sec.size());
+            g.stage.assign(1, {});
+            g.rb_es.clear();
+            g.rb_limit = INT64_MAX;
+            g.rb_host  = 0;
+            std::vector<int64_t> places;
+            for (size_t ip = 0; ip < g.ref.size(); ++ip) {
+                const ggml_tensor * t = g.ref[ip];
+                const size_t ring_size = (size_t) n_stage*sec[ip];
+                const size_t es = t->nb[2];
+                int64_t p = (int64_t) (ring_size/es);
+                while (p > 2 && GGML_PAD(expert_alloc_size(d, t, p), alignment) > ring_size) {
+                    p--;
+                }
+                ggml_tensor * st = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], p);
+                GGML_ASSERT(st->nb[2] == es);
+                ggml_format_name(st, "moe_ring.%zu.%s", ig, t->name);
+                g.stage[0].push_back(st);
+                g.rb_es.push_back(es);
+                places.push_back(p);
+                g.rb_limit = std::min(g.rb_limit, p);
+                g.rb_host  = std::max(g.rb_host, (int32_t) p);
+            }
+            g.rb_cap = std::min<int64_t>(g.ip_cap, g.rb_limit - 1);
+            g.rb_slot_base.assign(n_stage, 0);
+            int64_t slot_places = INT64_MAX;
+            for (int32_t is = 0; is < n_stage; ++is) {
+                int64_t base = 0, end = INT64_MAX;
+                for (size_t ip = 0; ip < g.ref.size(); ++ip) {
+                    base = std::max<int64_t>(base, (int64_t) ((is*sec[ip] + g.rb_es[ip] - 1)/g.rb_es[ip]));
+                    end  = std::min<int64_t>(end, std::min<int64_t>(places[ip], (int64_t) ((is + 1)*sec[ip]/g.rb_es[ip])));
+                }
+                g.rb_slot_base[is] = base;
+                slot_places = std::min(slot_places, end - base);
+            }
+            g.rb_slot_cap = (int32_t) std::min<int64_t>(g.ip_cap, slot_places - 1);
+            if (g.rb_cap < 1 || g.rb_slot_cap < 1) {
+                throw std::runtime_error("LLAMA_MOE_RING_BYTES: the ring is too small for one layer (LLAMA_MOE_RING_MIB)");
+            }
+        }
+    }
+
     void init_ring(device & d) {
         ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
-        for (int32_t is = 0; is < n_stage; ++is) {
+        for (int32_t is = 0; is < (ring_bytes ? (int32_t) llama_moe_ring_bytes::n_ev : n_stage); ++is) {
             d.ev_used.emplace_back(ggml_backend_event_new(dev));
             if (!d.ev_used.back()) {
                 throw std::runtime_error("failed to create the MoE ring events");
@@ -3770,6 +3907,14 @@ struct llama_moe_cache::impl {
         }
         d.mtx = std::make_unique<std::mutex>();
         d.rs.init(n_stage);
+        if (ring_bytes) {
+            std::vector<size_t> ring_size;
+            for (size_t x : d.slot_sec) {
+                ring_size.push_back((size_t) n_stage*x);
+            }
+            d.rb.ring.init(ring_size);
+            d.rb.max_ahead = ring_ahead;
+        }
 
         int64_t n_expert_max = 0;
         for (int32_t il : d.layers) {
@@ -5460,6 +5605,7 @@ struct llama_moe_cache::impl {
                 d.last_slot = -1;
             }
             d.rs.drop();
+            d.rb.drop();
             d.ring_prev = false;
             return_slots(d);
         }
@@ -5538,6 +5684,7 @@ struct llama_moe_cache::impl {
         }
         if (plan.empty()) {
             d.rs.drop();
+            d.rb.drop();
             d.ring_prev = false;
             return;
         }
@@ -5548,12 +5695,23 @@ struct llama_moe_cache::impl {
         // after a graph without the ring (fills, borrowed slots moved, per-layer staging) the copy stream waits for all of it once;
         // after a ring graph each slot waits for the release of its last layer, so the next graph's first layers can arrive while
         // the last ones of this graph still compute
-        const bool fence = !d.ring_prev || d.ring_fence;
+        const bool fence = !d.ring_prev || d.ring_fence || (ring_bytes && !d.rb.ring.idle());
         if (fence) {
             ggml_backend_event_record(d.ev_compute.get(), d.backend);
             ggml_backend_event_wait(d.copy.get(), d.ev_compute.get());
         }
-        d.rs.start(std::move(plan), fence);
+        if (ring_bytes) {
+            std::vector<llama_moe_ring_bytes_sched::entry> pb;
+            for (const auto & e : plan) {
+                llama_moe_ring_bytes_sched::entry x;
+                x.il   = e.il;
+                x.full = e.full;
+                pb.push_back(x);
+            }
+            d.rb.start(std::move(pb), fence);
+        } else {
+            d.rs.start(std::move(plan), fence);
+        }
         d.ring_prev  = true;
         d.ring_fence = false;
         if (ring_log) {
@@ -5578,29 +5736,97 @@ struct llama_moe_cache::impl {
 
     void ring_end_device(device & d) {
         std::lock_guard<std::mutex> lock(*d.mtx);
-        const int32_t rel = d.rs.release();
-        if (rel >= 0) {
-            ggml_backend_event_record(d.ev_used[rel].get(), d.backend);
-        }
+        ring_release(d, d.backend);
         if (ring_log && d.rgraph_t0 > 0) {
             const auto & a = d.rstats_graph;
             const auto & b = d.rstats;
-            LLAMA_LOG_INFO("llama_moe_cache: ring %s graph %zu: %zu layers ahead, %zu at their layer, %zu partial, %zu dropped; %.2f GiB "
-                "from host, %.2f GiB from the cache, %.2f GiB in place, %.2f GiB host reads; host %.1f ms queueing copies, %.1f ms queueing the graph\n",
+            LLAMA_LOG_INFO("llama_moe_cache: ring %s graph %zu: %zu layers ahead, %zu at their layer, %zu partial, %zu dropped; lookahead %.2f "
+                "layers (max %zu); %.2f GiB from host, %.2f GiB from the cache, %.2f GiB in place, %.2f GiB host reads; host %.1f ms queueing "
+                "copies, %.1f ms queueing the graph\n",
                 ggml_backend_name(d.backend), b.graphs, b.layers - a.layers, b.at_layer - a.at_layer, b.partial - a.partial,
-                b.dropped - a.dropped, (b.bytes_host - a.bytes_host)/1024.0/1024.0/1024.0, (b.bytes_cache - a.bytes_cache)/1024.0/1024.0/1024.0,
+                b.dropped - a.dropped, b.consumed > a.consumed ? (double) (b.ahead_sum - a.ahead_sum)/(b.consumed - a.consumed) : 0.0, b.ahead_max,
+                (b.bytes_host - a.bytes_host)/1024.0/1024.0/1024.0, (b.bytes_cache - a.bytes_cache)/1024.0/1024.0/1024.0,
                 (b.bytes_inplace - a.bytes_inplace)/1024.0/1024.0/1024.0, (b.bytes_zc - a.bytes_zc)/1024.0/1024.0/1024.0,
                 (b.issue_us - a.issue_us)/1000.0, (ggml_time_us() - d.rgraph_t0)/1000.0);
             d.rgraph_t0 = 0;
         }
     }
 
-    // the planned full layers whose slot is free, in order
+    // the planned full layers whose slot is free (bytes: for which the ring has room), in order
     void ring_issue(device & d) {
+        if (ring_bytes) {
+            for (int64_t i = d.rb.can_issue(); i >= 0 && rb_fill(d, (size_t) i, nullptr); i = d.rb.can_issue()) {
+                d.rstats.layers++;
+            }
+            return;
+        }
         for (int64_t i = d.rs.can_issue(); i >= 0; i = d.rs.can_issue()) {
             ring_fill(d, (size_t) i, nullptr);
             d.rstats.layers++;
         }
+    }
+
+    // the matmuls of the layer read last are queued: its slot (bytes: its range) can take a later layer
+    void ring_release(device & d, ggml_backend_t backend) {
+        if (ring_bytes) {
+            const llama_moe_ring_bytes::released r = d.rb.release();
+            if (r.force >= 0) {
+                ggml_backend_event_wait(d.copy.get(), d.ev_used[r.force % llama_moe_ring_bytes::n_ev].get());
+            }
+            if (r.rel >= 0) {
+                ggml_backend_event_record(d.ev_used[r.rel % llama_moe_ring_bytes::n_ev].get(), backend);
+            }
+            return;
+        }
+        const int32_t rel = d.rs.release();
+        if (rel >= 0) {
+            ggml_backend_event_record(d.ev_used[rel].get(), backend);
+        }
+    }
+
+    // LLAMA_MOE_RING_BYTES: stage plan entry i into the byte ring: its uncached experts (up to the cap) and zeros after them, at
+    // whatever place has room; false (nothing queued) if the ring has none until a layer before it is released
+    bool rb_fill(device & d, size_t i, const std::vector<bool> * used, const std::vector<int32_t> * count = nullptr) {
+        const int64_t t0 = ggml_time_us();
+        const int32_t il = d.rb.plan[i].il;
+        const group & g = groups[layers[il].ig];
+        GGML_ASSERT(!d.rb.plan[i].issued);
+
+        ip_plan(d, il, g.rb_cap, used, count);
+        const int32_t n = d.ip.staged.empty() ? 0 : (int32_t) d.ip.staged.size() + 1;
+        int64_t wait = -1;
+        if (!d.rb.issue(i, n, g.rb_es, g.rb_limit, wait)) {
+            return false;
+        }
+        if (wait >= 0) {
+            ggml_backend_event_wait(d.copy.get(), d.ev_used[wait % llama_moe_ring_bytes::n_ev].get());
+        }
+        llama_moe_ring_bytes_sched::entry & e = d.rb.plan[i];
+        if (n > 0) {
+            ip_copy(d, il, g.stage[0], e.base);
+            d.ip.place((int32_t) e.base, g.rb_host);
+        } else {
+            d.ip.place(0, g.rb_host);
+            size_t layer_bytes = 0;
+            for (const ggml_tensor * w : layers[il].experts) {
+                layer_bytes += w->nb[2];
+            }
+            d.rstats.bytes_inplace += (size_t) d.ip.n_hit*layer_bytes;
+            d.rstats.bytes_zc      += d.ip.host.size()*layer_bytes;
+            d.rstats.ip_hit  += d.ip.n_hit;
+            d.rstats.ip_host += d.ip.host.size();
+        }
+        e.map = (int32_t) (d.rb_map_next++ % (uint32_t) (n_stage*ip_r));
+        ip_map(d, e.map, il);
+        if (n > 0) {
+            e.ev = (int32_t) (d.rb_ev_next++ % (uint32_t) llama_moe_ring_bytes::n_ev);
+            ggml_backend_event_record(d.ev_ready[e.ev].get(), d.copy.get());
+            d.last_slot = e.ev;
+        }
+        const int64_t t = ggml_time_us() - t0;
+        d.rstats.issue_us    += t;
+        d.rstats.issue_us_max = std::max(d.rstats.issue_us_max, t);
+        return true;
     }
 
     void ring_fill(device & d, size_t i, const std::vector<bool> * used, const std::vector<int32_t> * count = nullptr) {
@@ -5613,27 +5839,48 @@ struct llama_moe_cache::impl {
     }
 
     // LLAMA_MOE_RING_INPLACE: stage layer il in slot is on the copy stream: only the uncached experts, packed from place 0 (up to
-    // the group's cap, the others are read from host memory), then zeros; the layer's map goes to the slot's next pinned map
+    // the group's cap, the others are read from host memory), then zeros; the layer's map goes to the slot's next pinned map.
+    // LLAMA_MOE_RING_BYTES (the per-layer staging when the ring is dropped): slot is is a fixed part of the byte ring
     void ip_stage(device & d, int32_t il, int32_t is, const std::vector<bool> * used, const std::vector<int32_t> * count) {
+        const group & g = groups[layers[il].ig];
+        if (ring_bytes) {
+            ip_plan(d, il, g.rb_slot_cap, used, count);
+            ip_copy(d, il, g.stage[0], g.rb_slot_base[is]);
+            d.ip.place((int32_t) g.rb_slot_base[is], g.rb_host);
+        } else {
+            ip_plan(d, il, g.ip_cap, used, count);
+            ip_copy(d, il, g.stage[is], 0);
+        }
+        const int32_t j = is*ip_r + (int32_t) (d.ip_next[is]++ % ip_r);
+        ip_map(d, j, il);
+        d.ip_cur[is] = j;
+    }
+
+    void ip_plan(device & d, int32_t il, int32_t cap, const std::vector<bool> * used, const std::vector<int32_t> * count) {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
         const int32_t n_expert = (int32_t) l.stage_map->ne[1];
-        ggml_backend_t copy = d.copy.get();
-        llama_moe_ring_inplace & ip = d.ip;
-
-        if (!ip.plan(g.slru.slot_map[il], g.n_slots, g.slru.key_of.data(), n_expert, used, count, g.ip_cap, !l.ip_host.empty(), g.ip_read_past)) {
+        if (!d.ip.plan(g.slru.slot_map[il], g.n_slots, g.slru.key_of.data(), n_expert, used, count, cap, !l.ip_host.empty(), g.ip_read_past)) {
             GGML_ABORT("LLAMA_MOE_RING_INPLACE: layer %d has more uncached experts than its staging slot holds and no host reads", il);
         }
+    }
+
+    // the staged experts of the plan (d.ip) at places base.. of the staging tensors st_t, zeros after them; statistics
+    void ip_copy(device & d, int32_t il, const std::vector<ggml_tensor *> & st_t, int64_t base) {
+        const layer & l = layers[il];
+        ggml_backend_t copy = d.copy.get();
+        llama_moe_ring_inplace & ip = d.ip;
 
         const bool zc = copy_blocks != nullptr && !l.ring_host.empty() &&
             std::all_of(l.ring_host.begin(), l.ring_host.end(), [](const uint8_t * p) { return p != nullptr; });
         size_t layer_bytes = 0;
         for (size_t ip_t = 0; ip_t < l.experts.size(); ++ip_t) {
             const ggml_tensor * w  = l.experts[ip_t];
-            ggml_tensor       * st = g.stage[is][ip_t];
+            ggml_tensor       * st = st_t[ip_t];
             const size_t expert_size = w->nb[2];
             const uint8_t * data = (const uint8_t *) w->data;
-            GGML_ASSERT(st->nb[2] == expert_size && (int64_t) ip.staged.size() < st->ne[2]);
+            const size_t offs = (size_t) base*expert_size;
+            GGML_ASSERT(st->nb[2] == expert_size && base + (int64_t) ip.staged.size() < st->ne[2]);
             layer_bytes += expert_size;
 
             if (zc) {
@@ -5641,7 +5888,7 @@ struct llama_moe_cache::impl {
                 d.r_dst.clear();
                 d.r_src.clear();
                 for (size_t p = 0; p < ip.staged.size(); ++p) {
-                    d.r_dst.push_back((uint8_t *) st->data + p*expert_size);
+                    d.r_dst.push_back((uint8_t *) st->data + offs + p*expert_size);
                     d.r_src.push_back(l.ring_host[ip_t] + (size_t) ip.staged[p]*expert_size);
                 }
                 if (!d.r_dst.empty()) {
@@ -5655,26 +5902,16 @@ struct llama_moe_cache::impl {
                     while (p + n < ip.staged.size() && ip.staged[p + n] == ip.staged[p] + (int32_t) n) {
                         n++;
                     }
-                    ggml_backend_tensor_set_async(copy, st, data + (size_t) ip.staged[p]*expert_size, p*expert_size, n*expert_size);
+                    ggml_backend_tensor_set_async(copy, st, data + (size_t) ip.staged[p]*expert_size, offs + p*expert_size, n*expert_size);
                     d.rstats.copies++;
                     p += n;
                 }
             }
             // MMQ reads past the last staged expert: zeros (the slot has one place more than the cap)
             const size_t padding = std::min(expert_size, zeros.size());
-            ggml_backend_tensor_set_async(copy, st, d.pinned_zeros, ip.staged.size()*expert_size, padding);
+            ggml_backend_tensor_set_async(copy, st, d.pinned_zeros, offs + ip.staged.size()*expert_size, padding);
             d.rstats.copies++;
         }
-
-        // the map is uploaded at the layer's callback, from a pinned map whose last upload has run
-        const int32_t j = is*ip_r + (int32_t) (d.ip_next[is]++ % ip_r);
-        if (d.ip_ev_rec[j]) {
-            ggml_backend_event_synchronize(d.ip_ev[j].get());
-            d.ip_ev_rec[j] = false;
-        }
-        GGML_ASSERT(n_expert <= d.ip_map_n);
-        memcpy(d.ip_maps + (size_t) j*d.ip_map_n, ip.map.data(), n_expert*sizeof(int32_t));
-        d.ip_cur[is] = j;
 
         d.rstats.bytes_host    += ip.staged.size()*layer_bytes;
         d.rstats.bytes_inplace += (size_t) ip.n_hit*layer_bytes;
@@ -5684,9 +5921,19 @@ struct llama_moe_cache::impl {
         d.rstats.ip_host   += ip.host.size();
     }
 
-    // LLAMA_MOE_RING_INPLACE: at the callback of staged layer il read from slot is, its map instead of the identity
-    void ip_upload_map(ggml_backend_t backend, device & d, int32_t is, const ggml_tensor * src, ggml_tensor * dst) {
-        const int32_t j = d.ip_cur[is];
+    // the map of the plan (d.ip) to pinned map j, uploaded at the layer's callback, once the last upload from j has run
+    void ip_map(device & d, int32_t j, int32_t il) {
+        const int32_t n_expert = (int32_t) layers[il].stage_map->ne[1];
+        if (d.ip_ev_rec[j]) {
+            ggml_backend_event_synchronize(d.ip_ev[j].get());
+            d.ip_ev_rec[j] = false;
+        }
+        GGML_ASSERT(n_expert <= d.ip_map_n);
+        memcpy(d.ip_maps + (size_t) j*d.ip_map_n, d.ip.map.data(), n_expert*sizeof(int32_t));
+    }
+
+    // LLAMA_MOE_RING_INPLACE: at the callback of a staged layer, its map (pinned map j) instead of the identity
+    void ip_upload_map(ggml_backend_t backend, device & d, int32_t j, const ggml_tensor * src, ggml_tensor * dst) {
         GGML_ASSERT(j >= 0 && ggml_nelements(src) <= d.ip_map_n);
         ggml_backend_tensor_set_async(backend, dst, d.ip_maps + (size_t) j*d.ip_map_n, 0, ggml_nbytes(src));
         ggml_backend_event_record(d.ip_ev[j].get(), backend);
@@ -5860,17 +6107,93 @@ struct llama_moe_cache::impl {
 
     // the graph does not stage the device's layers as planned: the per-layer staging takes over for the rest of the graph
     void ring_stop(device & d) {
-        if (d.rs.active()) {
+        if (d.rs.active() || d.rb.active()) {
             d.rstats.dropped++;
         }
         d.rs.drop();
+        d.rb.drop();
         d.ring_fence = true;
         std::fill(d.slot_layer.begin(), d.slot_layer.end(), -1);
+    }
+
+    // LLAMA_MOE_RING_BYTES: ring_copy_stage over the byte ring (the caller holds the device's ring mutex)
+    bool rb_copy_stage(ggml_backend_t backend, device & d, int32_t il, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        if (!d.rb.active()) {
+            return false;
+        }
+        const int64_t i = d.rb.at_layer(il);
+        if (i < 0) {
+            LLAMA_LOG_WARN("%s: layer %d is not the next layer the MoE ring planned on %s, it stages one layer at a time for this graph\n",
+                __func__, il, ggml_backend_name(backend));
+            ring_stop(d);
+            return false;
+        }
+
+        // the matmuls of the layer staged before are queued: its range can take later layers
+        ring_release(d, backend);
+
+        if (!d.rb.plan[i].issued) {
+            // nothing is in flight before it now, so it fits (an idle ring holds a layer at the cap)
+            bool ok;
+            if (d.rb.plan[i].full) {
+                ok = rb_fill(d, (size_t) i, nullptr);
+                d.rstats.at_layer++;
+            } else {
+                // the selected experts only: the routing is read back (synchronizes the compute stream); if the matmul's ids
+                // cannot be read back in this split, all uncached experts are staged
+                const ggml_tensor * sel = find_stage_ids(graph, dst);
+                if (sel == nullptr) {
+                    ok = rb_fill(d, (size_t) i, nullptr);
+                    d.rstats.at_layer++;
+                } else {
+                    GGML_ASSERT(ggml_is_contiguous(sel));
+                    const int64_t n_expert = layers[il].stage_map->ne[1];
+                    d.r_ids.resize(ggml_nelements(sel));
+                    ggml_backend_tensor_get_async(backend, sel, d.r_ids.data(), 0, ggml_nbytes(sel));
+                    ggml_backend_synchronize(backend);
+                    d.r_used.assign(n_expert, false);
+                    d.ip_count.assign(n_expert, 0);
+                    for (int32_t id : d.r_ids) {
+                        GGML_ASSERT(id >= 0 && id < n_expert);
+                        d.r_used[id] = true;
+                        d.ip_count[id]++;
+                    }
+                    ok = rb_fill(d, (size_t) i, &d.r_used, &d.ip_count);
+                    d.rstats.partial++;
+                }
+            }
+            if (!ok) {
+                LLAMA_LOG_WARN("%s: layer %d does not fit the idle MoE ring on %s, it stages one layer at a time for this graph\n",
+                    __func__, il, ggml_backend_name(backend));
+                ring_stop(d);
+                return false;
+            }
+        }
+        ring_issue(d);
+
+        // the compute stream waits only for this layer's copies
+        const llama_moe_ring_bytes_sched::entry e = d.rb.plan[i];
+        if (e.ev >= 0) {
+            ggml_backend_event_wait(backend, d.ev_ready[e.ev].get());
+            if (d.last_slot == e.ev) {
+                d.last_slot = -1;
+            }
+        }
+        d.rb.consume((size_t) i);
+        d.rstats.consumed++;
+        d.rstats.ahead_sum += d.rb.ahead();
+        d.rstats.ahead_max  = std::max(d.rstats.ahead_max, d.rb.ahead());
+
+        ip_upload_map(backend, d, e.map, src, dst);
+        return true;
     }
 
     // the staged layer il of the ring: returns false if the ring does not serve it
     bool ring_copy_stage(ggml_backend_t backend, device & d, int32_t il, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         std::lock_guard<std::mutex> lock(*d.mtx);
+        if (ring_bytes) {
+            return rb_copy_stage(backend, d, il, src, dst, graph);
+        }
         if (!d.rs.active()) {
             return false;
         }
@@ -5926,9 +6249,14 @@ struct llama_moe_cache::impl {
             d.last_slot = -1;
         }
         d.rs.consume((size_t) i);
+        // lookahead: the layers issued beyond this one when its matmuls were queued
+        const size_t ahead_now = d.rs.next_issue > (size_t) i + 1 ? d.rs.next_issue - (size_t) i - 1 : 0;
+        d.rstats.consumed++;
+        d.rstats.ahead_sum += ahead_now;
+        d.rstats.ahead_max  = std::max(d.rstats.ahead_max, ahead_now);
 
         if (in_place(il)) {
-            ip_upload_map(backend, d, e.slot, src, dst);
+            ip_upload_map(backend, d, d.ip_cur[e.slot], src, dst);
             return true;
         }
         // the staging map is the identity
@@ -6005,7 +6333,7 @@ struct llama_moe_cache::impl {
         }
 
         if (in_place(il)) {
-            ip_upload_map(backend, d, is, src, dst);
+            ip_upload_map(backend, d, d.ip_cur[is], src, dst);
             return true;
         }
         // the staging map is the identity
@@ -6345,6 +6673,10 @@ struct llama_moe_cache::impl {
                 "%zu copies + %zu kernels queued, %.2f GiB uploaded, %.2f GiB from the cache; host %.1f ms queueing (max %.2f ms a layer)\n", log_tag(),
                 ggml_backend_name(d.backend), r.graphs, r.layers, r.at_layer, r.partial, r.dropped, r.copies, r.launches,
                 r.bytes_host/1024.0/1024.0/1024.0, r.bytes_cache/1024.0/1024.0/1024.0, r.issue_us/1000.0, r.issue_us_max/1000.0);
+            if (r.consumed > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: ring %s lookahead: %.2f layers issued beyond the one computing on average, max %zu (%s)\n",
+                    ggml_backend_name(d.backend), (double) r.ahead_sum/r.consumed, r.ahead_max, ring_bytes ? "byte ring" : "slots");
+            }
             if (ring_inplace && r.ip_hit + r.ip_staged + r.ip_host > 0) {
                 const double n = (double) (r.ip_hit + r.ip_staged + r.ip_host);
                 LLAMA_LOG_INFO("llama_moe_cache: ring %s in place: %zu experts read from their cache slot (%.1f%%, %.2f GiB), %zu staged "
