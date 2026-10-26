@@ -6,6 +6,8 @@
 // - the copy plan covers every selected expert exactly once: uploaded if not cached, uploaded or copied from the cache if cached
 #include "../src/llama-moe-ring.h"
 
+#include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -284,11 +286,131 @@ static void test_copies(std::mt19937 & rng) {
     CHECK(cp.upload.size() == 2 && cp.cached.size() == 3, "example merge 1: %zu runs, %zu cached", cp.upload.size(), cp.cached.size());
 }
 
+// LLAMA_MOE_RING_INPLACE: every used expert resolves to its own weights (cache slot holding it, staging place it is copied to, or
+// the host experts), no slot is read in place when MMQ's read past its end would leave the occupied slots, the staging slot holds
+// at most cap experts, host memory only on overflow (busiest experts staged first), never the last expert with read_past
+static void test_inplace(std::mt19937 & rng) {
+    size_t n_plans = 0, n_host = 0, n_refused = 0;
+    for (int it = 0; it < 20000; ++it) {
+        const int32_t n_expert = 1 + (int32_t) (rng() % (it < 1000 ? 16 : 600));
+        const int32_t n_slots  = (int32_t) (rng() % (2*n_expert + 2));
+        // slots: some experts of this layer cached, the other slots empty or holding other layers' experts
+        std::vector<int32_t> key_of(n_slots, -1);
+        std::vector<int32_t> slots(n_expert, n_slots + (int32_t) (rng() % 3)); // >= n_slots: not cached
+        std::vector<int32_t> free_slots(n_slots);
+        for (int32_t s = 0; s < n_slots; ++s) {
+            free_slots[s] = s;
+        }
+        std::shuffle(free_slots.begin(), free_slots.end(), rng);
+        const int32_t share = (int32_t) (rng() % 101);
+        size_t next = 0;
+        for (int32_t e = 0; e < n_expert && next < free_slots.size(); ++e) {
+            if ((int32_t) (rng() % 100) < share) {
+                slots[e] = free_slots[next++];
+                key_of[slots[e]] = e;
+            }
+        }
+        for (; next < free_slots.size(); ++next) {
+            if (rng() % 2) {
+                key_of[free_slots[next]] = 100000 + (int32_t) next; // another layer's expert
+            }
+        }
+        const bool partial   = rng() % 2;
+        const bool counted   = partial && rng() % 2;
+        const bool can_host  = rng() % 4 != 0;
+        const bool read_past = rng() % 2;
+        const int32_t cap    = (int32_t) (rng() % (n_expert + 1));
+        std::vector<bool> used(n_expert, true);
+        std::vector<int32_t> count(n_expert, 0);
+        if (partial) {
+            for (int32_t e = 0; e < n_expert; ++e) {
+                used[e]  = rng() % 3 != 0;
+                count[e] = used[e] ? 1 + (int32_t) (rng() % 50) : 0;
+            }
+        }
+
+        llama_moe_ring_inplace ip;
+        const bool ok = ip.plan(slots.data(), n_slots, key_of.data(), n_expert, partial ? &used : nullptr, counted ? &count : nullptr,
+            cap, can_host, read_past);
+
+        // the misses the rule must stage or read from host memory
+        auto in_place = [&](int32_t e) {
+            const int32_t s = slots[e];
+            return s < n_slots && (!read_past || (s + 1 < n_slots && key_of[s + 1] >= 0));
+        };
+        int32_t n_miss = 0, n_hits = 0;
+        bool last_miss = false;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (used[e]) {
+                if (in_place(e)) {
+                    n_hits++;
+                } else {
+                    n_miss++;
+                    last_miss = last_miss || e == n_expert - 1;
+                }
+            }
+        }
+        if (!ok) {
+            n_refused++;
+            CHECK(n_miss > cap && (!can_host || (cap == 0 && read_past && last_miss)), "refused without cause: %d misses, cap %d", n_miss, cap);
+            continue;
+        }
+        n_plans++;
+        n_host += !ip.host.empty();
+        CHECK(ip.n_hit == n_hits, "hits %d vs %d", ip.n_hit, n_hits);
+        CHECK((int32_t) ip.staged.size() <= cap, "staged %zu > cap %d", ip.staged.size(), cap);
+        CHECK((int32_t) (ip.staged.size() + ip.host.size()) == n_miss, "misses %d, staged %zu + host %zu", n_miss, ip.staged.size(), ip.host.size());
+        CHECK(n_miss <= cap ? ip.host.empty() : (int32_t) ip.staged.size() == cap, "host used without overflow / staging not full");
+        CHECK(std::is_sorted(ip.staged.begin(), ip.staged.end()) && std::adjacent_find(ip.staged.begin(), ip.staged.end()) == ip.staged.end(), "staged order");
+        CHECK(ip.host.empty() || can_host, "host memory without can_host");
+        // every used expert reads its own weights: bank slot s holds key_of[s], staging place p holds staged[p], host holds all
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (!used[e]) {
+                continue;
+            }
+            const int32_t v = ip.map[e];
+            if (v >= 0) {
+                CHECK(v < n_slots && key_of[v] == e, "expert %d read from slot %d holding %d", e, v, v < n_slots ? key_of[v] : -9);
+                CHECK(!read_past || (v + 1 < n_slots && key_of[v + 1] >= 0), "slot %d read in place, read past lands outside the experts", v);
+            } else if (-1 - v < cap) {
+                const int32_t p = -1 - v;
+                CHECK(p < (int32_t) ip.staged.size() && ip.staged[p] == e, "expert %d read from place %d", e, p);
+            } else {
+                CHECK(std::binary_search(ip.host.begin(), ip.host.end(), e), "expert %d read from host memory but not listed", e);
+                CHECK(!(read_past && e == n_expert - 1), "the last expert read from host memory with read past");
+            }
+        }
+        if (counted && !ip.host.empty()) {
+            int32_t min_staged = INT32_MAX, max_host = 0;
+            for (int32_t e : ip.staged) {
+                if (!(read_past && e == n_expert - 1)) {
+                    min_staged = std::min(min_staged, count[e]);
+                }
+            }
+            for (int32_t e : ip.host) {
+                max_host = std::max(max_host, count[e]);
+            }
+            CHECK(min_staged >= max_host, "a busier expert (%d tokens) read from host memory than one staged (%d)", max_host, min_staged);
+        }
+    }
+    CHECK(n_plans > 5000 && n_host > 1000 && n_refused > 100, "coverage: %zu plans, %zu with host reads, %zu refused", n_plans, n_host, n_refused);
+
+    // Flash-Next down projection: slot 1 is followed by an empty slot, so its expert (3) is staged with read past
+    std::vector<int32_t> slots  = { 0, 8, 3, 1, 8 };
+    std::vector<int32_t> key_of = { 0, 3, -1, 2, 7, -1, 5, 6 };
+    llama_moe_ring_inplace ip;
+    CHECK(ip.plan(slots.data(), 8, key_of.data(), 5, nullptr, nullptr, 3, true, true), "example refused");
+    CHECK(ip.map[0] == 0 && ip.map[2] == 3 && ip.staged == std::vector<int32_t>({ 1, 3, 4 }) && ip.host.empty(), "example read past");
+    CHECK(ip.plan(slots.data(), 8, key_of.data(), 5, nullptr, nullptr, 3, true, false), "example refused");
+    CHECK(ip.map[3] == 1 && ip.map[1] == -1 && ip.map[4] == -2 && ip.staged == std::vector<int32_t>({ 1, 4 }), "example without read past");
+}
+
 int main() {
     std::mt19937 rng(42);
     test_sched(rng);
     test_lookahead();
     test_copies(rng);
+    test_inplace(rng);
     if (fails == 0) {
         printf("test-moe-ring: all OK\n");
     } else {

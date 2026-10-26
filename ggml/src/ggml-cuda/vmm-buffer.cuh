@@ -21,6 +21,12 @@ struct ggml_cuda_vmm_region {
     std::vector<CUmemAccessDesc> access;
     std::vector<bool>            backed;
     size_t                       n_backed = 0;
+    // per granule: first granule of its mapping (each mapping maps its own allocation from offset 0; a mapping is unmapped
+    // only as a whole), and whether it maps another region's memory (ggml_cuda_vmm_region_alias, not counted as backed)
+    std::vector<size_t>          map_start;
+    std::vector<size_t>          map_len;   // at map_start: granules of the mapping
+    std::vector<bool>            aliased;
+    size_t                       n_alias = 0;
 };
 
 // nullptr if the address space or the zero granule cannot be had
@@ -41,6 +47,15 @@ size_t ggml_cuda_vmm_region_release_spare(ggml_cuda_vmm_region * r, size_t offse
 
 // as commit, the device's spare granules first (no cuMemCreate for them); zero = false leaves the memory as it is
 bool ggml_cuda_vmm_region_commit_spare(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool zero);
+
+// as commit, one allocation and one mapping for each unbacked run of [offset, offset + size) instead of one per granule
+// (granule by granule if the device cannot give a run in one piece); such a run is released only as a whole
+bool ggml_cuda_vmm_region_commit_chunk(ggml_cuda_vmm_region * r, size_t offset, size_t size);
+
+// map the memory backing src [src_offset, src_offset + size) also at dst [dst_offset, ...) (unbacked there, granule aligned):
+// both ranges then read and write the same memory, nothing is allocated; one mapping per allocation of src
+// false (nothing changed) if src is not backed there or dst is
+bool ggml_cuda_vmm_region_alias(ggml_cuda_vmm_region * dst, size_t dst_offset, const ggml_cuda_vmm_region * src, size_t src_offset, size_t size);
 
 // frees the spare granules of a physical device, returns the bytes
 size_t ggml_cuda_vmm_spare_trim(int physical_device);

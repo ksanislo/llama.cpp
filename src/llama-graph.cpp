@@ -1750,7 +1750,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache or a staging slot are selected by their slots
     // with LLAMA_MOE_DEVICE_HITS the misses (negative slots) are read from the host experts mapped to the device
     ggml_tensor * mapped = slots != nullptr && cached ? moe_cache->get_mapped_experts(w, slots->ne[1], slots->ne[0]) : nullptr;
-    ggml_tensor * res = slots == nullptr ?
+    // with LLAMA_MOE_RING_INPLACE a staged layer reads the cached experts in place, by its map (see build_moe_cache_slots)
+    const bool in_place = slots != nullptr && cached && slots->view_src != nullptr && slots->view_src->op == GGML_OP_GET_ROWS &&
+        moe_cache->stage_in_place(w, slots->ne[1], slots->ne[0]);
+    ggml_tensor * res = in_place ?
+        ggml_mul_mat_id_slots(ctx0, moe_cache->get_experts(w), moe_cache->get_staged_experts(w), moe_cache->get_inplace_host(w), cur_mm,
+            ggml_reshape_2d(ctx0, slots->view_src->src[1], slots->ne[0], slots->ne[1]), slots->view_src->src[0]) :
+        slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         mapped != nullptr ?
         ggml_mul_mat_id_mapped(ctx0, moe_cache->get_experts(w, slots->ne[1], slots->ne[0]), mapped, cur_mm, slots) :
@@ -2754,6 +2760,19 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         ggml_build_forward_expand(gf, logged);
 
         return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+    }
+
+    if (moe_cache->stage_in_place(il, selected_experts->ne[1], selected_experts->ne[0])) {
+        // LLAMA_MOE_RING_INPLACE: the matmuls read each expert where the layer's staging map says (ggml_mul_mat_id_slots); the map
+        // is a host weight read by a cont on the device, so the scheduler starts a split there and the copy callback stages the
+        // layer and uploads its map. The lookup below is not computed, it holds the map and the selected experts for
+        // build_lora_mm_id (and is the lookup the callers key the layer by)
+        ggml_tensor * map = ggml_cont(ctx0, slot_map);
+        ggml_backend_sched_set_tensor_backend(sched, map, moe_cache->backend(il));
+        cb(map, "ffn_moe_stage_map", il);
+        ggml_build_forward_expand(gf, map);
+        ggml_tensor * lookup = ggml_get_rows(ctx0, map, ids);
+        return ggml_reshape_2d(ctx0, lookup, selected_experts->ne[0], selected_experts->ne[1]);
     }
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback

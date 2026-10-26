@@ -856,7 +856,13 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
     const size_t nbw1 = (src1->type == vec_dot_type) ? nb11 : ggml_row_size(vec_dot_type, ne10);
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
 
-    const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+    // ggml_mul_mat_id_mapped / _slots: the groups after those of src0 are the experts of src[3], then those of src[5]
+    const struct ggml_tensor * src_alt  = dst->src[3];
+    const struct ggml_tensor * src_host = dst->src[5];
+    const int64_t n_alt = src_alt ? src_alt->ne[2] : 0;
+    const char * src0_cur = cur_a < ne02         ? (const char *) src0->data     + cur_a * nb02
+                          : cur_a < ne02 + n_alt ? (const char *) src_alt->data  + (cur_a - ne02) * src_alt->nb[2]
+                                                 : (const char *) src_host->data + (cur_a - ne02 - n_alt) * src_host->nb[2];
 
     // this thread's workspace
     tiled_ws * ws = (tiled_ws *) (scratch + (size_t) ith * ggml_tiled_ws_size());

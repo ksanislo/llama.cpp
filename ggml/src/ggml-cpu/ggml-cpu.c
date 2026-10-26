@@ -1609,7 +1609,9 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
-    const struct ggml_tensor * src_alt = dst->src[3]; // ggml_mul_mat_id_mapped: experts of negative ids
+    const struct ggml_tensor * src_alt  = dst->src[3]; // ggml_mul_mat_id_mapped: experts of negative ids
+    const struct ggml_tensor * id_map   = dst->src[4]; // ggml_mul_mat_id_slots: where each expert is read
+    const struct ggml_tensor * src_host = dst->src[5];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1633,10 +1635,11 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    // row groups, the experts of src_alt are numbered after those of src0
+    // row groups, the experts of src_alt are numbered after those of src0, then those of src_host
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as0 = ne02;       // n_expert
-    const int n_as  = n_as0 + (src_alt ? (int) src_alt->ne[2] : 0);
+    const int n_alt = src_alt ? (int) src_alt->ne[2] : 0;
+    const int n_as  = n_as0 + n_alt + (src_host ? (int) src_host->ne[2] : 0);
 
     void * wdata_cur = params->wdata;
 
@@ -1705,6 +1708,25 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                if (id_map != NULL) {
+                    // ggml_mul_mat_id_slots: expert e is read from its slot, its staging place or the host experts
+                    const int32_t e = i02;
+                    GGML_ASSERT(e >= 0 && e < ggml_nelements(id_map));
+                    const int32_t v = ((const int32_t *) id_map->data)[e];
+                    if (v >= 0) {
+                        i02 = v;
+                    } else if (-1 - (int64_t) v < n_alt) {
+                        i02 = n_as0 + (-1 - v);
+                    } else {
+                        GGML_ASSERT(src_host != NULL);
+                        i02 = n_as0 + n_alt + e;
+                    }
+                    GGML_ASSERT(i02 < n_as);
+                    MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                    matrix_row_counts[i02] += 1;
+                    continue;
+                }
+
                 // a negative id selects expert -1 - id of src_alt, without src_alt it skips the row, its result is zero
                 // so does an id past the experts of src_alt (an expert of the MoE CPU lane, ggml_moe_doorbell)
                 if (i02 < 0) {
@@ -1746,12 +1768,13 @@ static void ggml_compute_forward_mul_mat_id(
 #else
         const bool mr_rows = false;
 #endif
-        if (!mr_rows && cur_a < n_as0 && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        if (!mr_rows && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
-        const char * src0_cur = cur_a < n_as0 ? (const char *) src0->data    + cur_a * nb02
-                                              : (const char *) src_alt->data + (cur_a - n_as0) * src_alt->nb[2];
+        const char * src0_cur = cur_a < n_as0         ? (const char *) src0->data     + cur_a * nb02
+                              : cur_a < n_as0 + n_alt ? (const char *) src_alt->data  + (cur_a - n_as0) * src_alt->nb[2]
+                                                      : (const char *) src_host->data + (cur_a - n_as0 - n_alt) * src_host->nb[2];
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -2985,7 +3008,7 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
                         const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-                        const int n_as = src0->ne[2] + (node->src[3] ? node->src[3]->ne[2] : 0);
+                        const int n_as = src0->ne[2] + (node->src[3] ? node->src[3]->ne[2] : 0) + (node->src[5] ? node->src[5]->ne[2] : 0);
                         // src1
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);

@@ -597,6 +597,10 @@ extern "C" {
     // until something synchronizes the context (reading logits or state)
     LLAMA_API bool     llama_pipeline_parallel(const struct llama_context * ctx);
 
+    // true if large batches read experts kept in host memory (MoE cache, --moe-cache-mib): each ubatch of a prompt then
+    // streams about all experts of a layer, whatever its size, so a prompt split into more ubatches costs that much more
+    LLAMA_API bool     llama_moe_streams_experts(const struct llama_context * ctx);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

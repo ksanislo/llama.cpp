@@ -91,6 +91,8 @@
 #define cudaOccupancyMaxPotentialBlockSize musaOccupancyMaxPotentialBlockSize
 #define cudaSetDevice musaSetDevice
 #define cudaStreamCreateWithFlags musaStreamCreateWithFlags
+#define cudaStreamCreateWithPriority musaStreamCreateWithPriority
+#define cudaDeviceGetStreamPriorityRange musaDeviceGetStreamPriorityRange
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamFireAndForget musaStreamFireAndForget
 #define cudaStreamNonBlocking musaStreamNonBlocking

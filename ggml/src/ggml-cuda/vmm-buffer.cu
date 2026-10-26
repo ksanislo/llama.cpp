@@ -37,6 +37,9 @@ ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, int physical_devi
     r->size            = GGML_PAD(std::max<size_t>(size, 1), granularity);
     r->access          = access;
     r->backed.assign(r->size/granularity, false);
+    r->map_start.assign(r->backed.size(), 0);
+    r->map_len.assign(r->backed.size(), 1);
+    r->aliased.assign(r->backed.size(), false);
 
     ggml_cuda_set_device(device);
 
@@ -156,7 +159,9 @@ static bool ggml_cuda_vmm_region_commit_impl(ggml_cuda_vmm_region * r, size_t of
         for (size_t j = 0; j < n; ++j) {
             CU_CHECK(cuMemMap(ptr + j*r->granularity, r->granularity, 0, handles[i + j], 0));
             CU_CHECK(cuMemRelease(handles[i + j])); // the mapping keeps the memory
-            r->backed[todo[i + j]] = true;
+            r->backed[todo[i + j]]    = true;
+            r->map_start[todo[i + j]] = todo[i + j];
+            r->map_len[todo[i + j]]   = 1;
         }
         CU_CHECK(cuMemSetAccess(ptr, n*r->granularity, r->access.data(), r->access.size()));
 
@@ -212,10 +217,15 @@ static size_t ggml_cuda_vmm_region_release_impl(ggml_cuda_vmm_region * r, size_t
             g++;
             continue;
         }
-
-        size_t n = 1;
-        while (g + n < g1 && r->backed[g + n]) {
-            n++;
+        // whole mappings only: one that reaches out of the range stays
+        const size_t ms = r->map_start[g];
+        if (ms < g0 || ms + r->map_len[ms] > g1) {
+            g = ms + r->map_len[ms];
+            continue;
+        }
+        size_t end = ms + r->map_len[ms];
+        while (end < g1 && r->backed[end] && r->map_start[end] == end && end + r->map_len[end] <= g1) {
+            end += r->map_len[end];
         }
 
         if (!synced) {
@@ -223,27 +233,33 @@ static size_t ggml_cuda_vmm_region_release_impl(ggml_cuda_vmm_region * r, size_t
             synced = true;
         }
 
-        if (spare) {
-            // keep the physical granules: a handle of each, then the unmap leaves the memory allocated
-            std::vector<CUmemGenericAllocationHandle> hs(n);
-            for (size_t j = 0; j < n; ++j) {
-                CU_CHECK(cuMemRetainAllocationHandle(&hs[j], (void *) (r->base + (g + j)*r->granularity)));
+        for (size_t m = g; m < end; m += r->map_len[m]) {
+            const size_t len = r->map_len[m];
+            if (r->aliased[m]) {
+                // another region's memory: only this mapping goes
+                r->n_alias -= len;
+                continue;
             }
-            std::lock_guard<std::mutex> lock(g_vmm_spare_mtx);
-            auto & sp = g_vmm_spare[r->physical_device];
-            for (CUmemGenericAllocationHandle h : hs) {
-                sp.push_back({ h, r->granularity });
+            if (spare) {
+                // keep the physical memory: a handle of the allocation, then the unmap leaves it allocated
+                CUmemGenericAllocationHandle h;
+                CU_CHECK(cuMemRetainAllocationHandle(&h, (void *) (r->base + m*r->granularity)));
+                std::lock_guard<std::mutex> lock(g_vmm_spare_mtx);
+                g_vmm_spare[r->physical_device].push_back({ h, len*r->granularity });
             }
+            n_freed += len;
         }
-        CU_CHECK(cuMemUnmap(r->base + g*r->granularity, n*r->granularity));
-        ggml_cuda_vmm_map_zero(r, g, g + n);
+        CU_CHECK(cuMemUnmap(r->base + g*r->granularity, (end - g)*r->granularity));
+        ggml_cuda_vmm_map_zero(r, g, end);
 
-        for (size_t j = 0; j < n; ++j) {
-            r->backed[g + j] = false;
+        for (size_t j = g; j < end; ++j) {
+            r->backed[j]    = false;
+            r->aliased[j]   = false;
+            r->map_start[j] = j;
+            r->map_len[j]   = 1;
         }
 
-        n_freed += n;
-        g += n;
+        g = end;
     }
 
     r->n_backed -= n_freed;
@@ -251,17 +267,120 @@ static size_t ggml_cuda_vmm_region_release_impl(ggml_cuda_vmm_region * r, size_t
     return n_freed*r->granularity;
 }
 
+bool ggml_cuda_vmm_region_commit_chunk(ggml_cuda_vmm_region * r, size_t offset, size_t size) {
+    if (size == 0 || offset >= r->size) {
+        return true;
+    }
+
+    const size_t g0 = offset/r->granularity;
+    const size_t g1 = std::min(r->backed.size(), (offset + size + r->granularity - 1)/r->granularity);
+
+    ggml_cuda_set_device(r->device);
+
+    bool synced = false;
+    for (size_t g = g0; g < g1; ) {
+        if (r->backed[g]) {
+            g++;
+            continue;
+        }
+        size_t end = g + 1;
+        while (end < g1 && !r->backed[end]) {
+            end++;
+        }
+        const size_t n = end - g;
+
+        CUmemGenericAllocationHandle h;
+        if (ggml_cuda_vmm_create(&h, n*r->granularity, r->physical_device) != CUDA_SUCCESS) {
+            // no run of that size: granule by granule
+            if (!ggml_cuda_vmm_region_commit_impl(r, g*r->granularity, n*r->granularity, false, true)) {
+                return false;
+            }
+            g = end;
+            continue;
+        }
+        if (!synced) {
+            ggml_cuda_vmm_sync(r);
+            synced = true;
+        }
+
+        const CUdeviceptr ptr = r->base + g*r->granularity;
+        CU_CHECK(cuMemUnmap(ptr, n*r->granularity));
+        CU_CHECK(cuMemMap(ptr, n*r->granularity, 0, h, 0));
+        CU_CHECK(cuMemRelease(h)); // the mapping keeps the memory
+        CU_CHECK(cuMemSetAccess(ptr, n*r->granularity, r->access.data(), r->access.size()));
+        CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, n*r->granularity, cudaStreamPerThread));
+
+        for (size_t j = g; j < end; ++j) {
+            r->backed[j]    = true;
+            r->map_start[j] = g;
+        }
+        r->map_len[g] = n;
+        r->n_backed  += n;
+
+        g = end;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+    return true;
+}
+
+bool ggml_cuda_vmm_region_alias(ggml_cuda_vmm_region * dst, size_t dst_offset, const ggml_cuda_vmm_region * src, size_t src_offset, size_t size) {
+    const size_t G = dst->granularity;
+    if (size == 0) {
+        return true;
+    }
+    if (src->granularity != G || src->physical_device != dst->physical_device || dst_offset % G != 0 || src_offset % G != 0 ||
+        size % G != 0 || dst_offset + size > dst->size || src_offset + size > src->size) {
+        return false;
+    }
+    const size_t n  = size/G;
+    const size_t ds = dst_offset/G;
+    const size_t ss = src_offset/G;
+    for (size_t i = 0; i < n; ++i) {
+        if (!src->backed[ss + i] || src->aliased[ss + i] || dst->backed[ds + i]) {
+            return false;
+        }
+    }
+
+    ggml_cuda_vmm_sync(dst);
+
+    const CUdeviceptr dptr = dst->base + ds*G;
+    CU_CHECK(cuMemUnmap(dptr, n*G)); // the zero granule mappings
+    for (size_t i = 0; i < n; ) {
+        const size_t g  = ss + i;
+        const size_t ms = src->map_start[g];
+        const size_t k  = std::min(ms + src->map_len[ms] - g, n - i);
+
+        CUmemGenericAllocationHandle h;
+        CU_CHECK(cuMemRetainAllocationHandle(&h, (void *) (src->base + ms*G)));
+        CU_CHECK(cuMemMap(dptr + i*G, k*G, (g - ms)*G, h, 0));
+        CU_CHECK(cuMemRelease(h)); // the mappings keep the memory
+
+        for (size_t j = 0; j < k; ++j) {
+            dst->backed[ds + i + j]    = true;
+            dst->aliased[ds + i + j]   = true;
+            dst->map_start[ds + i + j] = ds + i;
+        }
+        dst->map_len[ds + i] = k;
+        i += k;
+    }
+    CU_CHECK(cuMemSetAccess(dptr, n*G, dst->access.data(), dst->access.size()));
+    dst->n_alias += n;
+
+    return true;
+}
+
 void ggml_cuda_vmm_region_memset_backed(ggml_cuda_vmm_region * r, uint8_t value) {
     ggml_cuda_set_device(r->device);
 
     for (size_t g = 0; g < r->backed.size(); ) {
-        if (!r->backed[g]) {
+        if (!r->backed[g] || r->aliased[g]) {
             g++;
             continue;
         }
 
         size_t n = 1;
-        while (g + n < r->backed.size() && r->backed[g + n]) {
+        while (g + n < r->backed.size() && r->backed[g + n] && !r->aliased[g + n]) {
             n++;
         }
 

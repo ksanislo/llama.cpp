@@ -16,6 +16,8 @@ struct llama_model;
 // with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
 // with LLAMA_MOE_RING=K the K staging slots are a ring: every uncached expert of a device's staged layers streams on the copy stream in
 // layer order, independent of the routing, as far ahead as the slots allow, with no host step per layer (borrows the cache by default)
+// with LLAMA_MOE_RING_INPLACE=1 in addition the cached experts are read in place from the cache (ggml_mul_mat_id_slots over a per-layer
+// map) and the staging slots hold only the uncached ones (LLAMA_MOE_RING_INPLACE_CAP places, the rest read from host memory directly)
 // with LLAMA_MOE_PREFETCH=k the router of the next layer is applied to the input of the current one, and the missing experts among its top k
 // are uploaded on a second stream while the current layer and the attention of the next one compute (decode, cached batches only)
 // with LLAMA_MOE_DEVICE_HITS=1|2 small batches look the slots up on the device and read the misses straight from the pinned host experts,
@@ -73,6 +75,13 @@ public:
 
     // the experts of w in its staging slot, nullptr if w is not staged
     ggml_tensor * get_staged_experts(const ggml_tensor * w) const;
+
+    // LLAMA_MOE_RING_INPLACE: whether the staged batches of n_tokens tokens of layer il (of the layer of w) read the experts with
+    // ggml_mul_mat_id_slots: the cached ones in place from the cache (get_experts), the others from the staging slot
+    // (get_staged_experts) or, beyond its places, from the host experts mapped to the device (get_inplace_host), by the staging map
+    bool stage_in_place(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+    bool stage_in_place(const ggml_tensor * w, int64_t n_tokens, int64_t n_expert_used) const;
+    ggml_tensor * get_inplace_host(const ggml_tensor * w) const;
 
     // the share of the misses that the CPU computes while the device uploads the others, 0 if all misses are uploaded
     float cpu_share() const;

@@ -1535,6 +1535,21 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // ggml_mul_mat_id over experts in up to three tensors of the same type and expert layout, chosen per expert by a map:
+    // ids are the experts [0, n) as for ggml_mul_mat_id, n = ggml_nelements(map) (I32, contiguous); expert e reads
+    //   as[v]                       if v = map[e] >= 0  (e.g. its slot in an expert cache)
+    //   as_alt[-1 - v]              if -as_alt->ne[2] <= v < 0  (e.g. its place in a staging area)
+    //   as_host[e]                  otherwise (as_host holds all n experts, e.g. host memory the device reads directly)
+    // the experts are grouped by e (n groups), not by where they are read: n, not as->ne[2], sizes the work
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_slots(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * as_alt,
+            struct ggml_tensor  * as_host, // may be NULL
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map);
+
     // MoE CPU lane: a host thread computes part of the experts of a MUL_MAT_ID while the backend computes the others.
     // They meet in a channel: host memory that both the backend and the host thread read and write (pinned memory mapped to
     // a GPU), laid out by ggml_moe_lane_layout, passed by address (for a GPU: its address on the device, the same on UVA).

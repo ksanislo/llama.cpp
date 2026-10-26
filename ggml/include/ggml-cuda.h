@@ -34,6 +34,10 @@ GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_release(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_release_spare(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_commit_spare(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool zero);
+// as commit, one allocation per unbacked run (fewer, larger mappings); such a run is released only as a whole
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_commit_chunk(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+// map the memory backing src [src_offset, +size) also at dst [dst_offset, +size) (granule aligned, unbacked in dst): no allocation
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_alias(ggml_backend_buffer_t dst, size_t dst_offset, ggml_backend_buffer_t src, size_t src_offset, size_t size);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_spare_trim(ggml_backend_buffer_type_t buft);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_get_backed_size(ggml_backend_buffer_t buffer);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_get_granularity(ggml_backend_buffer_type_t buft);
