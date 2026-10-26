@@ -7,6 +7,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -131,6 +132,23 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// One ubatch of a decode whose nextn embeddings are read back unmasked, handed to a consumer that starts on it before
+// the decode ends (LLAMA_MTP_PIPE: the MTP draft's prompt K/V beside the target's prompt pipe). Called on the decoding
+// thread right after the ubatch is queued. n == 0: the batch cannot be followed from entry i0 on (a ubatch out of order,
+// of several sequences or of embeddings); no more calls for this batch.
+struct llama_nextn_chunk {
+    int32_t             n_tokens_all; // entries in the whole batch
+    int32_t             i0;           // this ubatch = batch entries [i0, i0 + n), in batch order
+    int32_t             n;
+    const llama_token * tokens;       // n token ids, valid during the call
+    const llama_pos   * pos;          // n positions, valid during the call
+    llama_seq_id        seq_id;       // the ubatch's only sequence
+    const float       * h;            // the batch's nextn rows on the host, row i at h + i*n_embd_out (rows [0, i0 + n) after wait)
+    std::function<bool()> wait;       // any thread: blocks until rows [i0, i0 + n) are on the host; false on a timeout
+};
+// only for batches of n_min+ entries
+LLAMA_API void llama_set_nextn_chunk_callback(struct llama_context * ctx, std::function<void(const llama_nextn_chunk &)> cb, int32_t n_min);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);

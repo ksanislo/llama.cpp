@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -414,6 +415,27 @@ static void submit_probe_cb(ggml_backend_sched_t, ggml_backend_t backend, int co
     p->open[b] = begin;
 }
 
+// ggml_backend_sched_post_callback as llama's LLAMA_MTP_PIPE uses it: after each graph's output read, an event recorded in
+// stream order (by the backend's submit thread) and a flag set; a consumer thread waits for the flag + the event and must
+// then see the graph's output on the host, while later graphs are still being queued
+struct post_ready {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    recorded = false;
+    bool                    main_thread = false;
+    ggml_backend_event_t    ev = nullptr;
+};
+
+static void post_record(ggml_backend_t backend, void * ud) {
+    auto * r = (post_ready *) ud;
+    ggml_backend_event_record(r->ev, backend);
+    {
+        std::lock_guard<std::mutex> lock(r->mtx);
+        r->recorded = true;
+    }
+    r->cv.notify_all();
+}
+
 // run n_graph graphs: with submit threads none of them is synchronized before the end
 static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<std::vector<float>> & out) {
     ggml_backend_t backends[3] = { tdev_init(0, seed), tdev_init(1, seed + 1), ggml_backend_cpu_init() };
@@ -444,6 +466,42 @@ static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<
     ggml_context * ctxs[4] = { nullptr, nullptr, nullptr, nullptr };
     out.assign(n_graph, std::vector<float>(N_EMBD, 0.0f));
     std::vector<std::vector<float>> inputs(n_graph);
+
+    // the consumer of the post callbacks (checks each graph's output as soon as its event says it landed)
+    std::vector<std::unique_ptr<post_ready>> posts(n_graph);
+    for (auto & p : posts) {
+        p = std::make_unique<post_ready>();
+    }
+    std::atomic<int> n_post_bad { 0 };
+    std::atomic<int> n_post_queued { 0 };
+    std::thread consumer([&] {
+        for (int c = 0; c < n_graph; c++) {
+            while (n_post_queued.load() <= c) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (n_post_queued.load() < 0) {
+                    return;
+                }
+            }
+            post_ready & r = *posts[c];
+            {
+                std::unique_lock<std::mutex> lock(r.mtx);
+                if (!r.cv.wait_for(lock, std::chrono::seconds(30), [&] { return r.recorded; })) {
+                    fprintf(stderr, "  post callback of graph %d never ran\n", c);
+                    n_post_bad++;
+                    return;
+                }
+            }
+            ggml_backend_event_synchronize(r.ev);
+            const std::vector<float> ref = reference(make_input(c));
+            for (int64_t i = 0; i < N_EMBD; i++) {
+                if (std::fabs(out[c][i] - ref[i]) > 1e-4f*(1.0f + std::fabs(ref[i]))) {
+                    fprintf(stderr, "  post callback, graph %d [%" PRId64 "]: %f, expected %f (read not landed)\n", c, i, out[c][i], ref[i]);
+                    n_post_bad++;
+                    break;
+                }
+            }
+        }
+    });
 
     bool ok = true;
     for (int c = 0; c < n_graph && ok; c++) {
@@ -499,6 +557,23 @@ static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<
         }
         ggml_backend_t ob = ggml_backend_sched_get_tensor_backend(sched, h);
         ggml_backend_sched_tensor_get_async(sched, ob, h, out[c].data(), 0, ggml_nbytes(h));
+        posts[c]->ev = ggml_backend_event_new(ggml_backend_get_device(ob));
+        if (posts[c]->ev == nullptr) { // the CPU backend has no events: its read is done when the post runs
+            posts[c]->ev = ggml_backend_event_new(&g_dev[0]);
+        }
+        ggml_backend_sched_post_callback(sched, ob, [](ggml_backend_t backend, void * ud) {
+            auto * r = (post_ready *) ud;
+            if (ggml_backend_get_device(backend) != r->ev->device) {
+                // CPU: synchronous, nothing to record on; mark the event done by recording it on device 0's idle-ish stream
+                std::lock_guard<std::mutex> lock(r->mtx);
+                r->recorded = true;
+                r->cv.notify_all();
+                return;
+            }
+            post_record(backend, ud);
+        }, posts[c].get());
+        posts[c]->main_thread = false;
+        n_post_queued++;
         ggml_backend_sched_flush(sched);
         if (!threads) {
             ggml_backend_sched_synchronize(sched); // (the reads of the outputs into out[c] must be done before ctxs[k] is freed)
@@ -516,7 +591,20 @@ static bool run(int n_graph, bool threads, int mode, unsigned seed, std::vector<
             ok = false;
         }
     }
+    if (!ok) {
+        n_post_queued = -1;
+    }
+    consumer.join();
+    if (n_post_bad > 0) {
+        fprintf(stderr, "  post callbacks: %d graphs wrong or missing\n", n_post_bad.load());
+        ok = false;
+    }
     ggml_backend_sched_synchronize(sched);
+    for (auto & p : posts) {
+        if (p->ev) {
+            ggml_backend_event_free(p->ev);
+        }
+    }
 
     ggml_backend_sched_free(sched);
     for (ggml_context * ctx : ctxs) {

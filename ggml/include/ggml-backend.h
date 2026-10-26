@@ -393,6 +393,10 @@ extern "C" {
     // ggml_backend_tensor_get_async of an output of the last graph: with submit threads queued by the thread of `backend`
     // after the splits of that graph, else directly
     GGML_API void                 ggml_backend_sched_tensor_get_async(ggml_backend_sched_t sched, ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+    // fn(backend, user_data) in stream order after the reads queued so far for `backend` (with submit threads: on its thread
+    // after the reads of the last graph, else now on the calling thread); e.g. to record an event after an output read
+    typedef void (*ggml_backend_sched_post_fn)(ggml_backend_t backend, void * user_data);
+    GGML_API void                 ggml_backend_sched_post_callback(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_sched_post_fn fn, void * user_data);
     // called after each graph allocation, before any of its tensors is written (inputs included)
     typedef void (*ggml_backend_sched_alloc_callback)(ggml_backend_sched_t sched, void * user_data);
     GGML_API void                 ggml_backend_sched_set_alloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_alloc_callback callback, void * user_data);

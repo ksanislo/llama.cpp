@@ -22,6 +22,11 @@
 #include <map>
 #include <random>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1536,6 +1541,189 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return on;
     }
 
+    // LLAMA_MTP_WINDOW=N (or the older LLAMA_MTP_PROMPT_TAIL=N): a fresh sequence's first batch (the prompt) gives the
+    // draft only its last N rows (Strata's --mtp-window, without its sliding attention): the draft attends to those N and
+    // what follows, the cells before them never get draft K/V. Only acceptance can change, the target verifies every token.
+    static int32_t prompt_window() {
+        static const int32_t w = [] {
+            const char * e = getenv("LLAMA_MTP_WINDOW");
+            if (e == nullptr) {
+                e = getenv("LLAMA_MTP_PROMPT_TAIL");
+            }
+            return e ? std::max(0, atoi(e)) : 0;
+        }();
+        return w;
+    }
+
+    // LLAMA_MTP_PIPE=1: the draft's K/V over a long batch (the prompt) is built per target ubatch while the target's
+    // prompt pipe runs: each ubatch's h rows, once read back, go to a KV-only draft decode on a thread of its own (the
+    // draft's devices and streams), so process() only waits for the last chunk. LLAMA_MTP_PIPE_MIN: smallest batch (1024).
+    static bool pipe_env() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MTP_PIPE"); return e != nullptr && atoi(e) != 0; }();
+        return on;
+    }
+    static int32_t pipe_min() {
+        static const int32_t n = [] { const char * e = getenv("LLAMA_MTP_PIPE_MIN"); return e ? std::max(2, atoi(e)) : 1024; }();
+        return n;
+    }
+
+    struct pipe_job {
+        bool                     flush = false; // decode the kept deferred rows of every sequence first
+        int32_t                  i0 = 0;
+        std::vector<llama_token> tokens;
+        std::vector<llama_pos>   pos;
+        std::function<bool()>    wait;
+    };
+
+    struct pipe_state {
+        bool                    on = false;
+        std::thread             thr;
+        std::mutex              mtx;
+        std::condition_variable cv;      // jobs queued / stop
+        std::condition_variable cv_idle; // queue drained
+        std::deque<pipe_job>    q;
+        bool                    busy = false;
+        bool                    stop = false;
+        bool                    failed = false; // a draft decode failed (or a wait timed out) in this batch
+
+        // the batch being followed (target thread; the worker reads them only while it has jobs of this batch)
+        bool               active  = false; // still following
+        bool               used    = false; // some rows of this batch went to the draft
+        llama_seq_id       seq     = -1;
+        int32_t            n_all   = 0;
+        int32_t            upto    = 0;     // entries [0, upto) are queued
+        int32_t            k_first = 0;     // the window's first entry
+        const float *      h       = nullptr;
+        std::vector<float> h0;              // the h of entry 0 (pending_h)
+        int32_t            n_chunks = 0;
+        int64_t            t_first  = 0;
+        double             ms_wait  = 0.0;  // worker: waiting for the h rows
+        double             ms_draft = 0.0;  // worker: draft decodes (host, queued)
+    } pipe;
+
+    std::unique_ptr<common_batch> pipe_batch; // the worker's batch
+
+    void pipe_worker() {
+        for (;;) {
+            pipe_job job;
+            {
+                std::unique_lock<std::mutex> lock(pipe.mtx);
+                pipe.cv.wait(lock, [&] { return pipe.stop || !pipe.q.empty(); });
+                if (pipe.q.empty()) {
+                    return;
+                }
+                job = std::move(pipe.q.front());
+                pipe.q.pop_front();
+                pipe.busy = true;
+            }
+            bool ok = true;
+            if (job.flush) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && ok; ++seq_id) {
+                    if (!defer_rows[seq_id].empty()) {
+                        ok = flush_deferred(seq_id);
+                    }
+                }
+            } else {
+                const int64_t t0 = ggml_time_us();
+                ok = job.wait();
+                const int64_t t1 = ggml_time_us();
+                auto & b = *pipe_batch;
+                b.clear();
+                const int32_t n = (int32_t) job.tokens.size();
+                for (int32_t j = std::max(0, pipe.k_first - job.i0); j < n && ok; ++j) {
+                    const int32_t k = job.i0 + j;
+                    const int32_t idx = b.add(job.tokens[j], job.pos[j], pipe.seq, false);
+                    const float * h_row = k == 0 ? pipe.h0.data() : pipe.h + (size_t) (k - 1) * n_embd;
+                    b.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                }
+                if (ok && b.size() > 0) {
+                    const int32_t rc = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, b.get());
+                    if (rc != 0) {
+                        SPC_ERR("MTP pipe: draft decode of entries [%d, %d) failed rc=%d\n", job.i0, job.i0 + n, (int) rc);
+                        ok = false;
+                    }
+                }
+                pipe.ms_wait  += (t1 - t0)/1000.0;
+                pipe.ms_draft += (ggml_time_us() - t1)/1000.0;
+            }
+            {
+                std::lock_guard<std::mutex> lock(pipe.mtx);
+                pipe.failed = pipe.failed || !ok;
+                pipe.busy = false;
+                if (!ok) {
+                    pipe.q.clear(); // later chunks would leave a gap in the draft's positions
+                }
+            }
+            pipe.cv_idle.notify_all();
+        }
+    }
+
+    void pipe_push(pipe_job && job) {
+        {
+            std::lock_guard<std::mutex> lock(pipe.mtx);
+            pipe.q.push_back(std::move(job));
+        }
+        pipe.cv.notify_one();
+    }
+
+    // wait until the worker has done every queued chunk
+    void pipe_join() {
+        std::unique_lock<std::mutex> lock(pipe.mtx);
+        pipe.cv_idle.wait(lock, [&] { return pipe.q.empty() && !pipe.busy; });
+    }
+
+    // target thread, inside its decode: one ubatch of a batch with unmasked h rows
+    void pipe_chunk(const llama_nextn_chunk & c) {
+        if (c.i0 == 0) {
+            pipe_join();
+            pipe.active   = false;
+            pipe.used     = false;
+            pipe.failed   = false;
+            pipe.upto     = 0;
+            pipe.n_chunks = 0;
+            pipe.ms_wait  = pipe.ms_draft = 0.0;
+            if (c.n <= 0 || c.seq_id < 0 || c.seq_id >= (llama_seq_id) n_seq || c.n_tokens_all < pipe_min()) {
+                return;
+            }
+            pipe.active  = true;
+            pipe.seq     = c.seq_id;
+            pipe.n_all   = c.n_tokens_all;
+            pipe.h       = c.h;
+            pipe.h0      = pending_h[c.seq_id];
+            pipe.k_first = 0;
+            pipe.t_first = ggml_time_us();
+            const int32_t w = prompt_window();
+            if (w > 0 && c.n_tokens_all > w && llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), c.seq_id) < 0) {
+                pipe.k_first = c.n_tokens_all - w;
+            }
+            bool any_deferred = false;
+            for (const auto & rows : defer_rows) {
+                any_deferred = any_deferred || !rows.empty();
+            }
+            if (any_deferred) {
+                pipe_job job;
+                job.flush = true;
+                pipe_push(std::move(job));
+            }
+        }
+        if (!pipe.active) {
+            return;
+        }
+        if (c.n <= 0 || c.seq_id != pipe.seq || c.i0 != pipe.upto || c.tokens == nullptr) {
+            pipe.active = false; // process() takes the rest
+            return;
+        }
+        pipe_job job;
+        job.i0 = c.i0;
+        job.tokens.assign(c.tokens, c.tokens + c.n);
+        job.pos.assign(c.pos, c.pos + c.n);
+        job.wait = c.wait;
+        pipe.used = true;
+        pipe.upto += c.n;
+        pipe.n_chunks++;
+        pipe_push(std::move(job));
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1614,6 +1802,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         defer_rows.assign(n_seq, {});
         defer_h.assign(n_seq, {});
         defer_keep.assign(n_seq, -1);
+
+        if (pipe_env() && !is_mem_shared && !chain_heads) {
+            pipe.on = true;
+            pipe_batch = std::make_unique<common_batch>(ctx_dft);
+            pipe.thr = std::thread([this] { pipe_worker(); });
+            llama_set_nextn_chunk_callback(ctx_tgt, [this](const llama_nextn_chunk & c) { pipe_chunk(c); }, pipe_min());
+            SPC_INF("MTP pipe: the draft's K/V of batches of %d+ entries per target ubatch, beside the target (window %d)\n",
+                    pipe_min(), prompt_window());
+        }
     }
 
     // decode the kept deferred rows of a sequence on their own (when no draft step takes them)
@@ -1635,6 +1832,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (pipe.on) {
+            llama_set_nextn_chunk_callback(this->params.ctx_tgt, nullptr, 0);
+            {
+                std::lock_guard<std::mutex> lock(pipe.mtx);
+                pipe.stop = true;
+            }
+            pipe.cv.notify_all();
+            pipe.thr.join();
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1703,6 +1909,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // LLAMA_MTP_PIPE: entries [0, pipe_upto) of pipe_seq already went to the draft during the target's decode
+        llama_seq_id pipe_seq  = -1;
+        int32_t      pipe_upto = 0;
+        if (pipe.on) {
+            const int64_t t_j0 = ggml_time_us();
+            pipe_join();
+            const bool mine = pipe.used && pipe.n_all == n_tokens;
+            if (mine && pipe.failed) {
+                SPC_ERR("%s", "MTP pipe: a draft decode beside the target failed\n");
+                pipe.used = pipe.active = false;
+                return false;
+            }
+            if (mine) {
+                pipe_seq  = pipe.seq;
+                pipe_upto = pipe.upto;
+                SPC_INF("MTP pipe: %d of %d entries to the draft in %d chunks beside the target (window from %d): "
+                        "waited for h rows %.1f ms, draft decodes %.1f ms (host), join %.1f ms, first chunk to join %.1f ms\n",
+                        pipe_upto, n_tokens, pipe.n_chunks, pipe.k_first, pipe.ms_wait, pipe.ms_draft,
+                        (ggml_time_us() - t_j0)/1000.0, (ggml_time_us() - pipe.t_first)/1000.0);
+            }
+            pipe.used = pipe.active = false;
+        }
+
         // deferred rows of an earlier verified batch that no draft step took: decode them first
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (!defer_rows[seq_id].empty() && !flush_deferred(seq_id)) {
@@ -1735,7 +1964,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared && !deferred) {
+        if (!is_mem_shared && !deferred && !(pipe_seq >= 0 && pipe_upto == n_tokens)) {
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1746,10 +1975,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
-            // LLAMA_MTP_PROMPT_TAIL=N: a fresh sequence's first batch (the prompt) gives the draft only its last N rows:
-            // the draft's attention then sees N tokens of context, its h input carries the rest (fewer K/V rows to build;
-            // only acceptance can change, the target verifies every token). Later batches stay consecutive.
-            static const int32_t prompt_tail = [] { const char * e = getenv("LLAMA_MTP_PROMPT_TAIL"); return e ? std::max(0, atoi(e)) : 0; }();
+            // LLAMA_MTP_WINDOW / LLAMA_MTP_PROMPT_TAIL (prompt_window()): a fresh sequence's first batch gives the draft
+            // only its last N rows. Later batches stay consecutive.
+            const int32_t prompt_tail = prompt_window();
             std::vector<int32_t> k_first(i_batch_beg);
             if (prompt_tail > 0) {
                 auto * mem = llama_get_memory(ctx_dft);
@@ -1766,7 +1994,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const llama_seq_id seq_id = t.seq_id;
 
-                if (k < k_first[seq_id]) {
+                if (k < k_first[seq_id] || (seq_id == pipe_seq && k < pipe_upto)) {
                     continue;
                 }
 
@@ -1798,11 +2026,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
+                // a long batch in pieces of whole draft ubatches (same ubatches): the batch's copies of the h rows stay
+                // small (a 21K prompt's were ~0.7 GB each, ~2 s of host setup)
+                const int32_t n_all   = batch.size();
+                const int32_t n_piece = n_all > 8192 ? (int32_t) llama_n_ubatch(ctx_dft) * std::max<int32_t>(1, 4096 / (int32_t) llama_n_ubatch(ctx_dft)) : n_all;
+                for (int32_t off = 0; off < n_all && ok; off += n_piece) {
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(off, std::min(n_piece, n_all - off)));
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                        ok = false;
+                    }
+                }
+                if (!ok) {
                     break;
                 }
             }
@@ -1820,18 +2056,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // the target's rows, read once (each _ith call synchronizes: ~1 s over a 21K prompt)
+        const float * h_all = llama_get_embeddings_nextn(ctx_tgt);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // a verified batch keeps its rows for accept(); a long batch (the prompt) only its last
+            const int32_t n_span = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_rows = n_span > 64 ? 1 : n_span;
+            const int32_t i_from = i_batch_end[seq_id] - n_rows + 1;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h_all + (size_t) (i_from + i) * n_embd, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),

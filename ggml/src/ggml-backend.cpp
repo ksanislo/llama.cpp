@@ -2105,6 +2105,7 @@ struct ggml_sched_tpost {
     void * data;
     size_t offset;
     size_t size;
+    ggml_backend_sched_post_fn fn = nullptr; // a post callback (ggml_backend_sched_post_callback) instead of a read, data = its user data
 };
 
 struct ggml_sched_slot {
@@ -2360,7 +2361,11 @@ static enum ggml_status ggml_sched_worker_run(ggml_backend_sched_t sched, ggml_s
     }
     for (const ggml_sched_tpost & p : s.posts) {
         if (p.backend_id == me) {
-            ggml_backend_tensor_get_async(backend, p.tensor, p.data, p.offset, p.size);
+            if (p.fn != nullptr) {
+                p.fn(backend, p.data);
+            } else {
+                ggml_backend_tensor_get_async(backend, p.tensor, p.data, p.offset, p.size);
+            }
         }
     }
 
@@ -2659,6 +2664,23 @@ void ggml_backend_sched_tensor_get_async(ggml_backend_sched_t sched, ggml_backen
         ggml_sched_submit_drain(sched);
     }
     ggml_backend_tensor_get_async(backend, tensor, data, offset, size);
+}
+
+void ggml_backend_sched_post_callback(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_sched_post_fn fn, void * user_data) {
+    GGML_ASSERT(sched && fn);
+    if (sched->submit_on) {
+        ggml_sched_submit * sub = sched->submit;
+        if (sub->staged >= 0) {
+            const int b = ggml_backend_sched_backend_id(sched, backend);
+            GGML_ASSERT(b >= 0);
+            ggml_sched_tpost p = { b, nullptr, user_data, 0, 0 };
+            p.fn = fn;
+            sub->slots[sub->staged].posts.push_back(p);
+            return;
+        }
+        ggml_sched_submit_drain(sched);
+    }
+    fn(backend, user_data);
 }
 
 static void ggml_sched_submit_free(ggml_backend_sched_t sched) {

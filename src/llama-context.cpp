@@ -16,7 +16,11 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2432,6 +2436,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
     t_dt1 = ggml_time_us();
 
+    // LLAMA_MTP_PIPE: the consumer follows this batch ubatch by ubatch until one does not fit (nextn_chunk_notify)
+    nextn_chunk_on = (int32_t) n_tokens_all >= nextn_chunk_min;
+
     // LLAMA_SUBMIT_THREADS: the chunks of a piped batch are queued by one host thread per backend; ends (the threads
     // have queued everything) before the pipe state is reset and on every return
     struct submit_reset {
@@ -2627,6 +2634,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_sched_tensor_get_async(sched.get(), backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
+
+                if (nextn_chunk_cb && !masked && nextn_chunk_on) {
+                    nextn_chunk_notify(ubatch, (int32_t) n_tokens_prev, (int32_t) n_tokens_all, backend_h);
+                }
             }
         }
 
@@ -2918,6 +2929,72 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         extracted = true;
     }
     return extracted;
+}
+
+// LLAMA_MTP_PIPE: when the h rows of a ubatch have landed on the host, told by an event recorded after their read
+namespace {
+struct nextn_ready {
+    ggml_backend_event_t    ev = nullptr;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    recorded = false;
+    ~nextn_ready() { if (ev) { ggml_backend_event_free(ev); } }
+};
+}
+
+void llama_context::nextn_chunk_notify(const llama_ubatch & ubatch, int32_t i0, int32_t n_tokens_all, ggml_backend_t backend_h) {
+    llama_nextn_chunk c = {};
+    c.n_tokens_all = n_tokens_all;
+    c.i0           = i0;
+    c.n            = (int32_t) ubatch.n_tokens;
+    c.tokens       = ubatch.token;
+    c.pos          = ubatch.pos; // section 0 = the text position (M-RoPE positions are section-major)
+    c.seq_id       = ubatch.n_seqs_unq == 1 ? ubatch.seq_id_unq[0] : -1;
+    c.h            = embd_nextn.data;
+
+    // in batch order, one sequence, token ids, text positions
+    bool ok = ubatch.token != nullptr && ubatch.embd == nullptr && ubatch.n_seqs_unq == 1 && ubatch.data != nullptr &&
+              ubatch.data->batch_idxs.size() == ubatch.n_tokens;
+    for (uint32_t i = 0; ok && i < ubatch.n_tokens; ++i) {
+        ok = ubatch.data->batch_idxs[i] == i0 + (int32_t) i && ubatch.n_seq_id[i] == 1;
+    }
+    ggml_backend_dev_t dev = ok ? ggml_backend_get_device(backend_h) : nullptr;
+    auto ready = std::make_shared<nextn_ready>();
+    ready->ev = dev ? ggml_backend_event_new(dev) : nullptr;
+    if (!ok || ready->ev == nullptr) {
+        nextn_chunk_on = false;
+        c.n      = 0;
+        c.tokens = nullptr;
+        c.pos    = nullptr;
+        nextn_chunk_cb(c);
+        return;
+    }
+
+    // recorded in stream order after the read (with submit threads: by the thread of backend_h, after its part of the graph)
+    auto * hold = new std::shared_ptr<nextn_ready>(ready);
+    ggml_backend_sched_post_callback(sched.get(), backend_h, [](ggml_backend_t backend, void * ud) {
+        auto * p = static_cast<std::shared_ptr<nextn_ready> *>(ud);
+        ggml_backend_event_record((*p)->ev, backend);
+        {
+            std::lock_guard<std::mutex> lock((*p)->mtx);
+            (*p)->recorded = true;
+        }
+        (*p)->cv.notify_all();
+        delete p;
+    }, hold);
+
+    c.wait = [ready]() {
+        {
+            std::unique_lock<std::mutex> lock(ready->mtx);
+            if (!ready->cv.wait_for(lock, std::chrono::seconds(120), [&] { return ready->recorded; })) {
+                LLAMA_LOG_ERROR("%s: the h rows of a ubatch were never read back (120 s)\n", "nextn_chunk_wait");
+                return false;
+            }
+        }
+        ggml_backend_event_synchronize(ready->ev);
+        return true;
+    };
+    nextn_chunk_cb(c);
 }
 
 void llama_context::output_reorder() {
@@ -4989,6 +5066,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_nextn_chunk_callback(llama_context * ctx, std::function<void(const llama_nextn_chunk &)> cb, int32_t n_min) {
+    ctx->set_nextn_chunk_callback(std::move(cb), n_min);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

@@ -131,6 +131,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_nextn_chunk_callback(std::function<void(const llama_nextn_chunk &)> cb, int32_t n_min) { nextn_chunk_cb = std::move(cb); nextn_chunk_min = n_min; }
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -337,6 +338,12 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // LLAMA_MTP_PIPE: told about each ubatch of a decode with unmasked nextn rows (llama_set_nextn_chunk_callback)
+    std::function<void(const llama_nextn_chunk &)> nextn_chunk_cb;
+    bool    nextn_chunk_on  = false; // the current batch is still followed
+    int32_t nextn_chunk_min = 0;
+    void nextn_chunk_notify(const llama_ubatch & ubatch, int32_t i0, int32_t n_tokens_all, ggml_backend_t backend_h);
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
