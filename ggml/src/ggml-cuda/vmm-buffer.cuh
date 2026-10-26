@@ -36,6 +36,15 @@ bool ggml_cuda_vmm_region_commit(ggml_cuda_vmm_region * r, size_t offset, size_t
 // give back the granules that lie wholly inside [offset, offset + size); returns the bytes given back
 size_t ggml_cuda_vmm_region_release(ggml_cuda_vmm_region * r, size_t offset, size_t size);
 
+// as release, but the physical granules stay allocated in a spare list of the device (no cuMemRelease)
+size_t ggml_cuda_vmm_region_release_spare(ggml_cuda_vmm_region * r, size_t offset, size_t size);
+
+// as commit, the device's spare granules first (no cuMemCreate for them); zero = false leaves the memory as it is
+bool ggml_cuda_vmm_region_commit_spare(ggml_cuda_vmm_region * r, size_t offset, size_t size, bool zero);
+
+// frees the spare granules of a physical device, returns the bytes
+size_t ggml_cuda_vmm_spare_trim(int physical_device);
+
 // memset the backed granules only (the zero granule must stay zero)
 void ggml_cuda_vmm_region_memset_backed(ggml_cuda_vmm_region * r, uint8_t value);
 

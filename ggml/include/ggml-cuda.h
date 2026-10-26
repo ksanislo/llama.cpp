@@ -32,6 +32,9 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int de
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_release(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_release_spare(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_buffer_commit_spare(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool zero);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_spare_trim(ggml_backend_buffer_type_t buft);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_buffer_get_backed_size(ggml_backend_buffer_t buffer);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_get_granularity(ggml_backend_buffer_type_t buft);
 
