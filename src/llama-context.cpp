@@ -2359,6 +2359,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (prompt_pipe_chunk > 0 && n_tokens_all > prompt_pipe_chunk) {
         LLAMA_LOG_INFO("%s: prompt pipe: %u tokens in %u-token chunks over %d stages\n", __func__, n_tokens_all, prompt_pipe_chunk, n_pipe_devices);
     }
+    // several slots: a batch carries their decode tokens in a small ubatch beside the prompt chunks; the decode memory
+    // keeps the lent tails for the whole batch instead of giving them back and taking them again (LLAMA_MOE_DECODE_MEM)
+    struct dm_batch_reset {
+        llama_moe_cache * mc;
+        ~dm_batch_reset() { if (mc) { mc->set_batch_large(false); } }
+    } dm_batch_reset_on_exit { nullptr };
+    if (moe_cache && n_tokens_all > (uint32_t) std::max<int32_t>(llama_moe_cache::small_batch_tokens(), cparams.n_seq_max)) {
+        moe_cache->set_batch_large(true);
+        dm_batch_reset_on_exit.mc = moe_cache.get();
+    }
+
     std::vector<int64_t> t_pipe_enqueue_us;
     const int32_t n_reallocs_pipe = n_reallocs_all;
 

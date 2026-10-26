@@ -59,6 +59,8 @@ public:
     void on_alloc(ggml_backend_sched_t sched);
     // a graph was built only to reserve memory (no alloc callback follows): forget what it read
     void reserved();
+    // decode(): the batch holds more tokens than a small (decode) batch, e.g. other slots' tokens beside a prompt chunk
+    void set_batch_large(bool large);
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;

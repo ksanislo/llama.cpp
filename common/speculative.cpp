@@ -1815,12 +1815,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // the kept rows continue the draft's K/V of the sequence: a slot that was cut back, cleared or restored
+    // since (a new conversation, a regenerated reply, a cache restore) must not get them
+    bool deferred_fits(llama_seq_id seq_id) const {
+        const auto & rows = defer_rows[seq_id];
+        return !rows.empty() && rows[0].pos == llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id) + 1;
+    }
+
     // decode the kept deferred rows of a sequence on their own (when no draft step takes them)
     bool flush_deferred(llama_seq_id seq_id) {
         auto & rows = defer_rows[seq_id];
         const int32_t keep = defer_keep[seq_id];
         bool ok = true;
-        if (!rows.empty() && keep > 0) {
+        if (!rows.empty() && keep > 0 && !deferred_fits(seq_id)) {
+            SPC_DBG("seq %d: %d deferred rows from position %d no longer continue the draft K/V - dropped\n",
+                    (int) seq_id, keep, (int) rows[0].pos);
+        } else if (!rows.empty() && keep > 0) {
             common_batch b(params.ctx_dft);
             for (int32_t r = 0; r < keep && r < (int32_t) rows.size(); ++r) {
                 const int32_t idx = b.add(rows[r].id, rows[r].pos, seq_id, false);
@@ -1936,6 +1946,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // deferred rows of an earlier verified batch that no draft step took: decode them first
+        // (a batch that rewrites their positions - the slot was cut back or reused - drops them)
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (!defer_rows[seq_id].empty() && i_batch_beg[seq_id] >= 0 &&
+                batch_in.tokens[i_batch_beg[seq_id]].pos[0] <= defer_rows[seq_id].back().pos) {
+                defer_rows[seq_id].clear();
+                defer_keep[seq_id] = -1;
+            }
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (!defer_rows[seq_id].empty() && !flush_deferred(seq_id)) {
                 return false;
@@ -2132,7 +2150,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!defer_rows[seq_id].empty()) {
                 const auto & rows = defer_rows[seq_id];
                 const int32_t keep = std::min<int32_t>(defer_keep[seq_id], (int32_t) rows.size());
-                if (keep > 0 && rows[keep - 1].pos + 1 == dp.pos0) {
+                if (keep > 0 && rows[keep - 1].pos + 1 == dp.pos0 && deferred_fits(seq_id)) {
                     for (int32_t r = 0; r < keep; ++r) {
                         const int32_t ridx = batch.add(rows[r].id, rows[r].pos, seq_id, false);
                         batch.set_embd_state(ridx, { defer_h[seq_id].data() + (size_t) r * n_embd, 1, (size_t) n_embd });

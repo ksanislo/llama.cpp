@@ -1496,6 +1496,7 @@ struct llama_moe_cache::impl {
     dm_stats stats_dm;
     bool dm_warned = false;
     mutable bool graph_stages = false; // the graph built last reads staging slots (get_slot_map), read and reset by on_alloc
+    bool batch_large = false;          // the current decode() batch is a large one: its small ubatches keep the lent memory
 
     // LLAMA_MOE_CACHE_SPLIT=miss: the hottest profiled experts are cached first, on whichever device they are
     bool split_miss  = false;
@@ -4842,7 +4843,8 @@ struct llama_moe_cache::impl {
             if (used <= dm.small && !(stages && dm.stage > 0)) {
                 dm.used_small_max = std::max(dm.used_small_max, used);
                 if (dm.lent) {
-                    if (++dm.n_small >= dm_return_after) {
+                    // a few decode tokens of other slots in the same batch as a prompt chunk: no give + take per step
+                    if (!batch_large && ++dm.n_small >= dm_return_after) {
                         give.push_back(id);
                     }
                 } else {
@@ -7016,6 +7018,10 @@ float llama_moe_cache::compact_ratio() const {
 
 void llama_moe_cache::reserved() {
     pimpl->graph_stages = false;
+}
+
+void llama_moe_cache::set_batch_large(bool large) {
+    pimpl->batch_large = large;
 }
 
 void llama_moe_cache::on_alloc(ggml_backend_sched_t sched) {
