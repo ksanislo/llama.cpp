@@ -255,4 +255,271 @@ struct llama_moe_ring_inplace {
         }
         return true;
     }
+
+    // LLAMA_MOE_RING_BYTES: the staging places from base on in a staging tensor of more places, host reads coded past all of them
+    void place(int32_t base, int32_t host_places) {
+        const int32_t code = host_code();
+        for (int32_t & v : map) {
+            if (v < 0) {
+                v = v == code ? -1 - host_places : -1 - (base + (-1 - v));
+            }
+        }
+    }
+};
+
+// LLAMA_MOE_RING_BYTES: the staging memory of a device as one byte ring per expert tensor position (gate, up, down), of which a
+// staged layer takes exactly its uncached experts (+ one place of zeros), so the copy stream runs as many layers ahead as fit.
+// A layer's experts sit at the same place index b in every ring (one map for its three matmuls): bytes [b*es[ip], (b+n)*es[ip]).
+// A taken range is released when the matmuls that read it are queued (an event on the compute stream, release index r, event
+// r % n_ev); a later range over released bytes waits for the newest such release first (the compute stream runs in order, so it
+// covers the older ones). Ranges never overlap one that is not released.
+struct llama_moe_ring_bytes {
+    static constexpr int64_t n_ev = 64; // release events, reused round robin
+
+    struct span {
+        int64_t seq = -1;
+        int64_t rel = -1;
+        std::vector<size_t> off;
+        std::vector<size_t> end;
+    };
+
+    std::vector<size_t> size;  // [ip] bytes of the ring
+    std::vector<size_t> head;  // [ip] end of the last range taken
+    std::vector<span>   live;  // taken, not released
+    std::vector<span>   hist;  // released, the copy stream may not have waited for the release yet
+    int64_t n_alloc = 0;
+    int64_t n_rel   = 0;
+    int64_t waited  = -1;      // the copy stream waited for every release <= waited
+
+    void init(std::vector<size_t> sz) {
+        size = std::move(sz);
+        n_rel  = 0;
+        waited = -1;
+        reset();
+    }
+
+    // the copy stream waited for everything queued on the compute stream: all bytes are free
+    void reset() {
+        head.assign(size.size(), 0);
+        live.clear();
+        hist.clear();
+        waited = n_rel - 1;
+    }
+
+    bool idle() const {
+        return live.empty();
+    }
+
+    static bool overlaps(const span & a, const span & b) {
+        for (size_t ip = 0; ip < a.off.size(); ++ip) {
+            if (a.off[ip] < b.end[ip] && b.off[ip] < a.end[ip] && a.off[ip] < a.end[ip] && b.off[ip] < b.end[ip]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    span make(int64_t b, int32_t n, const std::vector<size_t> & es) const {
+        span s;
+        for (size_t ip = 0; ip < size.size(); ++ip) {
+            s.off.push_back((size_t) b*es[ip]);
+            s.end.push_back((size_t) (b + n)*es[ip]);
+        }
+        return s;
+    }
+
+    // n places at place b fit in the ring (at most limit places) and miss every range not released
+    bool fits(int64_t b, int32_t n, const std::vector<size_t> & es, int64_t limit) const {
+        if (b < 0 || n <= 0 || b + n > limit) {
+            return false;
+        }
+        const span s = make(b, n, es);
+        for (size_t ip = 0; ip < size.size(); ++ip) {
+            if (s.end[ip] > size[ip]) {
+                return false;
+            }
+        }
+        for (const span & l : live) {
+            if (overlaps(s, l)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static int64_t place_at(const std::vector<size_t> & bytes, const std::vector<size_t> & es) {
+        int64_t b = 0;
+        for (size_t ip = 0; ip < bytes.size(); ++ip) {
+            b = std::max(b, (int64_t) ((bytes[ip] + es[ip] - 1)/es[ip]));
+        }
+        return b;
+    }
+
+    // the place for n places of es[ip] bytes: after the last range, else from the start (wrap), else after a range not released;
+    // -1 if none fits now
+    int64_t find(const std::vector<size_t> & es, int32_t n, int64_t limit) const {
+        const int64_t b = place_at(head, es);
+        if (fits(b, n, es, limit)) {
+            return b;
+        }
+        if (fits(0, n, es, limit)) {
+            return 0;
+        }
+        for (const span & l : live) {
+            const int64_t c = place_at(l.end, es);
+            if (fits(c, n, es, limit)) {
+                return c;
+            }
+        }
+        return -1;
+    }
+
+    // take n places at b (find); returns the release the copy stream must wait for before writing them, -1 if none
+    int64_t alloc(int64_t b, int32_t n, const std::vector<size_t> & es, int64_t & seq) {
+        span s = make(b, n, es);
+        s.seq = n_alloc++;
+        int64_t w = -1;
+        for (const span & h : hist) {
+            if (overlaps(s, h)) {
+                w = std::max(w, h.rel);
+            }
+        }
+        if (w > waited) {
+            waited = w;
+            forget();
+        } else {
+            w = -1;
+        }
+        head = s.end;
+        seq  = s.seq;
+        live.push_back(std::move(s));
+        return w;
+    }
+
+    struct released {
+        int64_t rel   = -1; // record release event rel % n_ev on the compute stream now
+        int64_t force = -1; // first: the copy stream waits for release event force % n_ev (it is about to be reused)
+    };
+
+    // the matmuls reading range seq are queued
+    released release(int64_t seq) {
+        released r;
+        auto it = std::find_if(live.begin(), live.end(), [&](const span & s) { return s.seq == seq; });
+        if (it == live.end()) {
+            return r;
+        }
+        r.rel = n_rel++;
+        for (const span & h : hist) {
+            if (h.rel <= r.rel - n_ev && h.rel > waited) {
+                r.force = std::max(r.force, h.rel);
+            }
+        }
+        if (r.force >= 0) {
+            waited = r.force;
+            forget();
+        }
+        span s = std::move(*it);
+        live.erase(it);
+        s.rel = r.rel;
+        hist.push_back(std::move(s));
+        return r;
+    }
+
+    void forget() {
+        hist.erase(std::remove_if(hist.begin(), hist.end(), [&](const span & h) { return h.rel <= waited; }), hist.end());
+    }
+};
+
+// LLAMA_MOE_RING_BYTES: the plan of a graph on one device over the byte ring, as llama_moe_ring_sched over the slots: full layers
+// are issued in order as far ahead as the ring has room (and at most max_ahead layers beyond the one computing); a layer is
+// released at the next staged layer of the device or at the end of the graph
+struct llama_moe_ring_bytes_sched {
+    struct entry {
+        int32_t il;
+        bool    full;
+        bool    issued = false;
+        int32_t n      = 0;  // places taken (0: nothing staged)
+        int64_t base   = -1; // first place
+        int64_t seq    = -1; // the range in the ring
+        int32_t ev     = -1; // ready event of its copies (llama_moe_cache)
+        int32_t map    = -1; // pinned map (llama_moe_cache)
+    };
+
+    llama_moe_ring_bytes ring;
+    std::vector<entry> plan;
+    size_t  next_issue   = 0;
+    size_t  next_consume = 0;
+    int64_t consumed     = -1; // range of the layer read last, released at the next step
+    int32_t max_ahead    = 32;
+
+    void start(std::vector<entry> p, bool fence) {
+        plan = std::move(p);
+        next_issue   = 0;
+        next_consume = 0;
+        consumed     = -1;
+        if (fence) {
+            ring.reset();
+        }
+    }
+
+    bool active() const {
+        return next_consume < plan.size();
+    }
+
+    // the plan index to issue next ahead of its layer, -1 if none (the caller tries issue, which fails without room)
+    int64_t can_issue() const {
+        if (next_issue >= plan.size() || !plan[next_issue].full || next_issue - next_consume >= (size_t) max_ahead) {
+            return -1;
+        }
+        return (int64_t) next_issue;
+    }
+
+    // entry i takes n places (es[ip] bytes each, at most limit places in its staging tensors): false if the ring has no room now;
+    // wait = the release the copy stream waits for first, -1 if none
+    bool issue(size_t i, int32_t n, const std::vector<size_t> & es, int64_t limit, int64_t & wait) {
+        wait = -1;
+        entry & e = plan[i];
+        if (n > 0) {
+            const int64_t b = ring.find(es, n, limit);
+            if (b < 0) {
+                return false;
+            }
+            wait   = ring.alloc(b, n, es, e.seq);
+            e.base = b;
+        }
+        e.n      = n;
+        e.issued = true;
+        next_issue = i + 1;
+        return true;
+    }
+
+    llama_moe_ring_bytes::released release() {
+        llama_moe_ring_bytes::released r;
+        if (consumed >= 0) {
+            r = ring.release(consumed);
+            consumed = -1;
+        }
+        return r;
+    }
+
+    int64_t at_layer(int32_t il) const {
+        return next_consume < plan.size() && plan[next_consume].il == il ? (int64_t) next_consume : -1;
+    }
+
+    void consume(size_t i) {
+        consumed     = plan[i].seq;
+        next_consume = i + 1;
+    }
+
+    // layers issued ahead of the one computing
+    size_t ahead() const {
+        return next_issue > next_consume ? next_issue - next_consume : 0;
+    }
+
+    void drop() {
+        plan.clear();
+        next_issue   = 0;
+        next_consume = 0;
+        consumed     = -1;
+    }
 };
