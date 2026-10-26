@@ -105,7 +105,8 @@ public:
     // (up, gate and down, or gate_up and down) and activation (swiglu, or swiglu_clamp if clamp > 0) with the lane
     void * cpu_lane(int32_t il, int64_t n_tokens, int64_t n_expert_used, const ggml_tensor * up, const ggml_tensor * gate,
             const ggml_tensor * down, const ggml_tensor * gate_up, float clamp);
-    float   cpu_lane_frac() const;
+    // the share of the misses the CPU lane computes; LLAMA_MOE_CPU_LANE_MULTI sets it for graphs of 2+ tokens
+    float   cpu_lane_frac(int64_t n_tokens = 1) const;
     int32_t cpu_lane_max_tokens() const;
     int32_t cpu_lane_timeout_ms() const;
 

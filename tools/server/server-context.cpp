@@ -44,6 +44,36 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// the cost of a speculative step, by target batch size (process-wide, printed and reset with a slot's timings):
+// the target decode + sync, the draft catch-up over that batch (common_speculative_process), the verify/accept
+static struct server_spec_timing {
+    static constexpr int N = 17;
+    uint64_t n[N]          = {};
+    double   decode_ms[N]  = {};
+    double   process_ms[N] = {};
+    uint64_t n_accept      = 0;
+    double   accept_ms     = 0.0;
+    void add(int nt, double d, double p) {
+        const int i = std::min(nt, N - 1);
+        n[i]++;
+        decode_ms[i]  += d;
+        process_ms[i] += p;
+    }
+    std::string str() const {
+        std::string r;
+        for (int i = 1; i < N; ++i) {
+            if (n[i] > 0) {
+                r += string_format(" n=%d%s: %" PRIu64 " x %.2f ms decode + %.2f ms draft catch-up;", i, i == N - 1 ? "+" : "", n[i],
+                        decode_ms[i]/n[i], process_ms[i]/n[i]);
+            }
+        }
+        if (n_accept > 0) {
+            r += string_format(" verify/accept %.3f ms x %" PRIu64, accept_ms/n_accept, n_accept);
+        }
+        return r;
+    }
+} g_spec_timing;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -818,6 +848,10 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+        if (n_draft_total > 0) {
+            SLT_INF(*this, "spec step timing (target batches during generation):%s\n", g_spec_timing.str().c_str());
+        }
+        g_spec_timing = server_spec_timing();
     }
 
     json to_json(bool only_metrics = false) const {
@@ -4721,12 +4755,14 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_dec0 = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        const int64_t t_dec1 = ggml_time_us();
 
         if (ret != 0) {
             {
@@ -4789,6 +4825,9 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            if (batch.view.size() <= 64) {
+                g_spec_timing.add(batch.view.size(), (t_dec1 - t_dec0)/1000.0, (ggml_time_us() - t_dec1)/1000.0);
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4960,6 +4999,8 @@ private:
 
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
+            const int64_t t_acc0 = ggml_time_us();
+            struct acc_timer { int64_t t0; ~acc_timer() { g_spec_timing.n_accept++; g_spec_timing.accept_ms += (ggml_time_us() - t0)/1000.0; } } acc_t { t_acc0 };
 
             // verify and try to accept the draft
             {

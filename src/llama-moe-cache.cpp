@@ -1317,6 +1317,11 @@ struct llama_moe_cache::impl {
     bool    dh_logged   = false; // the last graph logs selected experts
     std::vector<dh_device> dh_devs; // [devices]
     dh_stats stats_dh;
+    // by tokens in the graph (1..8): layer lookups, (token, slot) pairs, distinct experts, hits, misses
+    struct dh_by_n_stats { size_t layers = 0, pairs = 0, uniq = 0, hits = 0, misses = 0, graphs = 0; };
+    dh_by_n_stats stats_dh_n[9];
+    int64_t dh_graph_tokens = 0;
+    int32_t stats_every = 0; // LLAMA_MOE_STATS_EVERY=N: log the stats every N device-hit graphs (the exit log may not come)
     std::unordered_set<const ggml_tensor *> dh_logs;                  // the logs, to find the graphs that write them
     std::unordered_set<int32_t> dh_inflight;                          // il*n_expert + e of the pending and queued fills
     std::vector<int32_t> dh_cand;
@@ -1328,6 +1333,7 @@ struct llama_moe_cache::impl {
     // the device: ggml_moe_doorbell (after the slot lookup) publishes x and the plan and rings, ggml_moe_join (after the down
     // projection) spins on the done word and copies the CPU's rows in. No host step, no stream sync, CUDA graphs stay on.
     float   lane_frac       = 0.0f;
+    float   lane_frac_multi = -1.0f; // LLAMA_MOE_CPU_LANE_MULTI: the share for graphs of 2+ tokens (default: lane_frac)
     int32_t lane_timeout_ms = 2000;
     std::vector<ggml_backend_buffer_ptr> lane_bufs;   // the channels of each device, pinned host memory
     std::vector<ggml_backend_buffer_ptr> lane_mapped; // the same mapped to the device
@@ -1914,11 +1920,17 @@ struct llama_moe_cache::impl {
         if (const char * env = moe_env("LLAMA_MOE_DEVICE_HITS_MAX")) {
             dh_max = std::clamp<int64_t>(atoll(env), 1, max_batch);
         }
+        if (const char * env = getenv("LLAMA_MOE_STATS_EVERY")) {
+            stats_every = std::max(0, atoi(env));
+        }
         if (const char * env = moe_env("LLAMA_MOE_DEVICE_HITS_FILLS")) {
             dh_fill_max = std::max(0, atoi(env));
         }
         if (const char * env = moe_env("LLAMA_MOE_CPU_LANE")) {
             lane_frac = std::clamp((float) atof(env), 0.0f, 1.0f);
+        }
+        if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_MULTI")) {
+            lane_frac_multi = std::clamp((float) atof(env), 0.0f, 1.0f);
         }
         if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_TIMEOUT_MS")) {
             lane_timeout_ms = std::max(1, atoi(env));
@@ -2031,6 +2043,16 @@ struct llama_moe_cache::impl {
         }
         if (prof.n_layer > 0 && prof.n_layer != (int32_t) layers.size()) {
             LLAMA_LOG_WARN("%s: MoE cache profile %s has %d layers, the model %zu\n", __func__, prof_path.c_str(), prof.n_layer, layers.size());
+        }
+        // LLAMA_MOE_DRAFT_CACHE_PRELOAD=1: a draft cache without a profile fills its slots at load (all the experts when they fit,
+        // as Strata keeps the MTP experts resident) instead of on first use, which reads them over PCIe during the first steps
+        if (draft && prof.n_layer == 0 && !no_alloc) {
+            const char * env = getenv("LLAMA_MOE_DRAFT_CACHE_PRELOAD");
+            if (env != nullptr && atoi(env) != 0) {
+                prof.n_layer  = (int32_t) layers.size();
+                prof.n_expert = n_expert_model;
+                prof.score.assign((size_t) prof.n_layer*prof.n_expert, 1.0f);
+            }
         }
         if (prof.n_layer > 0 && !no_alloc) {
             place();
@@ -4129,6 +4151,17 @@ struct llama_moe_cache::impl {
 
             observe(il, ids, n);
             slru.mark_seen(ids, n);
+            {
+                const int64_t nt = std::clamp<int64_t>(n / std::max<int64_t>(1, n_expert_used), 1, 8);
+                dh_by_n_stats & bn = stats_dh_n[nt];
+                bn.layers++;
+                bn.pairs += n;
+                bn.uniq  += slru.uniq.size();
+                for (int32_t e : slru.uniq) {
+                    (slru.slot_map[il][e] < slru.n_slots ? bn.hits : bn.misses)++;
+                }
+                dh_graph_tokens = std::max(dh_graph_tokens, nt);
+            }
             int32_t * slots = slru.slot_map[il];
             dh_cand.clear();
             for (int32_t e : slru.uniq) {
@@ -4263,6 +4296,17 @@ struct llama_moe_cache::impl {
                 }
                 observe(il, ids, n);
                 slru.mark_seen(ids, n);
+                {
+                    const int64_t nt = std::clamp<int64_t>(n / std::max<int64_t>(1, n_expert_used), 1, 8);
+                    dh_by_n_stats & bn = stats_dh_n[nt];
+                    bn.layers++;
+                    bn.pairs += n;
+                    bn.uniq  += slru.uniq.size();
+                    for (int32_t e : slru.uniq) {
+                        (slru.slot_map[il][e] < slru.n_slots ? bn.hits : bn.misses)++;
+                    }
+                    dh_graph_tokens = std::max(dh_graph_tokens, nt);
+                }
                 const int32_t * slots = slru.slot_map[il];
                 for (int32_t e : slru.uniq) {
                     if (slots[e] < slru.n_slots) {
@@ -4958,6 +5002,13 @@ struct llama_moe_cache::impl {
         }
         if (dh_logged) {
             stats_dh.graphs++;
+            if (dh_graph_tokens > 0) {
+                stats_dh_n[dh_graph_tokens].graphs++;
+            }
+            dh_graph_tokens = 0;
+            if (stats_every > 0 && stats_dh.graphs % stats_every == 0) {
+                log_stats();
+            }
         }
         dh_logged = logs;
     }
@@ -6277,6 +6328,16 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        for (int64_t nt = 1; nt <= 8; ++nt) {
+            const dh_by_n_stats & bn = stats_dh_n[nt];
+            if (bn.layers == 0) {
+                continue;
+            }
+            LLAMA_LOG_INFO("%s: device hits, %" PRId64 "-token graphs: %zu graphs; per layer %.2f pairs, %.2f distinct experts, "
+                "%.2f hits, %.2f misses (%.1f%% hit rate)\n", log_tag(), nt, bn.graphs, (double) bn.pairs/bn.layers,
+                (double) bn.uniq/bn.layers, (double) bn.hits/bn.layers, (double) bn.misses/bn.layers,
+                100.0*bn.hits/std::max<size_t>(1, bn.hits + bn.misses));
+        }
         const dh_stats & ds = stats_dh;
         if (ds.hits + ds.misses > 0) {
             LLAMA_LOG_INFO("%s: device hits: %zu graphs, hits = %zu, misses = %zu read from host memory (%.2f MiB), hit rate = %.2f%%, "
@@ -6428,7 +6489,10 @@ void * llama_moe_cache::cpu_lane(int32_t il, int64_t n_tokens, int64_t n_expert_
     return pimpl->cpu_lane(il, n_tokens, n_expert_used, up, gate, down, gate_up, clamp);
 }
 
-float llama_moe_cache::cpu_lane_frac() const {
+float llama_moe_cache::cpu_lane_frac(int64_t n_tokens) const {
+    if (n_tokens > 1 && pimpl->lane_frac > 0.0f && pimpl->lane_frac_multi >= 0.0f) {
+        return pimpl->lane_frac_multi;
+    }
     return pimpl->lane_frac;
 }
 
