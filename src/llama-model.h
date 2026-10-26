@@ -914,6 +914,15 @@ struct llama_model {
     };
     const draft_vocab_head * get_draft_vocab_head() const;
 
+    // LLAMA_MTP_EH_ONCE=1: the MTP eh_proj [2*n_embd, n_embd] split once on first use into its token-embedding and hidden
+    // halves (columns 0..n_embd-1 and n_embd..2*n_embd-1), so the embedding half runs once per token, not once per stream;
+    // null without the env, for a weightless model or a layout that cannot be split
+    struct eh_proj_halves {
+        ggml_tensor * e = nullptr; // [n_embd, n_embd]
+        ggml_tensor * h = nullptr; // [n_embd, n_embd]
+    };
+    const eh_proj_halves * get_mtp_eh_halves(const ggml_tensor * eh_proj) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

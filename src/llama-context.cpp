@@ -18,6 +18,10 @@
 #include "llama.h"
 
 #include <algorithm>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
+
 #include <chrono>
 #include <unordered_set>
 #include <cinttypes>
@@ -2495,6 +2499,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 LLAMA_LOG_INFO("decode timing: %zu tokens (ctx type %d): setup %.1f ms, ubatches %.1f ms (host, unsynced)\n",
                         n, type, (t1 - t0)/1000.0, (t2 - t1)/1000.0);
             } else if (n <= 8 && type >= 0 && type < 8) {
+#if defined(__linux__) || defined(__APPLE__)
+                // page faults of the whole process over every 100 small batches of this context type (the PLE table and
+                // the host experts are mmap'd: a major fault is a read from disk)
+                static uint64_t fcnt[8] = {};
+                static long     fmaj[8] = {}, fmin[8] = {};
+                static int64_t  ft0[8]  = {};
+                if (fcnt[type]++ % 100 == 0) {
+                    struct rusage ru = {};
+                    getrusage(RUSAGE_SELF, &ru);
+                    if (fcnt[type] > 1) {
+                        LLAMA_LOG_INFO("decode timing: page faults over the last 100 1..8-token batches (ctx type %d): major %ld "
+                                "(%.2f a batch), minor %ld, %.0f ms\n", type, ru.ru_majflt - fmaj[type],
+                                (ru.ru_majflt - fmaj[type])/100.0, ru.ru_minflt - fmin[type], (t2 - ft0[type])/1000.0);
+                    }
+                    fmaj[type] = ru.ru_majflt;
+                    fmin[type] = ru.ru_minflt;
+                    ft0[type]  = t2;
+                }
+#endif
                 static double   acc[8][9][6] = {};
                 static uint64_t cnt[8][9]    = {};
                 acc[type][n][0] += (t1 - t0)/1000.0;
