@@ -6674,6 +6674,17 @@ struct test_mul_mat_id_slots : public test_case {
     }
 };
 
+// GGML_CUDA_SM75_F32_TC / GGML_CUDA_DEQ8_WIDE: Flash-Next prompt-chunk dense matmuls under their own name (MUL_MAT_FN) so a
+// gate can run just these: F32 router / GDN alpha / HC inject, Q8_0 projections (DENSE_F16 dequantizes them per call).
+struct test_mul_mat_fn : public test_mul_mat {
+    test_mul_mat_fn(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_FN";
+    }
+};
+
 // Expert matmuls at Flash-Next prompt shapes (GGML_CUDA_MMQ_MOE): 512 experts, 10 used, a prompt chunk of n tokens, routed by a
 // skewed popularity (log-normal expert weights, sigma = skew; 0 = uniform) drawn without replacement per token, fixed per case
 // (no redraw between perf runs). slots: ggml_mul_mat_id_slots with 3/4 of the experts in a bank, the rest in a staging area
@@ -12770,6 +12781,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q8_0, 512, 10, false, 2560, 3584,  640, sl, 0.7f));
     }
     test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, 100, 640, false, 1.5f)); // sparse, skewed
+    // GGML_CUDA_SM75_F32_TC / GGML_CUDA_DEQ8_WIDE: router, GDN alpha, HC inject (F32); qkv, out and an odd size (Q8_0)
+    test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_F32,    512, 3584,  2560));
+    test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_F32,     48, 3584,  2560));
+    test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_F32,      4, 3584, 10240));
+    test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_Q8_0, 10240, 1100,  2560));
+    test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_Q8_0,  2560, 1100,  6144));
+    test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_Q8_0,    33, 1100,  2560)); // k*m not a multiple of 2048
     // LLAMA_MOE_RING_BYTES: the staging tensor is the whole byte ring, more places than experts, the staged ones anywhere in it
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 16, 200, true, 8, true, 128, 512, 512));
     test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 64, 96, 16, 200, true, 8, false, 256, 512, 640));
@@ -13900,6 +13918,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q5_1, 512, 10, false, 2560, 3584, 640, false, 0.0f)); // uniform routing
     test_cases.emplace_back(new test_mul_mat_id_fn(GGML_TYPE_Q4_K, 512, 10, true,   640, 3584, 2560, false, 0.0f));
+    for (int n : {3584, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_F32,    512, n,  2560));
+        test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_F32,     48, n,  2560));
+        test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_F32,      4, n, 10240));
+        test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_Q8_0, 10240, n,  2560));
+        test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_Q8_0,  6144, n,  2560));
+        test_cases.emplace_back(new test_mul_mat_fn(GGML_TYPE_Q8_0,  2560, n,  6144));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

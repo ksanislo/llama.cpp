@@ -2398,6 +2398,40 @@ static void ggml_cuda_mul_mat_sm75_dense_f16(ggml_backend_cuda_context & ctx, co
     ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, &src1_h, dst, /*force_f32_output =*/ true);
 }
 
+// Turing (sm_75): an F32 2D weight (router, GDN alpha/beta, HC inject) times a prompt-sized batch on the FP16 tensor cores
+// (weight converted per call, activations saturated to FP16, FP32 sums and output) instead of cuBLAS's FP32 SIMT SGEMM, like
+// Strata's BF16_TC for the same projections. GGML_CUDA_SM75_F32_TC=<min batch columns>; unset or 0 = off.
+// GGML_CUDA_SM75_F32_TC_SKIP=<comma list of name substrings>: weights whose name contains one stay on SGEMM.
+static bool ggml_cuda_use_sm75_f32_tc(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    static const int64_t min_cols = [] {
+        const char * e = getenv("GGML_CUDA_SM75_F32_TC");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : (int64_t) 0;
+    }();
+    static const std::vector<std::string> skip = [] {
+        std::vector<std::string> v;
+        const char * e = getenv("GGML_CUDA_SM75_F32_TC_SKIP");
+        std::string s = e ? e : "";
+        for (size_t p = 0; p <= s.size(); ) {
+            size_t q = s.find(',', p);
+            if (q == std::string::npos) q = s.size();
+            if (q > p) v.push_back(s.substr(p, q - p));
+            p = q + 1;
+        }
+        return v;
+    }();
+    if (min_cols <= 0 || src0->type != GGML_TYPE_F32 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING ||
+            cc >= GGML_CUDA_CC_AMPERE || src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0) ||
+            src1->ne[1] < min_cols || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    for (const std::string & w : skip) {
+        if (strstr(src0->name, w.c_str()) != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2447,6 +2481,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_use_sm75_dense_f16(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_sm75_dense_f16(ctx, src0, src1, dst);
+        return;
+    }
+    if (ggml_cuda_use_sm75_f32_tc(src0, src1, dst, cc)) {
         ggml_cuda_mul_mat_sm75_dense_f16(ctx, src0, src1, dst);
         return;
     }

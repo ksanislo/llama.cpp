@@ -81,6 +81,81 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 }
 
+// GGML_CUDA_DEQ8_WIDE: the same per-warp 2048-value chunk as dequantize_block_q8_0_f16 (same arithmetic, same output), WARPS
+// warps a block, each with its own shared slice: the one-warp blocks cap Turing at 16 warps an SM (the block limit), half of
+// its 32, for this memory-bound per-call weight dequantization (GGML_CUDA_SM75_DENSE_F16 runs it every prompt chunk).
+template <bool need_check, int warps>
+static __global__ void dequantize_block_q8_0_f16_wide(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+    constexpr int nint = CUDA_Q8_0_NE_ALIGN/sizeof(int) + WARP_SIZE;
+
+    const int64_t chunk = (int64_t) blockIdx.x*warps + threadIdx.y;
+    const int64_t i0    = CUDA_Q8_0_NE_ALIGN*chunk;
+    if (i0 >= k) {
+        return;
+    }
+    const int * x0 = ((const int *) vx) + chunk*nint;
+    half2 * y2 = (half2 *) (y + i0);
+
+    __shared__ int vals_all[warps][nint];
+    int * vals = vals_all[threadIdx.y];
+
+#pragma unroll
+    for (int ix0 = 0; ix0 < nint; ix0 += WARP_SIZE) {
+        if (need_check && i0*sizeof(block_q8_0)/QK8_0 + sizeof(int)*(ix0 + threadIdx.x) >= k*sizeof(block_q8_0)/QK8_0) {
+            break;
+        }
+
+        const int ix = ix0 + threadIdx.x;
+        vals[ix] = x0[ix];
+    }
+
+    __syncwarp();
+
+#pragma unroll
+    for (int iy = 0; iy < CUDA_Q8_0_NE_ALIGN; iy += 2*WARP_SIZE) {
+        if (need_check && i0 + iy + 2*threadIdx.x >= k) {
+            return;
+        }
+
+        const half * b0 = ((const half  *) vals) + (sizeof(block_q8_0)/sizeof(half)) * ((iy + 2*threadIdx.x)/QK8_0);
+        const half    d = *b0;
+        const char2  qs = ((const char2 *) (b0 + 1))[threadIdx.x % (QK8_0/2)];
+
+        y2[iy/2 + threadIdx.x] = __hmul2(make_half2(qs.x, qs.y), __half2half2(d));
+    }
+#else
+    GGML_UNUSED_VARS(vx, y, k);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+}
+
+// GGML_CUDA_DEQ8_WIDE=<warps a block: 2, 4 or 8>; unset or 0 = the one-warp kernel
+static int ggml_cuda_deq8_wide() {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_DEQ8_WIDE");
+        const int w = e ? atoi(e) : 0;
+        if (w != 0 && w != 2 && w != 4 && w != 8) {
+            GGML_LOG_WARN("%s: GGML_CUDA_DEQ8_WIDE=%s is not 2, 4 or 8: off\n", __func__, e);
+            return 0;
+        }
+        return w;
+    }();
+    return v;
+}
+
+template <int warps>
+static void dequantize_block_q8_0_f16_wide_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
+    const int64_t n_chunks   = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
+    const int     num_blocks = (int) ((n_chunks + warps - 1) / warps);
+    const dim3 block(WARP_SIZE, warps, 1);
+    if (k % CUDA_Q8_0_NE_ALIGN == 0) {
+        dequantize_block_q8_0_f16_wide<false, warps><<<num_blocks, block, 0, stream>>>(vx, y, k);
+    } else {
+        dequantize_block_q8_0_f16_wide<true, warps><<<num_blocks, block, 0, stream>>>(vx, y, k);
+    }
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
 
@@ -265,6 +340,12 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
 }
 
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
+    switch (ggml_cuda_deq8_wide()) {
+        case 2: dequantize_block_q8_0_f16_wide_cuda<2>(vx, y, k, stream); return;
+        case 4: dequantize_block_q8_0_f16_wide_cuda<4>(vx, y, k, stream); return;
+        case 8: dequantize_block_q8_0_f16_wide_cuda<8>(vx, y, k, stream); return;
+        default: break;
+    }
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
         const bool need_check = false;
