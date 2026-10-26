@@ -2632,6 +2632,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
     if (cpu_ids == nullptr) {
         experts = build_experts(cur, selected_experts, slots, true);
+        if (lane != nullptr && moe_beside) {
+            // order: doorbell, the device's experts, the side work, then the join (ggml runs a split in node order)
+            ggml_build_forward_expand(gf, experts);
+            auto beside = std::move(moe_beside);
+            moe_beside = nullptr;
+            beside();
+        }
         if (lane != nullptr) {
             experts = ggml_moe_join(ctx0, experts, slots, lane, lane_n_expert, moe_cache->cpu_lane_max_tokens(), moe_cache->cpu_lane_timeout_ms());
             ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));

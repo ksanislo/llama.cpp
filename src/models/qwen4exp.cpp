@@ -1071,6 +1071,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // the shared expert's mat-vecs; its gate (sigmoid, mul, add) stays after the routed sum for the shgate fusion
+    const bool has_shexp = model.layers[il].ffn_up_shexp != nullptr;
+    ggml_tensor * ffn_shexp   = nullptr;
+    ggml_tensor * shared_gate = nullptr;
+    auto build_shexp = [&]() {
+        ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+    };
+
+    // LLAMA_MOE_JOIN_LATE=1: the shared expert runs between the CPU lane's doorbell and its join (Strata's late shared-expert fork)
+    static const bool join_late = [] { const char * e = getenv("LLAMA_MOE_JOIN_LATE"); return e != nullptr && atoi(e) != 0; }();
+    if (has_shexp && join_late) {
+        moe_beside = [&]() {
+            build_shexp();
+            ggml_build_forward_expand(gf, ffn_shexp);
+            ggml_build_forward_expand(gf, shared_gate);
+        };
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1087,21 +1116,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
+    moe_beside = nullptr; // no CPU lane on this layer: built below as before
 
     // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
+    if (has_shexp) {
+        if (ffn_shexp == nullptr) {
+            build_shexp();
+        }
 
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
