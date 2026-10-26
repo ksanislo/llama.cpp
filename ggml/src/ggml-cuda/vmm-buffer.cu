@@ -341,19 +341,24 @@ bool ggml_cuda_vmm_region_alias(ggml_cuda_vmm_region * dst, size_t dst_offset, c
             return false;
         }
     }
+    // whole allocations only: cuMemMap takes no offset into a handle (it must be 0)
+    for (size_t i = 0; i < n; i += src->map_len[ss + i]) {
+        if (src->map_start[ss + i] != ss + i || i + src->map_len[ss + i] > n) {
+            return false;
+        }
+    }
 
     ggml_cuda_vmm_sync(dst);
 
     const CUdeviceptr dptr = dst->base + ds*G;
     CU_CHECK(cuMemUnmap(dptr, n*G)); // the zero granule mappings
     for (size_t i = 0; i < n; ) {
-        const size_t g  = ss + i;
-        const size_t ms = src->map_start[g];
-        const size_t k  = std::min(ms + src->map_len[ms] - g, n - i);
+        const size_t g = ss + i;
+        const size_t k = src->map_len[g];
 
         CUmemGenericAllocationHandle h;
-        CU_CHECK(cuMemRetainAllocationHandle(&h, (void *) (src->base + ms*G)));
-        CU_CHECK(cuMemMap(dptr + i*G, k*G, (g - ms)*G, h, 0));
+        CU_CHECK(cuMemRetainAllocationHandle(&h, (void *) (src->base + g*G)));
+        CU_CHECK(cuMemMap(dptr + i*G, k*G, 0, h, 0));
         CU_CHECK(cuMemRelease(h)); // the mappings keep the memory
 
         for (size_t j = 0; j < k; ++j) {

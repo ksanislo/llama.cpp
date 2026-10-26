@@ -2755,15 +2755,28 @@ struct llama_moe_cache::impl {
         if (!d.buf) {
             throw std::runtime_error("failed to reserve the address space of the MoE cache");
         }
+        // aliased: the lent ranges as allocations of at most LLAMA_MOE_DECODE_MEM_PIECE_MIB (64), cut where the staging slots
+        // end in the tail space; an alias maps whole allocations (one call each, cuMemMap takes no offset into one)
         dm.tails.clear();
+        const char * env_p = getenv("LLAMA_MOE_DECODE_MEM_PIECE_MIB");
+        const size_t piece = std::max<size_t>(1, (size_t) (env_p ? std::max(1, atoi(env_p)) : 64)*1024*1024/dm.gran)*dm.gran;
+        size_t pos = 0;
         for (const group & g : groups) {
-            if (g.id == (int32_t) id) {
-                for (const auto & r : g.lend_ranges) {
-                    // aliased: one allocation per lent range, so that each maps with one call
-                    if (dm_alias && !vmm_chunk(d.buf.get(), r.first, r.second)) {
+            if (g.id != (int32_t) id) {
+                continue;
+            }
+            for (const auto & r : g.lend_ranges) {
+                for (size_t off = 0; off < r.second; ) {
+                    size_t n = std::min(piece, r.second - off);
+                    if (pos < dm.stage && pos + n > dm.stage) {
+                        n = dm.stage - pos;
+                    }
+                    if (dm_alias && !vmm_chunk(d.buf.get(), r.first + off, n)) {
                         throw std::runtime_error("failed to allocate the MoE cache buffers");
                     }
-                    dm.tails.push_back(r);
+                    dm.tails.push_back({ r.first + off, n });
+                    off += n;
+                    pos += n;
                 }
             }
         }
@@ -2791,29 +2804,27 @@ struct llama_moe_cache::impl {
         d.buf_size = total;
     }
 
-    // LLAMA_MOE_DECODE_MEM_ALIAS: map [t_off, t_off + size) of the device's tail space (its lent ranges in a row) into dst at dst_off
-    bool dm_alias_map(size_t id, ggml_backend_buffer_t dst, size_t dst_off, size_t t_off, size_t size) {
+    // LLAMA_MOE_DECODE_MEM_ALIAS: map the whole pieces of the device's tail space (its lent ranges in a row) from t_off (a piece
+    // start) into dst at dst_off, as many as fit in size; returns the bytes mapped, SIZE_MAX if a mapping failed
+    size_t dm_alias_map(size_t id, ggml_backend_buffer_t dst, size_t dst_off, size_t t_off, size_t size) {
         const dm_device & dm = dm_devs[id];
-        size_t pos = 0;
+        size_t pos  = 0;
+        size_t done = 0;
         for (const auto & r : dm.tails) {
-            if (size == 0) {
-                break;
-            }
-            if (t_off >= pos + r.second) {
+            if (pos < t_off) {
                 pos += r.second;
                 continue;
             }
-            const size_t skip = t_off - pos;
-            const size_t n    = std::min(size, r.second - skip);
-            if (!vmm_alias_fn(dst, dst_off, devices[id].buf.get(), r.first + skip, n)) {
-                return false;
+            if (done + r.second > size) {
+                break;
             }
-            dst_off += n;
-            t_off   += n;
-            size    -= n;
-            pos     += r.second;
+            if (!vmm_alias_fn(dst, dst_off + done, devices[id].buf.get(), r.first, r.second)) {
+                return SIZE_MAX;
+            }
+            done += r.second;
+            pos  += r.second;
         }
-        return size == 0;
+        return done;
     }
 
     size_t dm_tail_bytes(size_t id) const {
@@ -2832,8 +2843,8 @@ struct llama_moe_cache::impl {
             if (dm.lend == 0 || dm.stage == 0 || !d.buf_stage) {
                 continue;
             }
-            const size_t n = std::min(dm.stage, dm_tail_bytes(id))/dm.gran*dm.gran;
-            if (!dm_alias_map(id, d.buf_stage.get(), 0, 0, n)) {
+            const size_t n = std::min(dm.stage, dm_tail_bytes(id));
+            if (dm_alias_map(id, d.buf_stage.get(), 0, 0, n) != n) {
                 throw std::runtime_error("failed to map the MoE staging slots onto the lent cache tails");
             }
             dm.alias_stage = n;
@@ -2850,8 +2861,8 @@ struct llama_moe_cache::impl {
         }
         dm_commit_compute(id, dm.small);
         const size_t left = dm_tail_bytes(id) - std::min(dm_tail_bytes(id), dm.alias_stage);
-        const size_t n    = std::min(left, bsize - dm.small)/dm.gran*dm.gran;
-        if (n > 0 && !dm_alias_map(id, dm.cbuf, dm.small, dm.alias_stage, n)) {
+        const size_t n    = dm_alias_map(id, dm.cbuf, dm.small, dm.alias_stage, std::min(left, bsize - dm.small));
+        if (n == SIZE_MAX) {
             GGML_ABORT("%s: %s: cannot map the compute buffer onto the lent cache tails (LLAMA_MOE_DECODE_MEM_ALIAS=0 moves them instead)",
                 __func__, ggml_backend_name(devices[id].backend));
         }
