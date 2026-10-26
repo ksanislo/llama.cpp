@@ -521,6 +521,14 @@ private:
     std::vector<out_state>   group_out; // [G + 1], the entry of the active owner is stale
     std::vector<group_state> groups;
     void out_switch(int32_t owner);
+    // a scheduler and a graph per group: a group's graph stays allocated (and its CUDA graphs captured) in its own
+    // scheduler, so the next step of the group only sets the inputs (as the reuse of the last graph does); the
+    // scheduler of the group is swapped in as `sched` while it is decoded
+    std::vector<ggml_backend_sched_ptr> group_sched;
+    std::vector<llm_graph_result_ptr>   group_res;
+    std::vector<llm_graph_result *>     group_res_active;
+    int32_t n_group_built  = 0;
+    int32_t n_group_reused = 0;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

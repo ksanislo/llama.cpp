@@ -706,6 +706,18 @@ llama_context::llama_context(
                     }
                 }
             }
+            // decode groups: each group's scheduler allocates the compute buffer of its small graphs beside the cache
+            if (n_decode_groups > 0 && !cparams.moe_cache_draft) {
+                const char * env = getenv("LLAMA_DECODE_GROUPS_RESERVE_MIB");
+                const size_t per_group = (size_t) (env ? std::max(0, atoi(env)) : 192) * 1024 * 1024;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        compute.reserve[i] += n_decode_groups*per_group;
+                        reserve = reserve || per_group > 0;
+                    }
+                }
+            }
             // a draft cache has no decode memory or split to plan: nothing to measure
             if ((llama_moe_cache::wants_compute_sizes() || reserve) && !model.hparams.no_alloc && !cparams.moe_cache_draft) {
                 compute.measure = true;
@@ -1247,10 +1259,41 @@ int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
     }
 
     out_switch(g);
+
+    // the group's own scheduler (created on first use, for small graphs: its buffers grow to the group's graph)
+    sched_reserve();
+    if (group_sched.size() < (size_t) n_decode_groups) {
+        group_sched.resize(n_decode_groups);
+        group_res.resize(n_decode_groups);
+        group_res_active.assign(n_decode_groups, nullptr);
+    }
+    if (!group_sched[g]) {
+        const size_t max_nodes = gf_res_reserve ? gf_res_reserve->get_max_nodes() : graph_max_nodes(cparams.n_ubatch);
+        group_sched[g].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+                cparams.pipeline_parallel, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(group_sched[g].get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(group_sched[g].get(), sched_graph_realloc, this);
+        group_res[g].reset(new llm_graph_result(max_nodes));
+        group_res_active[g] = nullptr;
+    }
+    struct sched_swap {
+        ggml_backend_sched_ptr & a;
+        ggml_backend_sched_ptr & b;
+        sched_swap(ggml_backend_sched_ptr & a, ggml_backend_sched_ptr & b) : a(a), b(b) { std::swap(a, b); }
+        ~sched_swap() { std::swap(a, b); }
+    };
+
     group_cur   = g;
     out_backend = nullptr;
-    const int ret = decode(batch);
+    int ret;
+    {
+        sched_swap swap(sched, group_sched[g]);
+        ret = decode(batch);
+    }
     group_cur = -1;
+    if ((n_group_built + n_group_reused) % 1024 == 1023) {
+        LLAMA_LOG_INFO("%s: decode groups: %d group graphs built, %d reused\n", __func__, n_group_built, n_group_reused);
+    }
     if (ret != 0) {
         synchronize();
         return ret;
@@ -1908,7 +1951,7 @@ bool llama_context::set_adapter_cvec(
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // [TAG_PIPELINE_RESERVE] with pipeline parallelism, reserve the worst-case graph of sched_reserve again after a different graph
     // (e.g. a small batch with host weights), otherwise every ubatch of the prompt reallocates the compute buffers
-    if (cparams.pipeline_parallel && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {
+    if (cparams.pipeline_parallel && gtype == ctx_type_to_graph_type(cparams.ctx_type) && group_cur < 0) {
         const uint32_t n_tokens_reserve = std::min(cparams.n_ctx, cparams.n_ubatch);
         // a prompt pipe chunk fits the worst-case graph too: keep (or make) that reservation, else every chunk reallocates
         // and the reallocation synchronizes all the devices, which serializes the pipeline
@@ -1935,7 +1978,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // with submit threads, the graph of the pipeline copy it is allocated in: free once the threads have queued that
     // copy's previous graph
     llm_graph_result * res = nullptr;
-    if (submit_active) {
+    // decode groups: the group's graph, in the group's scheduler (swapped in as sched)
+    llm_graph_result ** res_active = &gf_res_prev_active;
+    if (group_cur >= 0) {
+        res        = group_res[group_cur].get();
+        res_active = &group_res_active[group_cur];
+    } else if (submit_active) {
         auto & r = gf_res_pipe[ggml_backend_sched_wait_next_copy(sched.get())];
         if (!r) {
             r.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
@@ -1951,22 +1999,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // (a reused graph synchronizes the scheduler under pipeline parallelism, so the prompt pipe's chunks are rebuilt)
-    // (decode groups: the other groups' graphs are in flight, so they are rebuilt too)
-    if (!graph_reuse_disable && prompt_pipe_chunk == 0 && !(group_cur >= 0 && cparams.pipeline_parallel) &&
-            gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && prompt_pipe_chunk == 0 && *res_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // (a group's previous step was waited for before this one: its scheduler's own copy events order the uploads)
+        if (cparams.pipeline_parallel && group_cur < 0) {
             ggml_backend_sched_synchronize(sched.get());
             copy_experts.in_flight = false;
         }
 
         n_reused++;
+        n_group_reused += group_cur >= 0;
     } else {
-        gf_res_prev_active = nullptr;
+        *res_active = nullptr;
+        n_group_built += group_cur >= 0;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1997,7 +2046,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             worst_case_reserved = false;
         }
 
-        gf_res_prev_active = submit_active ? nullptr : res;
+        *res_active = submit_active ? nullptr : res;
     }
 
     // set the input data for the input tensors
@@ -2494,7 +2543,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // handle any pending shifts/copies (and rope level moves)
-    memory_update(false);
+    if (memory_update(false) && group_cur >= 0) {
+        group_res_active[group_cur] = nullptr; // a graph of the update ran in the group's scheduler
+    }
     t_ph[2] = decode_timing ? ggml_time_us() : 0;
 
     llama_memory_context_ptr mctx;
