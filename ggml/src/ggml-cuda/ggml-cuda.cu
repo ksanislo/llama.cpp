@@ -2081,6 +2081,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     if (is_mul_mat_id && ((ffn_up->src[3] == nullptr) != (ffn_gate->src[3] == nullptr))) {
         return false;
     }
+    // ggml_mul_mat_id_slots: MMQ only, not fused
+    if (is_mul_mat_id && (ffn_up->src[4] != nullptr || ffn_gate->src[4] != nullptr)) {
+        return false;
+    }
 
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
     const ggml_tensor * ffn_up_bias_src   = has_scale ? ffn_up_scale   : ffn_up;
@@ -2186,6 +2190,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[4] != nullptr) {
+        return false; // ggml_mul_mat_id_slots is MMQ only
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2413,6 +2421,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    // ggml_mul_mat_id_slots: the experts are read where the map src[4] says, only MMQ supports it (see supports_op)
+    if (dst->src[4] != nullptr) {
+        GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ggml_nelements(dst->src[4])));
+        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // ggml_mul_mat_id_mapped: the experts of negative ids are read from src[3], only MMVQ supports it (see supports_op)
     if (dst->src[3] != nullptr) {
@@ -6081,6 +6096,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
+                }
+                if (op->op == GGML_OP_MUL_MAT_ID && op->src[4] != nullptr) {
+                    // ggml_mul_mat_id_slots: MMQ reads each expert where the map says, quantized experts of MMQ types
+                    const ggml_tensor * alt  = op->src[3];
+                    const ggml_tensor * host = op->src[5];
+                    const ggml_tensor * ids  = op->src[2];
+                    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    const int64_t n_map = ggml_nelements(op->src[4]);
+                    return ggml_is_quantized(a->type) && alt->type == a->type && alt->nb[1] == a->nb[1] && alt->nb[2] == a->nb[2] &&
+                        (host == nullptr || (host->type == a->type && host->nb[1] == a->nb[1] && host->nb[2] == a->nb[2])) &&
+                        b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && b->ne[3] == 1 &&
+                        ids->ne[0] < 1024 && b->ne[2] < (1 << 22) &&
+                        ggml_cuda_should_use_mmq(a->type, cc, b->ne[2], n_map);
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != nullptr) {
                     // ggml_mul_mat_id_mapped: only MMVQ reads the experts by pointer, so small batches of quantized experts

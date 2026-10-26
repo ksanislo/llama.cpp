@@ -5813,6 +5813,147 @@ struct test_mul_mat_id_mapped : public test_case {
     }
 };
 
+// ggml_mul_mat_id_slots (an expert cache read in place during a prompt): every expert is read where a map says - a slot of a bank
+// holding some of the experts (the bank may have more slots than there are experts), a place in a staging area holding others in
+// a different order, or all the experts (host memory read directly). Compared with plain MUL_MAT_ID on all the experts in the same
+// graph: the experts, not the bank slots, are the groups, so the halves must match bit for bit on the tested backend (whenever they
+// do on the CPU, whose tiled path serves only the bank), and both are compared with the CPU as usual.
+struct test_mul_mat_id_slots : public test_case {
+    const ggml_type type_a;
+    const int n_mats;  // experts (the map)
+    const int n_slots; // bank slots
+    const int n_hit;   // experts in the bank
+    const int n_stage; // staging places (experts staged: min(n_stage, n_mats - n_hit), the rest from the host tensor)
+    const bool host;   // a host tensor (else n_hit + n_stage >= n_mats)
+    const int n_used;
+    const bool b;      // broadcast b matrix (gate/up: one activation row per token)
+    const int64_t m;
+    const int64_t n;   // tokens
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR11(type_a, n_mats, n_slots, n_hit, n_stage, host, n_used, b, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SLOTS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t h = n/2;
+        const bool exact_a = memcmp(a, a + h, h*sizeof(float)) == 0;
+        const bool exact_b = memcmp(b, b + h, h*sizeof(float)) == 0;
+        if (!exact_a && exact_b) {
+            printf("[slots != plain on the tested backend] ");
+            return INFINITY;
+        }
+        return nmse(a, b, n);
+    }
+
+    test_mul_mat_id_slots(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 64, int n_slots = 96, int n_hit = 16, int n_stage = 32,
+            bool host = true, int n_used = 8, bool b = false, int64_t m = 128, int64_t n = 512, int64_t k = 512)
+        : type_a(type_a), n_mats(n_mats), n_slots(n_slots), n_hit(n_hit), n_stage(n_stage), host(host), n_used(n_used), b(b),
+          m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats && n_hit <= n_mats && n_hit <= n_slots && n_stage >= 1);
+        GGML_ASSERT(host || n_hit + n_stage >= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * bank = ggml_new_tensor_3d(ctx, type_a, k, m, n_slots);
+        ggml_set_name(bank, "bank");
+        ggml_tensor * stage = ggml_new_tensor_3d(ctx, type_a, k, m, n_stage);
+        ggml_set_name(stage, "stage");
+        ggml_tensor * as_host = nullptr;
+        if (host) {
+            as_host = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(as_host, "as_host");
+        }
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * map = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_mats);
+        ggml_set_name(map, "map");
+
+        ggml_tensor * bt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(bt, "b");
+
+        ggml_tensor * slots = ggml_mul_mat_id_slots(ctx, bank, stage, as_host, bt, ids, map);
+        ggml_set_name(slots, "slots");
+        ggml_tensor * plain = ggml_mul_mat_id(ctx, as, bt, ids);
+        ggml_set_name(plain, "plain");
+
+        ggml_tensor * out = ggml_concat(ctx, slots, plain, 2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234 + n + 7*n_hit + 13*n_stage);
+        ggml_tensor * as      = ggml_get_tensor(ctx, "as");
+        ggml_tensor * bank    = ggml_get_tensor(ctx, "bank");
+        ggml_tensor * stage   = ggml_get_tensor(ctx, "stage");
+        ggml_tensor * as_host = ggml_get_tensor(ctx, "as_host");
+        ggml_tensor * ids     = ggml_get_tensor(ctx, "ids");
+        ggml_tensor * map     = ggml_get_tensor(ctx, "map");
+        init_tensor_uniform(as);
+        init_tensor_uniform(bank);  // the slots without an expert of the map hold other experts
+        init_tensor_uniform(stage);
+        init_tensor_uniform(ggml_get_tensor(ctx, "b"));
+
+        std::vector<uint8_t> expert(as->nb[2]);
+        if (as_host) {
+            for (int e = 0; e < n_mats; ++e) {
+                ggml_backend_tensor_get(as, expert.data(), e*as->nb[2], expert.size());
+                ggml_backend_tensor_set(as_host, expert.data(), e*as_host->nb[2], expert.size());
+            }
+        }
+
+        // n_hit random experts in random slots of the bank, then the next ones in random places of the staging area, the rest host
+        std::vector<int32_t> perm(n_mats);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        std::vector<int32_t> slot(n_slots);
+        std::iota(slot.begin(), slot.end(), 0);
+        std::shuffle(slot.begin(), slot.end(), rng);
+        std::vector<int32_t> place(n_stage);
+        std::iota(place.begin(), place.end(), 0);
+        std::shuffle(place.begin(), place.end(), rng);
+        std::vector<int32_t> map_v(n_mats);
+        for (int i = 0; i < n_mats; ++i) {
+            const int32_t e = perm[i];
+            ggml_backend_tensor_get(as, expert.data(), e*as->nb[2], expert.size());
+            if (i < n_hit) {
+                map_v[e] = slot[i];
+                ggml_backend_tensor_set(bank, expert.data(), slot[i]*bank->nb[2], expert.size());
+            } else if (i - n_hit < n_stage) {
+                const int32_t p = place[i - n_hit];
+                map_v[e] = -1 - p;
+                ggml_backend_tensor_set(stage, expert.data(), p*stage->nb[2], expert.size());
+            } else {
+                map_v[e] = -1 - n_stage - (i % 3)*e; // any value past the staging places reads the host tensor
+            }
+        }
+        ggml_backend_tensor_set(map, map_v.data(), 0, ggml_nbytes(map));
+
+        // distinct experts per token
+        std::vector<int32_t> all(n_mats);
+        std::iota(all.begin(), all.end(), 0);
+        for (int64_t t = 0; t < n; ++t) {
+            std::shuffle(all.begin(), all.end(), rng);
+            ggml_backend_tensor_set(ids, all.data(), t*ids->nb[1], n_used*sizeof(int32_t));
+        }
+    }
+};
+
 // MoE CPU lane (ggml_moe_doorbell / ggml_moe_join, served by llama_moe_lane as in llama.cpp): an expert FFN (gate, up, swiglu,
 // down) through ggml_mul_mat_id_mapped where the doorbell hands a share frac of the misses to the CPU lane, compared with the plain
 // MUL_MAT_ID FFN on all the experts in the same graph. The lane computes its experts with ggml-cpu, the backend the others, so the
@@ -11761,6 +11902,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_id_mapped(ta, 64, 20, 10, true, 128, 1, 1024));
     }
+
+    // MoE cache read in place by large batches (LLAMA_MOE_RING_INPLACE): bank / staging / host experts by a map, MMQ sizes
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0,
+                         GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (int n : {33, 512}) {
+            for (bool bc : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_slots(ta, 64, 96, 16, 32, true, 8, bc, 128, n, 512));
+            }
+        }
+    }
+    for (int n : {1, 8, 64, 1024}) {
+        test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 16, 32, true, 8, true, 128, n, 512));
+    }
+    // read past the end of a row (k % 256 != 0, Flash-Next's down projection is 640 wide)
+    for (ggml_type ta : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_slots(ta, 64, 96, 16, 32, true, 8, false, 256, 512, 640));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 64, 64,  1, true,  8, true,  128, 512, 512)); // all hits
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 16,  0, 64, true,  8, true,  128, 512, 512)); // all staged
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 16,  0,  1, true,  8, true,  128, 512, 512)); // ~all host
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 64, 96, 24, 40, false, 8, false, 128, 512, 512)); // no host
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q5_1, 128, 600, 100, 20, true, 10, true, 128, 384, 512)); // bank >> experts
+    test_cases.emplace_back(new test_mul_mat_id_slots(GGML_TYPE_Q4_K, 512, 1500, 120, 300, true, 10, false, 128, 1024, 512)); // Flash-Next shape
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));

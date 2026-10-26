@@ -3489,6 +3489,28 @@ struct ggml_tensor * ggml_mul_mat_id_mapped(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_slots(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * as_alt,
+        struct ggml_tensor  * as_host,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * map) {
+    GGML_ASSERT(map->type == GGML_TYPE_I32 && ggml_is_contiguous(map));
+    if (as_host != NULL) {
+        GGML_ASSERT(as_host->type == as->type && as_host->ne[2] == ggml_nelements(map));
+        GGML_ASSERT(as_host->ne[0] == as->ne[0] && as_host->ne[1] == as->ne[1] && as_host->ne[3] == 1);
+        GGML_ASSERT(as_host->nb[0] == as->nb[0] && as_host->nb[1] == as->nb[1] && as_host->nb[2] == as->nb[2]);
+    }
+
+    struct ggml_tensor * result = ggml_mul_mat_id_mapped(ctx, as, as_alt, b, ids);
+    result->src[4] = map;
+    result->src[5] = as_host;
+
+    return result;
+}
+
 // ggml_moe_doorbell, ggml_moe_join
 
 size_t ggml_moe_lane_layout(int64_t n_embd, int64_t n_used, int64_t max_tokens, size_t * off_ids, size_t * off_x, size_t * off_rows) {

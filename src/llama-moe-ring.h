@@ -8,6 +8,7 @@
 // with the slot's previous layer. Partial layers (batches below the full-batch rule) need their routing, so they are staged at
 // their own layer and the ring does not pass them.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -179,5 +180,79 @@ struct llama_moe_ring_copies {
             }
             first = last + 1;
         }
+    }
+};
+
+// LLAMA_MOE_RING_INPLACE: where ggml_mul_mat_id_slots reads each expert of a staged layer. A cached expert is read in place from
+// its cache slot, an uncached one from its place in the staging slot (the ring copies only these), and beyond the staging slot's
+// cap places from the host experts directly (mapped pinned memory). MMQ reads a little past the end of an expert when a row's
+// length is not a multiple of its K step (Flash-Next's down projection, 640 wide); with read_past the bytes after a slot must be
+// a valid expert of the same layout, so a cached expert is read in place only if the next slot holds an expert, and the host's
+// last expert is never read from host memory (past it lies whatever follows the host tensor). The staging slot has one place
+// more than cap, which takes zeros after the last staged expert.
+struct llama_moe_ring_inplace {
+    std::vector<int32_t> map;    // [n_expert] slot (>= 0), -1 - place (staged), host_code() (host experts)
+    std::vector<int32_t> staged; // the staged experts by place, ascending
+    std::vector<int32_t> host;   // the experts read from host memory (used ones)
+    int32_t n_hit = 0;           // experts read in place from their cache slot (used ones)
+    int32_t cap   = 0;
+
+    int32_t host_code() const { return -1 - cap; }
+
+    // slots[e] < n_slots: expert e is cached in slot slots[e]; key_of[s] >= 0: slot s holds an expert (only read with read_past);
+    // used == nullptr: all experts are used, count (optional, with used): tokens per expert, the busiest uncached ones are staged
+    // first; can_host: experts beyond cap may be read from host memory. Returns false if they would have to be (and !can_host).
+    bool plan(const int32_t * slots, int32_t n_slots, const int32_t * key_of, int32_t n_expert, const std::vector<bool> * used,
+            const std::vector<int32_t> * count, int32_t cap_, bool can_host, bool read_past) {
+        cap = cap_;
+        map.assign(n_expert, host_code());
+        staged.clear();
+        host.clear();
+        n_hit = 0;
+
+        std::vector<int32_t> miss;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (used != nullptr && !(*used)[e]) {
+                continue; // never read: any value
+            }
+            const int32_t s = slots[e];
+            const bool in_place = s >= 0 && s < n_slots && (!read_past || (s + 1 < n_slots && key_of[s + 1] >= 0));
+            if (in_place) {
+                map[e] = s;
+                n_hit++;
+            } else {
+                miss.push_back(e);
+            }
+        }
+
+        if ((int32_t) miss.size() <= cap) {
+            staged = miss;
+        } else {
+            if (!can_host) {
+                return false;
+            }
+            std::vector<int32_t> order = miss;
+            if (count != nullptr) {
+                std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return (*count)[a] > (*count)[b]; });
+            }
+            // the last expert stays out of host memory when MMQ reads past an expert
+            const int32_t last = n_expert - 1;
+            const bool keep_last = read_past && std::find(order.begin(), order.end(), last) != order.end();
+            if (keep_last) {
+                order.erase(std::find(order.begin(), order.end(), last));
+                order.insert(order.begin(), last);
+            }
+            if (cap == 0 && keep_last) {
+                return false;
+            }
+            staged.assign(order.begin(), order.begin() + cap);
+            host.assign(order.begin() + cap, order.end());
+            std::sort(staged.begin(), staged.end());
+            std::sort(host.begin(), host.end());
+        }
+        for (size_t p = 0; p < staged.size(); ++p) {
+            map[staged[p]] = -1 - (int32_t) p;
+        }
+        return true;
     }
 };
