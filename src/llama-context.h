@@ -494,6 +494,33 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // LLAMA_GRAPH_CACHE_SIZES: one built graph per small ubatch size (and with/without outputs), so a varying speculative
+    // verify size returns to a graph of its size: no rebuild, the same allocation and CUDA graph keys as its first run
+    struct graph_cache_entry {
+        llm_graph_result_ptr res;
+        bool built = false;
+        // the graph as built, before the scheduler rewrote it (node order, input copies as srcs, allocations)
+        std::vector<ggml_tensor *> nodes;
+        struct tensor_state {
+            ggml_tensor *         t;
+            void *                data;
+            ggml_backend_buffer * buffer;
+            void *                extra;
+            ggml_tensor *         src[GGML_MAX_SRC];
+        };
+        std::vector<tensor_state> tensors;
+        std::vector<std::pair<ggml_tensor *, ggml_backend_t>> backends; // ggml_backend_sched_set_tensor_backend of the build
+    };
+    std::map<uint32_t, graph_cache_entry> gf_res_sizes;
+    uint32_t graph_cache_max = 0; // 0 = off, else the largest ubatch kept
+    struct {
+        int64_t n_build = 0, n_hit = 0, n_reuse = 0;
+        int64_t t_build_us = 0, t_hit_us = 0;
+    } graph_cache_stats;
+    void graph_cache_clear();
+    void graph_cache_snapshot(graph_cache_entry & e, ggml_cgraph * gf);
+    void graph_cache_restore(const graph_cache_entry & e, ggml_cgraph * gf);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

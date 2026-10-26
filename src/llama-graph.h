@@ -1120,6 +1120,10 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // LLAMA_MOE_JOIN_LATE: work independent of the routed experts (a shared expert), built by build_moe_ffn between the CPU
+    // lane's doorbell and its join, so the device runs it while the CPU lane computes; called at most once, then cleared
+    mutable std::function<void()> moe_beside;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
