@@ -53,8 +53,8 @@ bool ggml_cuda_vmm_region_commit_spare(ggml_cuda_vmm_region * r, size_t offset, 
 bool ggml_cuda_vmm_region_commit_chunk(ggml_cuda_vmm_region * r, size_t offset, size_t size);
 
 // map the memory backing src [src_offset, src_offset + size) also at dst [dst_offset, ...) (unbacked there, granule aligned):
-// both ranges then read and write the same memory, nothing is allocated; one mapping per allocation of src
-// false (nothing changed) if src is not backed there or dst is
+// both ranges then read and write the same memory, nothing is allocated; one mapping per allocation of src, which must lie
+// wholly in the range (cuMemMap maps a handle from offset 0 only); false (nothing changed) otherwise or if dst is backed
 bool ggml_cuda_vmm_region_alias(ggml_cuda_vmm_region * dst, size_t dst_offset, const ggml_cuda_vmm_region * src, size_t src_offset, size_t size);
 
 // frees the spare granules of a physical device, returns the bytes
