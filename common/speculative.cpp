@@ -1681,6 +1681,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.size();
+        const int64_t t_proc0 = ggml_time_us();
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -1782,6 +1783,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+            const int64_t t_pr0 = ggml_time_us();
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
@@ -1810,6 +1812,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             if (!ok) {
                 return false;
+            }
+            if (batch.size() >= 512) {
+                llama_synchronize(ctx_dft);
+                SPC_INF("draft catch-up over %d target rows (%d to the draft): batch built in %.1f ms, draft decode %.1f ms\n",
+                        n_tokens, (int) batch.size(), (t_pr0 - t_proc0)/1000.0, (ggml_time_us() - t_pr0)/1000.0);
             }
         }
 

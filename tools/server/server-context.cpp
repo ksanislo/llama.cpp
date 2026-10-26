@@ -4827,6 +4827,9 @@ private:
             });
             if (batch.view.size() <= 64) {
                 g_spec_timing.add(batch.view.size(), (t_dec1 - t_dec0)/1000.0, (ggml_time_us() - t_dec1)/1000.0);
+            } else {
+                SRV_INF("spec: a %d-token batch: target decode %.1f ms (%s), draft process %.1f ms\n", (int) batch.view.size(),
+                        (t_dec1 - t_dec0)/1000.0, has_output ? "synced" : "queued", (ggml_time_us() - t_dec1)/1000.0);
             }
 
             if (!ok) {

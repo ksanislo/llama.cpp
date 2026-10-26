@@ -3337,7 +3337,7 @@ struct ggml_cuda_op_prof {
     std::vector<std::string> keys;
     size_t used = 0;
     int64_t n_tok = 0;
-    bool    small = false; // a graph of < 1000 nodes (a draft / MTP layer beside the target's splits)
+    bool    small = false; // a graph of < 300 nodes (the draft / MTP layer; a target split has more)
 
     static int every() {
         static const int n = [] { const char * e = getenv("GGML_CUDA_OP_PROF"); return e ? std::max(0, atoi(e)) : 0; }();
@@ -3348,7 +3348,7 @@ struct ggml_cuda_op_prof {
         used = 0;
         keys.clear();
         n_tok = 0;
-        small = cgraph->n_nodes < 1000;
+        small = cgraph->n_nodes < 300;
         for (int i = 0; i < cgraph->n_nodes && n_tok == 0; ++i) {
             const ggml_tensor * t = cgraph->nodes[i];
             if (t->op == GGML_OP_MUL_MAT && t->src[1]) {

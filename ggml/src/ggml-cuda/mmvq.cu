@@ -1073,6 +1073,8 @@ static __global__ void mul_mat_vec_q_moe(
 // the M tokens routed to that expert (M a template parameter, so the loads are shared). A pair's sum has the same terms
 // in the same order whichever block computes it, so mapped and plain ids give bit-identical results.
 // Needs n_slots <= 32 and n_slots*ncols_dst <= 256.
+static constexpr int GROUPED_TILES = 16; // row pairs per block of mul_mat_vec_q_moe_grouped
+
 struct mmvq_moe_grouped_args {
     const void * vx; const void * vgate; const void * vy; float * dst;
     const float * x_bias; const float * gate_bias; const float * x_scale; const float * gate_scale;
@@ -1093,7 +1095,6 @@ static __device__ __forceinline__ void mmvq_moe_grouped_body(const mmvq_moe_grou
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const int tid  = warp_size*threadIdx.y + threadIdx.x;
-    const int row0 = rpb*blockIdx.x;
     const int blocks_per_row_x = a.ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -1102,6 +1103,12 @@ static __device__ __forceinline__ void mmvq_moe_grouped_body(const mmvq_moe_grou
     for (int jj = 0; jj < M; ++jj) {
         const int j = s_jc[jj];
         y[jj] = ((const block_q8_1 *) a.vy) + fastmodulo(uint32_t(s_slot[j]), a.nchannels_y)*a.stride_channel_y + j*a.stride_col_y;
+    }
+    // a block walks GROUPED_TILES row pairs: the distinct-id setup of the kernel is paid once per 2*GROUPED_TILES rows
+    for (int tile = 0; tile < GROUPED_TILES; ++tile) {
+    const int row0 = rpb*(blockIdx.x*GROUPED_TILES + tile);
+    if (uint32_t(row0) >= a.nrows_x) {
+        break; // uniform across the block
     }
     const int kbx_offset = a.channel_x*a.stride_channel_x + row0*a.stride_row_x;
 
@@ -1125,8 +1132,6 @@ static __device__ __forceinline__ void mmvq_moe_grouped_body(const mmvq_moe_grou
         }
     }
 
-    ggml_cuda_pdl_lc();
-
     // red / red_gate: [nwarps-1][M][rpb][warp_size] partial sums of the other warps (the kernel's buffers, sized for M = 8)
     auto at = [](int l, int jj, int i, int x) { return ((l*M + jj)*rpb + i)*warp_size + x; };
     if (threadIdx.y > 0) {
@@ -1144,10 +1149,7 @@ static __device__ __forceinline__ void mmvq_moe_grouped_body(const mmvq_moe_grou
         }
     }
     __syncthreads();
-    if (threadIdx.y > 0) {
-        return;
-    }
-
+    if (threadIdx.y == 0) {
 #pragma unroll
     for (int jj = 0; jj < M; ++jj) {
         const int j = s_jc[jj];
@@ -1213,6 +1215,10 @@ static __device__ __forceinline__ void mmvq_moe_grouped_body(const mmvq_moe_grou
             }
         }
     }
+    }
+    __syncthreads(); // red is reused by the next tile
+    }
+    ggml_cuda_pdl_lc();
 }
 
 template <ggml_type type, bool has_fusion>
@@ -1342,11 +1348,12 @@ static __global__ void mul_mat_vec_q_moe_grouped(
         }
         if (a.channel_x >= uint32_t(fusion.n_alt)) {
             // an expert of the MoE CPU lane: zero for every pair of it, ggml_moe_join adds the CPU's result
-            for (int t = tid; t < s_m*rpb; t += nthreads) {
-                const int j = s_jc[t / rpb];
-                const int i = t % rpb;
-                if (uint32_t(blockIdx.x*rpb + i) < nrows_x) {
-                    dst_ptr[uint32_t(s_slot[j])*stride_channel_dst + uint32_t(j)*stride_col_dst + blockIdx.x*rpb + i] = 0.0f;
+            constexpr int rows_blk = rpb*GROUPED_TILES;
+            for (int t = tid; t < s_m*rows_blk; t += nthreads) {
+                const int j = s_jc[t / rows_blk];
+                const uint32_t row = blockIdx.x*rows_blk + t % rows_blk;
+                if (row < nrows_x) {
+                    dst_ptr[uint32_t(s_slot[j])*stride_channel_dst + uint32_t(j)*stride_col_dst + row] = 0.0f;
                 }
             }
             return;
@@ -1429,7 +1436,8 @@ static void mul_mat_vec_q_moe_launch(
 
     static const bool dedup_env = [] { const char * e = getenv("GGML_CUDA_MOE_DEDUP"); return e != nullptr && atoi(e) != 0; }();
     if (dedup_env && nchannels_dst <= warp_size && ncols_dst <= MMVQ_MAX_BATCH_SIZE && warp_size == 32) {
-        const dim3 gblock_nums(nblocks_rows, nchannels_dst*ncols_dst + (fusion.shared_up != nullptr));
+        const int64_t gblocks_rows = (nrows_x + 2*GROUPED_TILES - 1) / (2*GROUPED_TILES);
+        const dim3 gblock_nums(gblocks_rows, nchannels_dst*ncols_dst + (fusion.shared_up != nullptr));
         const dim3 gblock_dims(warp_size, 4);
         const ggml_cuda_kernel_launch_params gparams = ggml_cuda_kernel_launch_params(gblock_nums, gblock_dims, 0, stream);
         if (has_fusion) {

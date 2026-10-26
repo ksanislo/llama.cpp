@@ -2194,6 +2194,20 @@ void llama_context::rope_elastic_prepare(uint32_t n_seq_max) {
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // LLAMA_DECODE_TIMING=1: host-side phases of batches of 512+ tokens (setup up to the first ubatch, the ubatch loop)
+    static const bool decode_timing = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t t_dt0 = ggml_time_us();
+    int64_t t_dt1 = 0;
+    struct decode_timing_log {
+        bool on; int64_t t0; const int64_t & t1; size_t n; int type;
+        ~decode_timing_log() {
+            if (on && t1 > 0) {
+                const int64_t t2 = ggml_time_us();
+                LLAMA_LOG_INFO("decode timing: %zu tokens (ctx type %d): setup %.1f ms, ubatches %.1f ms (host, unsynced)\n",
+                        n, type, (t1 - t0)/1000.0, (t2 - t1)/1000.0);
+            }
+        }
+    } decode_timing_log_on_exit { decode_timing && batch_inp.tokens.size() >= 512, t_dt0, t_dt1, batch_inp.tokens.size(), (int) cparams.ctx_type };
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2401,6 +2415,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    t_dt1 = ggml_time_us();
 
     // LLAMA_SUBMIT_THREADS: the chunks of a piped batch are queued by one host thread per backend; ends (the threads
     // have queued everything) before the pipe state is reset and on every return
