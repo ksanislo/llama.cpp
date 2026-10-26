@@ -957,6 +957,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
 
+    // --moe-cache-draft caches host experts: keep the draft's experts there unless an override already places them
+    if (params.speculative.draft.moe_cache && params.speculative.draft.tensor_buft_overrides.empty()) {
+        params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+    }
+
     if (!params.speculative.draft.tensor_buft_overrides.empty()) {
         params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
@@ -4248,6 +4253,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-cache", "--moe-cache-draft"},
+        "draft / MTP model: keep the MoE experts in host memory (implies --cpu-moe-draft) and give them a small MoE cache of their own "
+        "on the GPU of their layer: cached experts from VRAM, the others read from pinned host memory by the GPU (device hits); "
+        "settings LLAMA_MOE_DRAFT_* (e.g. LLAMA_MOE_DRAFT_CACHE_DEVICE=CUDA1, LLAMA_MOE_DRAFT_CPU_LANE=0.5)",
+        [](common_params & params) {
+            params.speculative.draft.moe_cache = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-cache-mib", "--moe-cache-draft-mib"}, "N",
+        string_format("size in MiB of the draft's MoE cache (--moe-cache-draft), at most what the GPU has free at its creation (default: %zu)",
+            params.speculative.draft.moe_cache_size >> 20),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.moe_cache_size = (size_t) value << 20;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_MOE_DRAFT_CACHE_MIB"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",

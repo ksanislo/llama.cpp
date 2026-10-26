@@ -850,6 +850,44 @@ static ggml_context_ptr llama_moe_cache_init_ctx(size_t n_tensors) {
 }
 
 struct llama_moe_cache::impl {
+    // the cache of a draft / MTP context (--moe-cache-draft): device hits only, read LLAMA_MOE_DRAFT_X before LLAMA_MOE_X
+    bool draft = false;
+
+    // a setting of the cache: for a draft cache LLAMA_MOE_DRAFT_X if set, else device hits on, the tuning of the device-hit
+    // path and the CPU lane from the main cache's variables, and everything else (ring, staging, prefetch, decode memory,
+    // split, profile, trace, policy, CPU lane share) off
+    // exit and profile lines: "llama_moe_cache (draft)" for the draft cache
+    const char * log_tag() const {
+        return draft ? "llama_moe_cache (draft)" : "llama_moe_cache";
+    }
+
+    const char * moe_env(const char * name) const {
+        if (!draft) {
+            return getenv(name);
+        }
+        static const char * prefix = "LLAMA_MOE_";
+        const size_t np = strlen(prefix);
+        if (strncmp(name, prefix, np) == 0) {
+            const std::string dn = std::string("LLAMA_MOE_DRAFT_") + (name + np);
+            if (const char * v = getenv(dn.c_str())) {
+                return v;
+            }
+        }
+        if (strcmp(name, "LLAMA_MOE_DEVICE_HITS") == 0) {
+            return "1";
+        }
+        static const char * inherited[] = {
+            "LLAMA_MOE_DEVICE_HITS_MAX", "LLAMA_MOE_DEVICE_HITS_FILLS", "LLAMA_MOE_CPU_LANE_THREADS", "LLAMA_MOE_CPU_LANE_POLL",
+            "LLAMA_MOE_CPU_LANE_TIMEOUT_MS",
+        };
+        for (const char * n : inherited) {
+            if (strcmp(name, n) == 0) {
+                return getenv(name);
+            }
+        }
+        return nullptr;
+    }
+
     // a GPU with its own budget and banks, it caches the layers assigned to it
     struct device {
         ggml_backend_t backend;
@@ -1268,8 +1306,8 @@ struct llama_moe_cache::impl {
     std::mutex mtx_shared;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
-            const std::string & profile, const llama_moe_cache_compute & compute) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+            const std::string & profile, const llama_moe_cache_compute & compute, bool draft_) :
+            draft(draft_), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         const bool no_alloc = model.hparams.no_alloc || compute.measure;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -1290,41 +1328,41 @@ struct llama_moe_cache::impl {
             throw std::runtime_error("MoE cache requires a MoE model");
         }
 
-        if (const char * env = getenv("LLAMA_MOE_ASYNC")) {
+        if (const char * env = moe_env("LLAMA_MOE_ASYNC")) {
             n_stage = std::max(0, atoi(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_ASYNC_FULL")) {
+        if (const char * env = moe_env("LLAMA_MOE_ASYNC_FULL")) {
             full_ids = std::max<int64_t>(1, atoll(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_CACHE_ZERO_ROWS")) {
+        if (const char * env = moe_env("LLAMA_MOE_CACHE_ZERO_ROWS")) {
             zero_rows = atoi(env) != 0;
         }
-        if (const char * env = getenv("LLAMA_MOE_ASYNC_BORROW")) {
+        if (const char * env = moe_env("LLAMA_MOE_ASYNC_BORROW")) {
             borrow = atoi(env) != 0;
         }
-        if (const char * env = getenv("LLAMA_MOE_RING")) {
+        if (const char * env = moe_env("LLAMA_MOE_RING")) {
             ring = std::max(0, atoi(env));
             if (ring > 0) {
                 // a ring of one slot never runs ahead of the compute stream
                 ring    = std::max(ring, 2);
                 n_stage = ring;
                 // the slots borrow the cache unless LLAMA_MOE_ASYNC_BORROW=0
-                borrow  = getenv("LLAMA_MOE_ASYNC_BORROW") == nullptr || borrow;
+                borrow  = moe_env("LLAMA_MOE_ASYNC_BORROW") == nullptr || borrow;
             }
         }
-        if (const char * env = getenv("LLAMA_MOE_RING_MERGE")) {
+        if (const char * env = moe_env("LLAMA_MOE_RING_MERGE")) {
             ring_merge = std::max(0, atoi(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_RING_ZC")) {
+        if (const char * env = moe_env("LLAMA_MOE_RING_ZC")) {
             ring_zc = atoi(env);
         }
-        if (const char * env = getenv("LLAMA_MOE_RING_BLOCKS")) {
+        if (const char * env = moe_env("LLAMA_MOE_RING_BLOCKS")) {
             ring_blocks = std::max(1, atoi(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_PREFETCH")) {
+        if (const char * env = moe_env("LLAMA_MOE_PREFETCH")) {
             n_pref = std::clamp(atoi(env), 0, (int) model.hparams.n_expert);
             pref_max = n_pref;
-            if (const char * env_max = getenv("LLAMA_MOE_PREFETCH_MAX")) {
+            if (const char * env_max = moe_env("LLAMA_MOE_PREFETCH_MAX")) {
                 pref_max = std::max(0, atoi(env_max));
             }
             if (pref_max == 0) {
@@ -1345,13 +1383,30 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // a draft cache may sit on another GPU than its layers (LLAMA_MOE_DRAFT_CACHE_DEVICE): its MoE ops then run there
+        ggml_backend_dev_t dev_override = nullptr;
+        if (const char * name = draft ? getenv("LLAMA_MOE_DRAFT_CACHE_DEVICE") : nullptr; name != nullptr && *name != '\0') {
+            for (const device & d : devices) {
+                if (strcmp(ggml_backend_dev_name(ggml_backend_get_device(d.backend)), name) == 0) {
+                    dev_override = ggml_backend_get_device(d.backend);
+                }
+            }
+            if (dev_override == nullptr) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_DRAFT_CACHE_DEVICE=%s is not a GPU of this context, the layers' own devices are used\n", __func__, name);
+            }
+        }
+
+        // a draft cache of an MTP context holds only the MTP layers (the context may run on the target model's weights)
+        const size_t il_first = draft && model.hparams.n_layer_nextn > 0 ? model.hparams.n_layer() : 0;
+
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
-        for (size_t il = 0; il < model.layers.size(); ++il) {
+        for (size_t il = il_first; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_tensor_is_host_weight)) {
                 continue;
             }
-            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
+            ggml_backend_dev_t dev_il = dev_override != nullptr ? dev_override : model.dev_layer(il);
+            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == dev_il; });
             if (it_dev == devices.end()) {
                 continue;
             }
@@ -1410,7 +1465,7 @@ struct llama_moe_cache::impl {
 
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         cpu_share_q = (uint32_t) std::lround(cpu_share*65536.0f);
-        if (const char * path = getenv("LLAMA_MOE_CACHE_TRACE"); path != nullptr && *path != '\0') {
+        if (const char * path = moe_env("LLAMA_MOE_CACHE_TRACE"); path != nullptr && *path != '\0') {
             trace = fopen(path, "wb");
             if (trace == nullptr) {
                 throw std::runtime_error(std::string("failed to open the MoE cache trace ") + path);
@@ -1422,7 +1477,10 @@ struct llama_moe_cache::impl {
             const device & d = devices[g.id];
             g.budget = (double) size*d.split/split_sum*g.host_bytes/d.host_bytes;
         }
-        if (const char * env = getenv("LLAMA_MOE_CACHE_SPLIT")) {
+        if (draft && !no_alloc) {
+            draft_clamp();
+        }
+        if (const char * env = moe_env("LLAMA_MOE_CACHE_SPLIT")) {
             split_miss = strcmp(env, "miss") == 0;
             if (!split_miss && *env != '\0' && strcmp(env, "free") != 0) {
                 LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_SPLIT=%s (free or miss), using free\n", __func__, env);
@@ -1643,19 +1701,19 @@ struct llama_moe_cache::impl {
             }
         }
 
-        if (const char * env = getenv("LLAMA_MOE_DEVICE_HITS")) {
+        if (const char * env = moe_env("LLAMA_MOE_DEVICE_HITS")) {
             dh_mode = std::clamp(atoi(env), 0, 2);
         }
-        if (const char * env = getenv("LLAMA_MOE_DEVICE_HITS_MAX")) {
+        if (const char * env = moe_env("LLAMA_MOE_DEVICE_HITS_MAX")) {
             dh_max = std::clamp<int64_t>(atoll(env), 1, max_batch);
         }
-        if (const char * env = getenv("LLAMA_MOE_DEVICE_HITS_FILLS")) {
+        if (const char * env = moe_env("LLAMA_MOE_DEVICE_HITS_FILLS")) {
             dh_fill_max = std::max(0, atoi(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_CPU_LANE")) {
+        if (const char * env = moe_env("LLAMA_MOE_CPU_LANE")) {
             lane_frac = std::clamp((float) atof(env), 0.0f, 1.0f);
         }
-        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_TIMEOUT_MS")) {
+        if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_TIMEOUT_MS")) {
             lane_timeout_ms = std::max(1, atoi(env));
         }
         if (dh_mode > 0 && !no_alloc) {
@@ -1667,14 +1725,53 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_CPU_LANE needs LLAMA_MOE_DEVICE_HITS, it is off\n", __func__);
             lane_frac = 0.0f;
         }
+        if (draft && !no_alloc) {
+            for (const group & g : groups) {
+                LLAMA_LOG_INFO("%s: draft MoE cache (--moe-cache-draft): %s, layer%s %d..%d, %d of %d experts cached (%.2f MiB), device hits %s, "
+                    "CPU lane %.0f%%\n", __func__, ggml_backend_name(devices[g.id].backend), g.layers.size() > 1 ? "s" : "", g.layers.front(),
+                    g.layers.back(), g.n_slots, (int32_t) (g.layers.size()*g.ref[0]->ne[2]), group_bytes(g, g.n_slots)/1024.0/1024.0,
+                    dh_mode > 0 ? "on" : "off", 100.0*lane_frac);
+            }
+        }
+    }
+
+    // a draft cache is created after the main context has planned the device memory: it takes at most what is free beside a
+    // margin for the draft context's compute buffer (LLAMA_MOE_DRAFT_CACHE_MARGIN_MIB, default 384)
+    void draft_clamp() {
+        const char * env_m = getenv("LLAMA_MOE_DRAFT_CACHE_MARGIN_MIB");
+        const double margin = (env_m != nullptr && *env_m != '\0' ? std::max(0.0, atof(env_m)) : 384.0)*1024.0*1024.0;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
+            if (d.host_bytes == 0) {
+                continue;
+            }
+            double want = 0.0;
+            for (const group & g : groups) {
+                want += g.id == (int32_t) id ? g.budget : 0.0;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
+            const double cap = std::max(0.0, (double) free - margin);
+            if (free == 0 || want <= cap) {
+                continue;
+            }
+            LLAMA_LOG_WARN("%s: %s: the draft MoE cache gets %.2f MiB of the %.2f MiB asked (%.2f MiB free, %.0f MiB margin)\n", __func__,
+                ggml_backend_name(d.backend), cap/1024.0/1024.0, want/1024.0/1024.0, free/1024.0/1024.0, margin/1024.0/1024.0);
+            for (group & g : groups) {
+                if (g.id == (int32_t) id) {
+                    g.budget *= cap/want;
+                }
+            }
+        }
     }
 
     void init_policy(const std::string & profile_arg, bool no_alloc) {
-        auto env_f = [](const char * name, double def) {
-            const char * v = getenv(name);
+        auto env_f = [this](const char * name, double def) {
+            const char * v = moe_env(name);
             return v != nullptr && *v != '\0' ? atof(v) : def;
         };
-        if (const char * env = getenv("LLAMA_MOE_CACHE_POLICY")) {
+        if (const char * env = moe_env("LLAMA_MOE_CACHE_POLICY")) {
             ad_on = strcmp(env, "adaptive") == 0 || strcmp(env, "1") == 0;
             if (!ad_on && strcmp(env, "lru") != 0 && strcmp(env, "0") != 0 && *env != '\0') {
                 LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_POLICY=%s (lru or adaptive), using lru\n", __func__, env);
@@ -1690,7 +1787,7 @@ struct llama_moe_cache::impl {
             ad_fills_per_token = std::max(0, (int32_t) env_f("LLAMA_MOE_CACHE_FILLS_PER_TOKEN", 16));
             // enough for the misses of one decode token per plan (the slots are reused layer by layer); none with device hits,
             // whose misses are read from host memory
-            const bool dh = getenv("LLAMA_MOE_DEVICE_HITS") != nullptr && atoi(getenv("LLAMA_MOE_DEVICE_HITS")) > 0;
+            const bool dh = moe_env("LLAMA_MOE_DEVICE_HITS") != nullptr && atoi(moe_env("LLAMA_MOE_DEVICE_HITS")) > 0;
             const int32_t want = std::max(0, (int32_t) env_f("LLAMA_MOE_CACHE_TRANSIENT", dh ? 0.0 : 2.0*n_expert_used));
             for (group & g : groups) {
                 if (g.n_slots == 0) {
@@ -1713,7 +1810,7 @@ struct llama_moe_cache::impl {
         const bool exists = prof_exists;
         prof_keep     = std::clamp(env_f("LLAMA_MOE_CACHE_PROFILE_KEEP", 0.5), 0.0, 1.0);
         prof_save_min = std::max(0.0, env_f("LLAMA_MOE_CACHE_PROFILE_SAVE_MIN", 10.0));
-        if (const char * env = getenv("LLAMA_MOE_CACHE_PROFILE_SAVE")) {
+        if (const char * env = moe_env("LLAMA_MOE_CACHE_PROFILE_SAVE")) {
             prof_save = strcmp(env, "0") == 0 ? "" : env;
         } else if (!prof_path.empty()) {
             // Strata's file is never overwritten
@@ -1746,7 +1843,7 @@ struct llama_moe_cache::impl {
         prof_loaded = true;
         prof_path = profile_arg;
         if (prof_path.empty()) {
-            if (const char * env = getenv("LLAMA_MOE_CACHE_PROFILE")) {
+            if (const char * env = moe_env("LLAMA_MOE_CACHE_PROFILE")) {
                 prof_path = env;
             }
         }
@@ -1768,7 +1865,7 @@ struct llama_moe_cache::impl {
     // their layer (a miss costs its bytes, a slot costs the same bytes, so the gain per byte is the routing probability), as far
     // as each device has room beside its compute buffer; the rest (no profile, or experts without a score) by expert bytes
     void split_by_miss(size_t size, const llama_moe_cache_compute & compute, bool no_alloc) {
-        const char * env_m = getenv("LLAMA_MOE_CACHE_SPLIT_MARGIN_MIB");
+        const char * env_m = moe_env("LLAMA_MOE_CACHE_SPLIT_MARGIN_MIB");
         const double margin = (env_m ? std::max(0.0, atof(env_m)) : 512.0)*1024.0*1024.0;
         std::vector<double> cap(devices.size(), 0.0);
         for (size_t id = 0; id < devices.size(); ++id) {
@@ -1878,7 +1975,7 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_DECODE_MEM: which devices lend, and how much (the part of the compute buffer that small batches do not use)
     void dm_setup(const llama_moe_cache_compute & compute, bool no_alloc) {
         dm_devs.assign(devices.size(), dm_device());
-        const char * env = getenv("LLAMA_MOE_DECODE_MEM");
+        const char * env = moe_env("LLAMA_MOE_DECODE_MEM");
         if (env == nullptr || atoi(env) == 0 || no_alloc) {
             return;
         }
@@ -1891,14 +1988,14 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_DECODE_MEM needs the measured compute buffers, it is off\n", __func__);
             return;
         }
-        auto env_i = [](const char * name, int def) {
-            const char * v = getenv(name);
+        auto env_i = [this](const char * name, int def) {
+            const char * v = moe_env(name);
             return v != nullptr && *v != '\0' ? atoi(v) : def;
         };
         dm_return_after = std::max(1, env_i("LLAMA_MOE_DECODE_MEM_RETURN", 1));
         dm_refill_cap   = std::max(0, env_i("LLAMA_MOE_DECODE_MEM_REFILL", 256));
         const size_t spare = (size_t) std::max(0, env_i("LLAMA_MOE_DECODE_MEM_SPARE_MIB", 64))*1024*1024;
-        if (const char * v = getenv("LLAMA_MOE_DECODE_MEM_COMPACT")) {
+        if (const char * v = moe_env("LLAMA_MOE_DECODE_MEM_COMPACT")) {
             dm_compact = std::max(0.0f, (float) atof(v));
         }
 
@@ -1986,14 +2083,14 @@ struct llama_moe_cache::impl {
 
     // the transient slots init_policy will give a group of n slots (LLAMA_MOE_CACHE_POLICY=adaptive without device hits)
     int32_t transient_slots(int32_t n) const {
-        const char * pol = getenv("LLAMA_MOE_CACHE_POLICY");
+        const char * pol = moe_env("LLAMA_MOE_CACHE_POLICY");
         const bool ad = pol != nullptr && (strcmp(pol, "adaptive") == 0 || strcmp(pol, "1") == 0) && cpu_share <= 0.0f;
         if (!ad) {
             return 0;
         }
-        const char * dh_env = getenv("LLAMA_MOE_DEVICE_HITS");
+        const char * dh_env = moe_env("LLAMA_MOE_DEVICE_HITS");
         const bool dh = dh_env != nullptr && atoi(dh_env) > 0;
-        const char * tr_env = getenv("LLAMA_MOE_CACHE_TRANSIENT");
+        const char * tr_env = moe_env("LLAMA_MOE_CACHE_TRANSIENT");
         const int32_t want = std::max(0, tr_env != nullptr && *tr_env != '\0' ? atoi(tr_env) : (dh ? 0 : 2*n_expert_used));
         return std::min(want, n/8);
     }
@@ -2174,9 +2271,9 @@ struct llama_moe_cache::impl {
             return false;
         }
         // one value for every device, or a comma list by device (e.g. room for an MTP draft context loaded after this one)
-        const char * env_m = getenv("LLAMA_MOE_CACHE_MARGIN_MIB");
+        const char * env_m = moe_env("LLAMA_MOE_CACHE_MARGIN_MIB");
         if (env_m == nullptr) {
-            env_m = getenv("LLAMA_MOE_CACHE_SPLIT_MARGIN_MIB");
+            env_m = moe_env("LLAMA_MOE_CACHE_SPLIT_MARGIN_MIB");
         }
         std::vector<double> margins;
         for (const char * p = env_m; p != nullptr && *p != '\0'; ) {
@@ -2423,9 +2520,9 @@ struct llama_moe_cache::impl {
         std::string err;
         if (moe_cache_profile_write(prof_save, (int32_t) layers.size(), n_expert_model, out, err)) {
             prof_saved_sum = prof_run_sum;
-            LLAMA_LOG_INFO("llama_moe_cache: profile saved to %s (%.0f routings this run%s)\n", prof_save.c_str(), prof_run_sum, at_exit ? ", at exit" : "");
+            LLAMA_LOG_INFO("%s: profile saved to %s (%.0f routings this run%s)\n", log_tag(), prof_save.c_str(), prof_run_sum, at_exit ? ", at exit" : "");
         } else {
-            LLAMA_LOG_WARN("llama_moe_cache: profile not saved: %s\n", err.c_str());
+            LLAMA_LOG_WARN("%s: profile not saved: %s\n", log_tag(), err.c_str());
         }
         prof_saved_us = ggml_time_us();
     }
@@ -2502,10 +2599,10 @@ struct llama_moe_cache::impl {
 
         int n_threads = std::max(1, (int) std::thread::hardware_concurrency()/2 - 1);
         int poll = 50;
-        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_THREADS")) {
+        if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_THREADS")) {
             n_threads = std::max(1, atoi(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_CPU_LANE_POLL")) {
+        if (const char * env = moe_env("LLAMA_MOE_CPU_LANE_POLL")) {
             poll = atoi(env);
         }
         lane = std::make_unique<llama_moe_lane>(layers.size(), n_threads, poll);
@@ -2556,7 +2653,7 @@ struct llama_moe_cache::impl {
     // the ring's borrow (large batches) and device hits (decode) take turns: borrow_slots commits the fills and updates the
     // device map, begin() returns the slots before a graph without the ring
     bool dh_requested() const {
-        const char * env = getenv("LLAMA_MOE_DEVICE_HITS");
+        const char * env = moe_env("LLAMA_MOE_DEVICE_HITS");
         return env != nullptr && atoi(env) > 0 && cpu_share <= 0.0f && (!borrow || ring > 0);
     }
 
@@ -5224,68 +5321,68 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
-        auto log = [](const char * name, const stats & st) {
+        auto log = [this](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
                 return;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
+            LLAMA_LOG_INFO("%s: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n", log_tag(),
                 name, st.hits, st.misses, st.cpu, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("%s: large batches: %zu experts copied from the cache, %.2f MiB\n", log_tag(), stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
         const stage_stats & ss = stats_stage;
         if (ss.layers_prefetched + ss.layers_waited + ss.layers_partial > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: staged layers: %zu prefetched, %zu waited for, %zu partial, %zu prefetches, %.2f MiB uploaded, %.2f MiB from the cache\n",
+            LLAMA_LOG_INFO("%s: staged layers: %zu prefetched, %zu waited for, %zu partial, %zu prefetches, %.2f MiB uploaded, %.2f MiB from the cache\n", log_tag(),
                 ss.layers_prefetched, ss.layers_waited, ss.layers_partial, ss.prefetches, ss.bytes_host/1024.0/1024.0, ss.bytes_cache/1024.0/1024.0);
         }
         if (stats_pf.layers > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: prefetch: %zu predictions, %zu experts uploaded ahead (%.2f MiB), %zu selected (%.1f%%), %zu evicted unused\n",
+            LLAMA_LOG_INFO("%s: prefetch: %zu predictions, %zu experts uploaded ahead (%.2f MiB), %zu selected (%.1f%%), %zu evicted unused\n", log_tag(),
                 stats_pf.layers, stats_pf.issued, stats_pf.bytes/1024.0/1024.0, stats_pf.used, stats_pf.issued ? 100.0*stats_pf.used/stats_pf.issued : 0.0, stats_pf.wasted);
         }
         if (ss.borrows > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: staging borrowed the cache %zu times: %zu experts moved, %zu evicted\n", ss.borrows, ss.experts_moved, ss.experts_evicted);
+            LLAMA_LOG_INFO("%s: staging borrowed the cache %zu times: %zu experts moved, %zu evicted\n", log_tag(), ss.borrows, ss.experts_moved, ss.experts_evicted);
         }
         for (const device & d : devices) {
             const auto & r = d.rstats;
             if (r.graphs == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: ring %s: %zu graphs, %zu layers streamed ahead, %zu at their layer, %zu partial, %zu graphs dropped; "
-                "%zu copies + %zu kernels queued, %.2f GiB uploaded, %.2f GiB from the cache; host %.1f ms queueing (max %.2f ms a layer)\n",
+            LLAMA_LOG_INFO("%s: ring %s: %zu graphs, %zu layers streamed ahead, %zu at their layer, %zu partial, %zu graphs dropped; "
+                "%zu copies + %zu kernels queued, %.2f GiB uploaded, %.2f GiB from the cache; host %.1f ms queueing (max %.2f ms a layer)\n", log_tag(),
                 ggml_backend_name(d.backend), r.graphs, r.layers, r.at_layer, r.partial, r.dropped, r.copies, r.launches,
                 r.bytes_host/1024.0/1024.0/1024.0, r.bytes_cache/1024.0/1024.0/1024.0, r.issue_us/1000.0, r.issue_us_max/1000.0);
         }
         if (ad_on) {
             const moe_cache_policy_stats & a = stats_ad;
-            LLAMA_LOG_INFO("llama_moe_cache: adaptive policy: %zu fills admitted (%zu into empty slots), %zu misses kept out "
-                "(%zu via transient slots, %zu cached anyway), %zu over the cap of %d per token\n",
+            LLAMA_LOG_INFO("%s: adaptive policy: %zu fills admitted (%zu into empty slots), %zu misses kept out "
+                "(%zu via transient slots, %zu cached anyway), %zu over the cap of %d per token\n", log_tag(),
                 a.admitted, a.into_free, a.kept_out, a.transient, a.forced, a.capped, ad_fills_per_token);
         }
         if (dm_on) {
             const dm_stats & m = stats_dm;
-            LLAMA_LOG_INFO("llama_moe_cache: decode memory: %zu large-batch takes (%.1f ms each, %.2f MiB released per take), %zu gives "
-                "(%.1f ms each), %zu experts moved, %zu evicted, %zu refilled (%.2f MiB) in %zu graph-devices\n",
+            LLAMA_LOG_INFO("%s: decode memory: %zu large-batch takes (%.1f ms each, %.2f MiB released per take), %zu gives "
+                "(%.1f ms each), %zu experts moved, %zu evicted, %zu refilled (%.2f MiB) in %zu graph-devices\n", log_tag(),
                 m.takes, m.takes ? m.take_us/1000.0/m.takes : 0.0, m.takes ? m.released/1024.0/1024.0/m.takes : 0.0,
                 m.gives, m.gives ? m.give_us/1000.0/m.gives : 0.0, m.moved, m.evicted, m.refilled, m.refill_bytes/1024.0/1024.0, m.refill_graphs);
-            auto cost = [](const char * what, const dm_cost & c, size_t n) {
+            auto cost = [this](const char * what, const dm_cost & c, size_t n) {
                 if (n > 0) {
-                    LLAMA_LOG_INFO("llama_moe_cache: decode memory: %s ms each: sync %.1f, evict %.1f, tails %.1f, compute %.1f, staging %.1f, rest %.1f\n",
+                    LLAMA_LOG_INFO("%s: decode memory: %s ms each: sync %.1f, evict %.1f, tails %.1f, compute %.1f, staging %.1f, rest %.1f\n", log_tag(),
                         what, c.sync/1000.0/n, c.evict/1000.0/n, c.tail/1000.0/n, c.comp/1000.0/n, c.stage/1000.0/n, c.rest/1000.0/n);
                 }
             };
             cost("take", m.take_cost, m.takes);
             cost("give", m.give_cost, m.gives);
             if (m.tails_out > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache: decode memory: %zu times a group tail stayed out after a give (no memory)\n", m.tails_out);
+                LLAMA_LOG_INFO("%s: decode memory: %zu times a group tail stayed out after a give (no memory)\n", log_tag(), m.tails_out);
             }
             for (size_t id = 0; id < dm_devs.size(); ++id) {
                 const dm_device & dm = dm_devs[id];
                 if (dm.lend > 0) {
-                    LLAMA_LOG_INFO("llama_moe_cache: decode memory: %s compute used: small graphs up to %.2f MiB (kept %.2f), large up to %.2f MiB (measured %.2f)\n",
+                    LLAMA_LOG_INFO("%s: decode memory: %s compute used: small graphs up to %.2f MiB (kept %.2f), large up to %.2f MiB (measured %.2f)\n", log_tag(),
                         ggml_backend_name(devices[id].backend), dm.used_small_max/1024.0/1024.0, dm.small/1024.0/1024.0,
                         dm.used_large_max/1024.0/1024.0, dm.large/1024.0/1024.0);
                 }
@@ -5293,15 +5390,15 @@ struct llama_moe_cache::impl {
         }
         const dh_stats & ds = stats_dh;
         if (ds.hits + ds.misses > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: device hits: %zu graphs, hits = %zu, misses = %zu read from host memory (%.2f MiB), hit rate = %.2f%%, "
-                "fills = %zu (%.2f MiB), %zu dropped\n", ds.graphs, ds.hits, ds.misses, ds.bytes_miss/1024.0/1024.0,
+            LLAMA_LOG_INFO("%s: device hits: %zu graphs, hits = %zu, misses = %zu read from host memory (%.2f MiB), hit rate = %.2f%%, "
+                "fills = %zu (%.2f MiB), %zu dropped\n", log_tag(), ds.graphs, ds.hits, ds.misses, ds.bytes_miss/1024.0/1024.0,
                 100.0*ds.hits/(ds.hits + ds.misses), ds.fills, ds.bytes_fill/1024.0/1024.0, ds.dropped);
         }
         if (lane) {
             const llama_moe_lane::stats ls = lane->get_stats();
             if (ls.requests > 0 || ls.timeouts > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache: CPU lane: %" PRIu64 " requests, %" PRIu64 " experts (%.2f per request), %" PRIu64 " rows, "
-                    "%.3f ms per request, %" PRIu64 " timeouts\n", ls.requests, ls.experts, (double) ls.experts/std::max<uint64_t>(1, ls.requests),
+                LLAMA_LOG_INFO("%s: CPU lane: %" PRIu64 " requests, %" PRIu64 " experts (%.2f per request), %" PRIu64 " rows, "
+                    "%.3f ms per request, %" PRIu64 " timeouts\n", log_tag(), ls.requests, ls.experts, (double) ls.experts/std::max<uint64_t>(1, ls.requests),
                     ls.rows, ls.busy_ms/std::max<uint64_t>(1, ls.requests), ls.timeouts);
             }
         }
@@ -5309,8 +5406,8 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share,
-        const std::string & profile, const llama_moe_cache_compute & compute) :
-    pimpl(new impl(model, backends, bufts, size, cpu_share, profile, compute)) {
+        const std::string & profile, const llama_moe_cache_compute & compute, bool draft) :
+    pimpl(new impl(model, backends, bufts, size, cpu_share, profile, compute, draft)) {
 }
 
 bool llama_moe_cache::wants_compute_sizes() {

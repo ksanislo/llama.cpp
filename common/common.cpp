@@ -1267,7 +1267,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
-        cparams_dft.n_rs_seq = 0;
+        cparams_dft.n_rs_seq       = 0;
+        cparams_dft.moe_cache_size = 0;
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
@@ -1307,15 +1308,34 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             const auto dmd = common_get_device_memory_data(params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
                 devs_dft, ngl, nct, nex, GGML_LOG_LEVEL_ERROR);
             moe_reserve.assign(ggml_backend_dev_count(), 0);
-            for (size_t je = 0; je < devs_dft.size() && je < dmd.size(); ++je) {
-                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                    if (ggml_backend_dev_get(i) == devs_dft[je]) {
-                        moe_reserve[i] += (shares_model ? 0 : dmd[je].model) + dmd[je].context + dmd[je].compute;
-                        if (moe_reserve[i] > 0) {
-                            LOG_INF("%s: %s: %.2f MiB left free by the MoE cache for the draft / MTP context\n", __func__,
-                                ggml_backend_dev_name(devs_dft[je]), moe_reserve[i]/1024.0/1024.0);
-                        }
+            // --moe-cache-draft: the draft's cache goes on LLAMA_MOE_DRAFT_CACHE_DEVICE, else on the device with most of the
+            // draft's weights (its MoE layer's), on top of what the draft context measured
+            ggml_backend_dev_t dev_dc = nullptr;
+            if (params_dft.moe_cache_draft) {
+                const char * name = getenv("LLAMA_MOE_DRAFT_CACHE_DEVICE");
+                dev_dc = name != nullptr && *name != '\0' ? ggml_backend_dev_by_name(name) : nullptr;
+                size_t best = 0;
+                for (size_t je = 0; je < devs_dft.size() && je < dmd.size(); ++je) {
+                    if (dmd[je].model > best && (name == nullptr || *name == '\0')) {
+                        best   = dmd[je].model;
+                        dev_dc = devs_dft[je];
                     }
+                }
+            }
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                for (size_t je = 0; je < devs_dft.size() && je < dmd.size(); ++je) {
+                    if (dev == devs_dft[je]) {
+                        moe_reserve[i] += (shares_model ? 0 : dmd[je].model) + dmd[je].context + dmd[je].compute;
+                    }
+                }
+                if (dev == dev_dc) {
+                    moe_reserve[i] += params_dft.moe_cache_size;
+                }
+                if (moe_reserve[i] > 0) {
+                    LOG_INF("%s: %s: %.2f MiB left free by the MoE cache for the draft / MTP context%s\n", __func__,
+                        ggml_backend_dev_name(dev), moe_reserve[i]/1024.0/1024.0,
+                        dev == dev_dc ? " (with its own MoE cache, --moe-cache-draft)" : "");
                 }
             }
             cparams.moe_cache_reserve = moe_reserve.data();
@@ -1797,6 +1817,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.moe_cache_profile   = params.moe_cache_profile.empty() ? nullptr : params.moe_cache_profile.c_str();
+    cparams.moe_cache_draft     = params.moe_cache_draft;
 
     return cparams;
 }

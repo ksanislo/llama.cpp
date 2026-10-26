@@ -347,6 +347,9 @@ struct common_params_speculative_draft {
 
     int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
 
+    bool   moe_cache      = false;               // --moe-cache-draft: the draft's host experts get their own small MoE cache
+    size_t moe_cache_size = (size_t) 768 << 20;  // --moe-cache-draft-mib / LLAMA_MOE_DRAFT_CACHE_MIB
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
@@ -603,6 +606,7 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
     std::string moe_cache_profile;     // expert usage profile for the MoE cache (placement at load, saved back)
+    bool   moe_cache_draft     = false; // this is the draft / MTP context's cache (set by common_base_params_to_speculative)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

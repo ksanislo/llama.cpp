@@ -402,6 +402,7 @@ extern "C" {
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
         const char * moe_cache_profile; // expert usage profile: fills the MoE cache at load and is saved back, nullptr = LLAMA_MOE_CACHE_PROFILE or none [EXPERIMENTAL]
         const size_t * moe_cache_reserve; // [ggml_backend_dev_count()] bytes of each device the MoE cache leaves free (e.g. for a draft context created after this one), nullptr = none [EXPERIMENTAL]
+        bool           moe_cache_draft;   // the MoE cache of a draft / MTP context: device hits from a small cache, settings LLAMA_MOE_DRAFT_* [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

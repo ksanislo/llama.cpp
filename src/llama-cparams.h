@@ -69,6 +69,7 @@ struct llama_cparams {
     float  moe_cache_cpu_share;
     std::string moe_cache_profile;
     std::vector<size_t> moe_cache_reserve; // [ggml_backend_dev_count()]
+    bool moe_cache_draft;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
