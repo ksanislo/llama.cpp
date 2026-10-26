@@ -12,6 +12,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <unistd.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -634,6 +635,52 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     return ret;
 }
 
+// LLAMA_MERGE_GATE_UP check: src rewritten to dst with every ffn_gate_up_exps as ffn_gate_exps + ffn_up_exps (the halves of each
+// expert's rows), the layout of a GGUF that keeps them apart; returns the tensors split, -1 on error
+static int split_gate_up_file(const std::string & src, const std::string & dst) {
+    ggml_context * ctx_data = nullptr;
+    gguf_init_params ip = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data };
+    gguf_context_ptr a(gguf_init_from_file(src.c_str(), ip));
+    if (!a) {
+        return -1;
+    }
+    ggml_context_ptr ctx_data_ptr(ctx_data);
+    gguf_context_ptr b(gguf_init_empty());
+    gguf_set_kv(b.get(), a.get());
+
+    const int64_t n_tensors = gguf_get_n_tensors(a.get());
+    size_t bytes = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        bytes += ggml_nbytes(ggml_get_tensor(ctx_data, gguf_get_tensor_name(a.get(), i))) + 64;
+    }
+    ggml_init_params cp = { 2*n_tensors*ggml_tensor_overhead() + bytes, nullptr, false };
+    ggml_context_ptr ctx_new(ggml_init(cp));
+    int n_split = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(a.get(), i);
+        ggml_tensor * t = ggml_get_tensor(ctx_data, name);
+        int il = -1;
+        int n  = 0;
+        if (sscanf(name, "blk.%d.ffn_gate_up_exps.weight%n", &il, &n) != 1 || n != (int) strlen(name)) {
+            gguf_add_tensor(b.get(), t);
+            continue;
+        }
+        ggml_tensor * g = ggml_new_tensor_3d(ctx_new.get(), t->type, t->ne[0], t->ne[1]/2, t->ne[2]);
+        ggml_tensor * u = ggml_new_tensor_3d(ctx_new.get(), t->type, t->ne[0], t->ne[1]/2, t->ne[2]);
+        ggml_format_name(g, "blk.%d.ffn_gate_exps.weight", il);
+        ggml_format_name(u, "blk.%d.ffn_up_exps.weight", il);
+        GGML_ASSERT(2*g->nb[2] == t->nb[2]);
+        for (int64_t e = 0; e < t->ne[2]; ++e) {
+            memcpy((char *) g->data + e*g->nb[2], (const char *) t->data + e*t->nb[2], g->nb[2]);
+            memcpy((char *) u->data + e*u->nb[2], (const char *) t->data + e*t->nb[2] + g->nb[2], u->nb[2]);
+        }
+        gguf_add_tensor(b.get(), g);
+        gguf_add_tensor(b.get(), u);
+        n_split++;
+    }
+    return gguf_write_to_file(b.get(), dst.c_str(), false) ? n_split : -1;
+}
+
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
 }
@@ -642,9 +689,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const llama_load_mode load_mode = LLAMA_LOAD_MODE_AUTO) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
+    if (load_mode != LLAMA_LOAD_MODE_AUTO) {
+        model_params.load_mode = load_mode;
+    }
     model_params.progress_callback = silent_model_load_progress;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
@@ -1252,6 +1303,60 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                         }
                     }
+                }
+
+                // LLAMA_MERGE_GATE_UP: the model written with gate and up apart, loaded apart and merged by the loader (--load-mode
+                // none); merged must give the logits of the model it was written from bit for bit, apart close to them
+                if (!skip && moe && arch == LLM_ARCH_QWEN4EXP && model_and_ctx_dev.first && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    test_executed = true;
+                    const std::string path_a = string_format("/tmp/test-llama-archs-gu-%d-a.gguf", (int) getpid());
+                    const std::string path_b = string_format("/tmp/test-llama-archs-gu-%d-b.gguf", (int) getpid());
+                    llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
+                    ms.add_kv_from_model();
+                    ms.add_tensors_from_model();
+                    ms.save(path_a);
+                    const int n_split = split_gate_up_file(path_a, path_b);
+                    const char * env_old = getenv("LLAMA_MERGE_GATE_UP");
+                    const std::string env_keep = env_old ? env_old : "";
+                    std::string merge_str;
+                    if (n_split <= 0) {
+                        test_ok = false;
+                        merge_str = "FAIL (no gate_up to split)";
+                    }
+                    for (bool merge : { false, true }) {
+                        if (n_split <= 0) {
+                            break;
+                        }
+                        if (merge) {
+                            setenv("LLAMA_MERGE_GATE_UP", "1", 1);
+                        } else {
+                            unsetenv("LLAMA_MERGE_GATE_UP");
+                        }
+                        FILE * f = fopen(path_b.c_str(), "rb");
+                        GGML_ASSERT(f != nullptr);
+                        auto mc = get_model_and_ctx(nullptr, f, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size,
+                            LLAMA_LOAD_MODE_NONE);
+                        const std::vector<float> logits_gu = get_logits(mc.first.get(), mc.second.get(), tokens, encode);
+                        fclose(f);
+                        GGML_ASSERT(logits_gu.size() == logits_dev.size());
+                        if (merge) {
+                            const bool same = memcmp(logits_gu.data(), logits_dev.data(), logits_dev.size()*sizeof(float)) == 0;
+                            merge_str += same ? " merged OK" : " merged FAIL";
+                            test_ok = test_ok && same;
+                        } else {
+                            const double e = nmse(logits_dev, logits_gu);
+                            merge_str += string_format("apart %.2e", e);
+                            test_ok = test_ok && e <= 1e-4;
+                        }
+                    }
+                    if (env_old) {
+                        setenv("LLAMA_MERGE_GATE_UP", env_keep.c_str(), 1);
+                    } else {
+                        unsetenv("LLAMA_MERGE_GATE_UP");
+                    }
+                    remove(path_a.c_str());
+                    remove(path_b.c_str());
+                    LOG("[gate_up: %d split, %s] ", n_split, merge_str.c_str());
                 }
 
                 if (test_executed) {

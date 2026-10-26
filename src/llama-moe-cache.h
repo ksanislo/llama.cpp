@@ -16,6 +16,8 @@ struct llama_model;
 // with LLAMA_MOE_ASYNC_BORROW=1 the staging slots lie in cache slots of the device, which large batches borrow and the next cached batch gives back
 // with LLAMA_MOE_RING=K the K staging slots are a ring: every uncached expert of a device's staged layers streams on the copy stream in
 // layer order, independent of the routing, as far ahead as the slots allow, with no host step per layer (borrows the cache by default)
+// with LLAMA_MOE_RING_TENSORS=1 the ring's entries are the expert tensors (gate, up, down) with slots of their own (default one each,
+// LLAMA_MOE_RING_TENSOR_SLOTS), each released as soon as the next tensor's matmul is queued: ~1 layer of staging instead of K
 // with LLAMA_MOE_RING_INPLACE=1 in addition the cached experts are read in place from the cache (ggml_mul_mat_id_slots over a per-layer
 // map) and the staging slots hold only the uncached ones (LLAMA_MOE_RING_INPLACE_CAP places, the rest read from host memory directly)
 // with LLAMA_MOE_PREFETCH=k the router of the next layer is applied to the input of the current one, and the missing experts among its top k
@@ -77,6 +79,12 @@ public:
 
     // the experts of w in its staging slot, nullptr if w is not staged
     ggml_tensor * get_staged_experts(const ggml_tensor * w) const;
+
+    // LLAMA_MOE_RING_TENSORS: whether the staged batches of n_tokens tokens of layer il look their experts up per expert tensor,
+    // and the staging map of w for that lookup (nullptr if not); each lookup starts a split right before its matmul, so the ring
+    // is called back once per expert tensor
+    bool stage_per_tensor(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+    ggml_tensor * get_stage_map(const ggml_tensor * w, int64_t n_tokens, int64_t n_expert_used, ggml_backend_t * backend) const;
 
     // LLAMA_MOE_RING_INPLACE: whether the staged batches of n_tokens tokens of layer il (of the layer of w) read the experts with
     // ggml_mul_mat_id_slots: the cached ones in place from the cache (get_experts), the others from the staging slot
