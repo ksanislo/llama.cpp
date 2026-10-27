@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -103,6 +104,16 @@ public:
     //
     // tasks declined by callback_new_task are put back in the queue once this returns
     void yield_to_queue(std::function<void()> && work);
+
+    // a task waits that needs the update loop: anything but its own NEXT_RESPONSE and the read-only tasks a yield serves
+    bool has_work_waiting() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        auto needs_loop = [](const server_task & t) {
+            return t.type != SERVER_TASK_TYPE_NEXT_RESPONSE && t.type != SERVER_TASK_TYPE_METRICS && t.type != SERVER_TASK_TYPE_SLOT_GET;
+        };
+        return std::any_of(queue_tasks.begin(), queue_tasks.end(), needs_loop) ||
+               std::any_of(queue_tasks_unhandled.begin(), queue_tasks_unhandled.end(), needs_loop);
+    }
 
     // for metrics
     size_t queue_tasks_deferred_size() {

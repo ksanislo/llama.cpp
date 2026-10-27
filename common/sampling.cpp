@@ -604,7 +604,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+    // decode groups: a full synchronization would wait for every group in flight (it serialized the pipeline); the
+    // logits / sampled-token getters below wait for the outputs' owner only
+    if (llama_decode_groups(ctx) < 2) {
+        llama_synchronize(ctx);
+    }
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();

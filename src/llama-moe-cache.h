@@ -158,6 +158,10 @@ public:
     // called after the graph is queued
     void launched();
 
+    // LLAMA_DECODE_GROUPS: the next graphs start while earlier ones of other groups are in flight; the device-hit logs are then
+    // read back asynchronously after each graph and processed once they landed, instead of a synchronization per graph
+    void set_pipelined(bool on);
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map, the staging map of a layer or an input of the CPU part
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 

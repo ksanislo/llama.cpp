@@ -690,6 +690,29 @@ llama_context::llama_context(
             }
         }
 
+        // LLAMA_DECODE_GROUPS=G (or auto = one per layer-split stage): see decode_group
+        if (const char * env = getenv("LLAMA_DECODE_GROUPS")) {
+            int32_t n_stages = 0;
+            {
+                std::vector<ggml_backend_dev_t> devs;
+                for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                    ggml_backend_dev_t dev = model.dev_layer(il);
+                    if (dev != nullptr && std::find(devs.begin(), devs.end(), dev) == devs.end()) {
+                        devs.push_back(dev);
+                    }
+                }
+                n_stages = (int32_t) devs.size();
+            }
+            n_decode_groups = strcmp(env, "auto") == 0 ? (cparams.pipeline_parallel ? n_stages : 0) : std::max(0, atoi(env));
+            if (n_decode_groups == 1) {
+                n_decode_groups = 0;
+            }
+            if (n_decode_groups > 0) {
+                LLAMA_LOG_INFO("%s: decode groups: up to %d groups of generating sequences in flight (LLAMA_DECODE_GROUPS=%s, %d stages, "
+                        "pipeline parallelism %s)\n", __func__, n_decode_groups, env, n_stages, cparams.pipeline_parallel ? "on" : "off - groups run one after another");
+            }
+        }
+
         if (const char * env = getenv("LLAMA_MOE_GATHER")) {
             moe_gather = atoi(env) != 0;
         }
@@ -711,6 +734,18 @@ llama_context::llama_context(
                     if (ggml_backend_dev_get(j) == dev) {
                         compute.reserve[i] = cparams.moe_cache_reserve[j];
                         reserve = reserve || compute.reserve[i] > 0;
+                    }
+                }
+            }
+            // decode groups: each group's scheduler allocates the compute buffer of its small graphs beside the cache
+            if (n_decode_groups > 0 && !cparams.moe_cache_draft) {
+                const char * env = getenv("LLAMA_DECODE_GROUPS_RESERVE_MIB");
+                const size_t per_group = (size_t) (env ? std::max(0, atoi(env)) : 192) * 1024 * 1024;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        compute.reserve[i] += n_decode_groups*per_group;
+                        reserve = reserve || per_group > 0;
                     }
                 }
             }
@@ -1156,6 +1191,9 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
     copy_experts.in_flight = false;
+    for (auto & gs : groups) {
+        gs.in_flight = false;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1182,6 +1220,214 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+}
+
+void llama_context::synchronize_out() {
+    if (out_owner >= 0 && (size_t) out_owner < groups.size()) {
+        if (groups[out_owner].in_flight) {
+            decode_group_wait(out_owner);
+        }
+        return;
+    }
+    synchronize();
+}
+
+void llama_context::out_switch(int32_t owner) {
+    if (owner == out_owner) {
+        return;
+    }
+    if (group_out.empty()) {
+        group_out.resize(std::max(n_decode_groups, 1) + 1);
+    }
+    auto entry = [&](int32_t o) -> out_state & { return o < 0 ? group_out.back() : group_out.at(o); };
+
+    out_state & from = entry(out_owner);
+    from.buf_output      = std::move(buf_output);
+    from.logits          = logits;
+    from.embd            = embd;
+    from.embd_nextn      = embd_nextn;
+    from.output_ids      = std::move(output_ids);
+    from.output_swaps    = std::move(output_swaps);
+    from.embd_batch_idxs = std::move(embd_batch_idxs);
+    from.n_outputs       = n_outputs;
+
+    out_state & to = entry(owner);
+    buf_output      = std::move(to.buf_output);
+    logits          = to.logits;
+    embd            = to.embd;
+    embd_nextn      = to.embd_nextn;
+    output_ids      = std::move(to.output_ids);
+    output_swaps    = std::move(to.output_swaps);
+    embd_batch_idxs = std::move(to.embd_batch_idxs);
+    n_outputs       = to.n_outputs;
+    to = out_state();
+
+    out_owner = owner;
+}
+
+int32_t llama_context::decode_groups() const {
+    if (n_decode_groups < 2 || !memory || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn ||
+            !sampling.samplers.empty()) {
+        return 0;
+    }
+    for (bool e : cparams.embeddings_layer_inp) {
+        if (e) {
+            return 0;
+        }
+    }
+    int32_t n = n_decode_groups;
+    if (cparams.pipeline_parallel && sched) {
+        // more groups than pipeline copies would make the scheduler wait on the host for a copy to be free
+        n = std::min<int32_t>(n, ggml_backend_sched_get_n_copies(sched.get()));
+    }
+    return n >= 2 ? n : 0;
+}
+
+int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
+    if (g < 0 || g >= decode_groups()) {
+        LLAMA_LOG_ERROR("%s: decode group %d of %d\n", __func__, g, decode_groups());
+        return -1;
+    }
+    if (groups.size() < (size_t) n_decode_groups) {
+        groups.resize(n_decode_groups);
+    }
+    group_state & gs = groups[g];
+    if (gs.in_flight) {
+        decode_group_wait(g);
+    }
+
+    out_switch(g);
+
+    // the group's own scheduler (created on first use, for small graphs: its buffers grow to the group's graph)
+    sched_reserve();
+    if (group_sched.size() < (size_t) n_decode_groups) {
+        group_sched.resize(n_decode_groups);
+        group_res.resize(n_decode_groups);
+        group_res_active.assign(n_decode_groups, nullptr);
+    }
+    if (!group_sched[g]) {
+        const size_t max_nodes = gf_res_reserve ? gf_res_reserve->get_max_nodes() : graph_max_nodes(cparams.n_ubatch);
+        group_sched[g].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+                cparams.pipeline_parallel, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(group_sched[g].get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(group_sched[g].get(), sched_graph_realloc, this);
+        group_res[g].reset(new llm_graph_result(max_nodes));
+        group_res_active[g] = nullptr;
+    }
+    struct sched_swap {
+        ggml_backend_sched_ptr & a;
+        ggml_backend_sched_ptr & b;
+        sched_swap(ggml_backend_sched_ptr & a, ggml_backend_sched_ptr & b) : a(a), b(b) { std::swap(a, b); }
+        ~sched_swap() { std::swap(a, b); }
+    };
+
+    // LLAMA_DECODE_GROUPS_PROBE=1: where the pipelining stops - see decode_group_wait
+    static const bool probe = [] { const char * e = getenv("LLAMA_DECODE_GROUPS_PROBE"); return e && atoi(e) != 0; }();
+    const auto probe_mark = [&](std::vector<ggml_backend_event_ptr> & evs) {
+        evs.resize(backend_ptrs.size());
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            if (!evs[i]) {
+                evs[i].reset(ggml_backend_event_new(dev));
+            }
+            if (!gprobe.query) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                gprobe.query = reg ? (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_query") : nullptr;
+            }
+            if (evs[i]) {
+                ggml_backend_event_record(evs[i].get(), backend_ptrs[i]);
+            }
+        }
+    };
+    if (probe) {
+        gs.t_submit_us = ggml_time_us();
+        probe_mark(gs.ev_start);
+    }
+
+    group_cur   = g;
+    out_backend = nullptr;
+    int ret;
+    {
+        sched_swap swap(sched, group_sched[g]);
+        ret = decode(batch);
+    }
+    group_cur = -1;
+    if (probe && ret == 0) {
+        probe_mark(gs.ev_end);
+    }
+    if ((n_group_built + n_group_reused) % 1024 == 1023) {
+        LLAMA_LOG_INFO("%s: decode groups: %d group graphs built, %d reused\n", __func__, n_group_built, n_group_reused);
+    }
+    if (ret != 0) {
+        synchronize();
+        return ret;
+    }
+
+    // the group's outputs are complete once the work queued on their backend so far is done
+    if (out_backend != nullptr) {
+        if (!gs.ev || gs.ev_backend != out_backend) {
+            gs.ev.reset(ggml_backend_event_new(ggml_backend_get_device(out_backend)));
+            gs.ev_backend = out_backend;
+        }
+        if (gs.ev) {
+            ggml_backend_event_record(gs.ev.get(), out_backend);
+        }
+    } else {
+        gs.ev.reset();
+        gs.ev_backend = nullptr;
+    }
+    gs.in_flight = true;
+
+    return 0;
+}
+
+int32_t llama_context::decode_group_wait(int32_t g) {
+    if (g < 0 || (size_t) g >= groups.size()) {
+        return -1;
+    }
+    group_state & gs = groups[g];
+    if (gs.in_flight) {
+        const int64_t t0 = ggml_time_us();
+        if (gs.ev) {
+            ggml_backend_event_synchronize(gs.ev.get());
+            gs.in_flight = false;
+        } else {
+            synchronize(); // no events (CPU): everything
+        }
+        // probe: when this group's outputs are ready, has the next group in flight started / finished on each device?
+        // pipelined: the next group is done on the early stages; serialized: it has not even started on device 0
+        const group_state & nx = groups[(g + 1) % groups.size()];
+        if (gprobe.query && gs.t_submit_us > 0 && nx.in_flight && nx.ev_end.size() == backend_ptrs.size()) {
+            const int64_t t1 = ggml_time_us();
+            gprobe.started.resize(backend_ptrs.size());
+            gprobe.done.resize(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                gprobe.started[i] += nx.ev_start[i] && gprobe.query(nx.ev_start[i].get());
+                gprobe.done[i]    += nx.ev_end[i]   && gprobe.query(nx.ev_end[i].get());
+            }
+            gprobe.n++;
+            gprobe.lat_us  += t1 - gs.t_submit_us;
+            gprobe.wait_us += t1 - t0;
+            if (gprobe.n % 512 == 0) {
+                std::string per_dev;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (nx.ev_end[i]) {
+                        per_dev += format(" %s %.0f/%.0f%%", ggml_backend_name(backend_ptrs[i]),
+                                100.0*gprobe.started[i]/gprobe.n, 100.0*gprobe.done[i]/gprobe.n);
+                    }
+                }
+                LLAMA_LOG_INFO("decode groups probe: last %lld steps: %.2f ms submit -> outputs, host waited %.2f ms; next group "
+                        "started/done when one is ready:%s\n", (long long) gprobe.n, gprobe.lat_us/1e3/gprobe.n,
+                        gprobe.wait_us/1e3/gprobe.n, per_dev.c_str());
+                gprobe = { gprobe.query, 0, 0, 0, {}, {} };
+            }
+        }
+    }
+    out_switch(g);
+    return 0;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2000,7 +2246,7 @@ bool llama_context::set_adapter_cvec(
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // [TAG_PIPELINE_RESERVE] with pipeline parallelism, reserve the worst-case graph of sched_reserve again after a different graph
     // (e.g. a small batch with host weights), otherwise every ubatch of the prompt reallocates the compute buffers
-    if (cparams.pipeline_parallel && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {
+    if (cparams.pipeline_parallel && gtype == ctx_type_to_graph_type(cparams.ctx_type) && group_cur < 0) {
         const uint32_t n_tokens_reserve = std::min(cparams.n_ctx, cparams.n_ubatch);
         // a prompt pipe chunk fits the worst-case graph too: keep (or make) that reservation, else every chunk reallocates
         // and the reallocation synchronizes all the devices, which serializes the pipeline
@@ -2017,6 +2263,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
     }
+
+    // LLAMA_DECODE_TIMING: host ms of the phases of small graphs (graph / inputs / MoE begin / queue / MoE launched)
+    static const bool phase_timing = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
+    const bool phases = phase_timing && ubatch.n_tokens <= 8;
+    const int64_t t_ph0 = phases ? ggml_time_us() : 0;
+    bool built = false;
 
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -2039,7 +2291,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // copy's previous graph
     llm_graph_result * res = nullptr;
     graph_cache_entry * gce = nullptr;
-    if (submit_active) {
+    // decode groups: the group's graph, in the group's scheduler (swapped in as sched)
+    llm_graph_result ** res_active = &gf_res_prev_active;
+    if (group_cur >= 0) {
+        res        = group_res[group_cur].get();
+        res_active = &group_res_active[group_cur];
+    } else if (submit_active) {
         auto & r = gf_res_pipe[ggml_backend_sched_wait_next_copy(sched.get())];
         if (!r) {
             r.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
@@ -2062,18 +2319,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // (a reused graph synchronizes the scheduler under pipeline parallelism, so the prompt pipe's chunks are rebuilt)
-    if (!graph_reuse_disable && !causal_plan && prompt_pipe_chunk == 0 && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !causal_plan && prompt_pipe_chunk == 0 && *res_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // (a group's previous step was waited for before this one: its scheduler's own copy events order the uploads)
+        if (cparams.pipeline_parallel && group_cur < 0) {
             ggml_backend_sched_synchronize(sched.get());
             copy_experts.in_flight = false;
         }
 
         n_reused++;
+        n_group_reused += group_cur >= 0;
         graph_cache_stats.n_reuse += gce != nullptr;
     } else if (gce != nullptr && gce->built && res->can_reuse(gparams)) {
         // a graph of this size built earlier: undo the scheduler's rewrite of it, then split and allocate it again
@@ -2102,7 +2361,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         graph_cache_stats.t_hit_us += ggml_time_us() - t0;
     } else {
         const int64_t t0 = ggml_time_us();
-        gf_res_prev_active = nullptr;
+        built = true;
+        *res_active = nullptr;
+        n_group_built += group_cur >= 0;
         if (gce != nullptr) {
             gce->built = false;
         }
@@ -2159,7 +2420,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             worst_case_reserved = false;
         }
 
-        gf_res_prev_active = submit_active ? nullptr : res;
+        *res_active = submit_active ? nullptr : res;
         if (gce != nullptr) {
             gce->built = true;
             graph_cache_stats.n_build++;
@@ -2185,7 +2446,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_ph1 = phases ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (phases) {
+        // [0] built graphs: n, ms to the inputs; [1] reused; then compute phases summed over both
+        static double   acc[2][2] = {};
+        static double   cmp[3]    = {};
+        static uint64_t cnt[2]    = {};
+        static uint64_t n_all     = 0;
+        acc[built ? 0 : 1][0] += (t_ph1 - t_ph0)/1000.0;
+        cnt[built ? 0 : 1]++;
+        for (int k = 0; k < 3; ++k) {
+            cmp[k] += t_compute_phase[k]/1000.0;
+        }
+        if (++n_all % 100 == 0) {
+            LLAMA_LOG_INFO("decode timing: last 100 graphs of <= 8 tokens (%s): %llu built %.2f ms to the inputs, %llu reused %.2f ms; "
+                    "MoE begin %.2f ms, queue (sched compute) %.2f ms, MoE launched %.2f ms a graph (host)\n",
+                    group_cur >= 0 ? "decode groups" : "plain", (unsigned long long) cnt[0], cnt[0] ? acc[0][0]/cnt[0] : 0.0,
+                    (unsigned long long) cnt[1], cnt[1] ? acc[1][0]/cnt[1] : 0.0, cmp[0]/100, cmp[1]/100, cmp[2]/100);
+            acc[0][0] = acc[1][0] = cmp[0] = cmp[1] = cmp[2] = 0.0;
+            cnt[0] = cnt[1] = 0;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2198,6 +2480,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    out_switch(-1);
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2579,6 +2863,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } decode_timing_log_on_exit { decode_timing && (batch_inp.tokens.size() >= 512 || batch_inp.tokens.size() <= 8), t_dt0, t_dt1, t_ph,
             batch_inp.tokens.size(), (int) cparams.ctx_type };
+    // LLAMA_DECODE_GROUPS: the outputs of a group decode go to the group's buffer, the others to the plain one
+    out_switch(group_cur);
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2683,7 +2970,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // handle any pending shifts/copies (and rope level moves)
-    memory_update(false);
+    if (memory_update(false) && group_cur >= 0) {
+        group_res_active[group_cur] = nullptr; // a graph of the update ran in the group's scheduler
+    }
     t_ph[2] = decode_timing ? ggml_time_us() : 0;
 
     llama_memory_context_ptr mctx;
@@ -2822,6 +3111,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
     t_dt1 = ggml_time_us();
 
+    // decode groups: the graphs of the other groups are in flight (the MoE cache reads its device logs without waiting)
+    if (moe_cache) {
+        moe_cache->set_pipelined(group_cur >= 0 && cparams.pipeline_parallel);
+    }
+
     // LLAMA_MTP_PIPE: the consumer follows this batch ubatch by ubatch until one does not fit (nextn_chunk_notify)
     nextn_chunk_on = (int32_t) n_tokens_all >= nextn_chunk_min;
 
@@ -2934,6 +3228,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
+            out_backend = backend_res;
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
@@ -3944,17 +4239,23 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
     copy_experts.prev_in_flight = copy_experts.in_flight;
     copy_experts.in_flight      = true;
+    const int64_t t0 = ggml_time_us();
     if (moe_cache) {
         moe_cache->begin(copy_experts.prev_in_flight, gf);
     }
+    const int64_t t1 = ggml_time_us();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+    const int64_t t2 = ggml_time_us();
     if (moe_cache) {
         moe_cache->launched();
     }
+    t_compute_phase[0] = t1 - t0;
+    t_compute_phase[1] = t2 - t1;
+    t_compute_phase[2] = ggml_time_us() - t2;
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
@@ -5584,13 +5885,13 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     float * res = nullptr;
 
@@ -5604,19 +5905,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5646,19 +5947,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5668,43 +5969,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_out();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
@@ -6068,6 +6369,18 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+int32_t llama_decode_groups(const llama_context * ctx) {
+    return ctx->decode_groups();
+}
+
+int32_t llama_decode_group(llama_context * ctx, llama_batch_ext * batch, int32_t group) {
+    return ctx->decode_group(*batch, group);
+}
+
+int32_t llama_decode_group_wait(llama_context * ctx, int32_t group) {
+    return ctx->decode_group_wait(group);
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {

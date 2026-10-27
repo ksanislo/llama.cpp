@@ -59,6 +59,14 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+    // the outputs of the last decode: with decode groups only the selected group's (llama_decode_group_wait)
+    void synchronize_out();
+
+    // LLAMA_DECODE_GROUPS: the generating sequences decoded in groups whose graphs are in flight together, so the stages of a
+    // layer split compute different groups at once; each group keeps its own outputs until it is waited for
+    int32_t decode_groups() const;
+    int32_t decode_group(const llama_batch_ext & batch, int32_t g);
+    int32_t decode_group_wait(int32_t g);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -531,6 +539,49 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // LLAMA_DECODE_GROUPS (decode_group): the outputs of each group (index G = plain decodes) live in their own buffer, the
+    // active owner's are the members above; a group's event marks the end of its output copies
+    struct out_state {
+        ggml_backend_buffer_ptr buf_output;
+        buffer_view<float>      logits     = {nullptr, 0};
+        buffer_view<float>      embd       = {nullptr, 0};
+        buffer_view<float>      embd_nextn = {nullptr, 0};
+        std::vector<int32_t>    output_ids;
+        std::vector<swap_info>  output_swaps;
+        std::vector<int32_t>    embd_batch_idxs;
+        uint32_t                n_outputs  = 0;
+    };
+    struct group_state {
+        ggml_backend_event_ptr ev;
+        ggml_backend_t ev_backend = nullptr;
+        bool in_flight = false;
+        // LLAMA_DECODE_GROUPS_PROBE: markers on each device's stream before / after the group's work, the submit time
+        std::vector<ggml_backend_event_ptr> ev_start, ev_end;
+        int64_t t_submit_us = 0;
+    };
+    // probe stats: per device, how often the next group had started / finished there when a group's outputs were ready
+    struct group_probe {
+        bool (*query)(ggml_backend_event_t) = nullptr;
+        int64_t n = 0, lat_us = 0, wait_us = 0;
+        std::vector<int64_t> started, done;
+    } gprobe;
+    int32_t n_decode_groups = 0;  // G from the env (0 off)
+    int32_t out_owner       = -1; // whose outputs the members hold: a group, or -1 = plain decodes
+    int32_t group_cur       = -1; // the group being decoded (decode() of decode_group)
+    ggml_backend_t out_backend = nullptr; // where the last decode's outputs were read from
+    std::vector<out_state>   group_out; // [G + 1], the entry of the active owner is stale
+    std::vector<group_state> groups;
+    void out_switch(int32_t owner);
+    // a scheduler and a graph per group: a group's graph stays allocated (and its CUDA graphs captured) in its own
+    // scheduler, so the next step of the group only sets the inputs (as the reuse of the last graph does); the
+    // scheduler of the group is swapped in as `sched` while it is decoded
+    std::vector<ggml_backend_sched_ptr> group_sched;
+    std::vector<llm_graph_result_ptr>   group_res;
+    std::vector<llm_graph_result *>     group_res_active;
+    int64_t t_compute_phase[3] = { 0, 0, 0 }; // host us of the last graph_compute: MoE begin, sched queue, MoE launched
+    int32_t n_group_built  = 0;
+    int32_t n_group_reused = 0;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

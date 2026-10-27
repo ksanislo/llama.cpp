@@ -1393,6 +1393,20 @@ struct llama_moe_cache::impl {
     fill_stats stats_fill;
     int64_t dh_log_cap  = 0;
     bool    dh_logged   = false; // the last graph logs selected experts
+    // LLAMA_DECODE_GROUPS (set_pipelined): the log of each graph is read back into pinned host memory right after it on its
+    // device's stream, and a later begin() processes the oldest read that landed (several graphs of other groups are in flight,
+    // a synchronization per graph would serialize them); logs still in flight when the pipelining ends are dropped
+    struct dh_log_read {
+        std::vector<ggml_backend_buffer_ptr> bufs; // [dh_devs] pinned copy of the device's log
+        std::vector<ggml_backend_event_ptr>  evs;  // [dh_devs] the copy landed
+    };
+    bool dh_pipelined = false;
+    std::vector<dh_log_read> dh_lr; // ring
+    size_t dh_lr_head = 0;
+    size_t dh_lr_n    = 0;
+    std::vector<ggml_backend_buffer_ptr> dh_clear_bufs; // [dh_devs] pinned -1s
+    size_t dh_lr_dropped = 0;
+    event_query_t dh_ev_query = nullptr;
     std::vector<dh_device> dh_devs; // [devices]
     dh_stats stats_dh;
     // by tokens in the graph (1..8): layer lookups, (token, slot) pairs, distinct experts, hits, misses
@@ -3458,14 +3472,18 @@ struct llama_moe_cache::impl {
         // LLAMA_MOE_CPU_LANE_NUMA under NUMA device-local: 1 (default) a lane per node, 0 one lane (threads placed by --numa),
         // spread: one lane whose threads float over all CPUs as without --numa, active: one lane (one OpenMP team) with a
         // pool per node, each layer computed by its node's pool with that node's CPUs (all of them, one stage runs at a time),
-        // local: a lane per node whose threads stay on its CPUs (by default --numa places them node-round-robin every graph)
+        // local: a lane per node whose threads stay on its CPUs (by default --numa places them node-round-robin every graph),
+        // stage: a lane (polling thread + pool) per device on its node's CPUs, so concurrent decode groups (one per stage) are
+        // served at once (Strata's per-stage pools); a lane's threads: LLAMA_MOE_CPU_LANE_THREADS or the node's cores / its devices
         const char * env_numa = moe_env("LLAMA_MOE_CPU_LANE_NUMA");
+        const bool lane_stage  = env_numa && strcmp(env_numa, "stage") == 0;
         const bool numa_local  = ggml_numa_device_local_enabled();
         const bool lane_spread = numa_local && env_numa && strcmp(env_numa, "spread") == 0;
         const bool lane_active = numa_local && env_numa && strcmp(env_numa, "active") == 0;
         const bool lane_local  = numa_local && env_numa && strcmp(env_numa, "local") == 0;
-        const bool numa_lanes  = numa_local && !(env_numa && atoi(env_numa) == 0 && !lane_local) && !lane_spread && !lane_active;
+        const bool numa_lanes  = numa_local && !(env_numa && atoi(env_numa) == 0 && !lane_local) && !lane_spread && !lane_active && !lane_stage;
         std::vector<std::pair<int32_t, int>> row_node; // (layer, node of its device)
+        std::vector<size_t> row_dev;                   // device of each row_node entry
         int64_t n_embd = 0; // an upper bound of the rows of the experts' input and output
         for (const layer & l : layers) {
             for (const ggml_tensor * w : l.experts) {
@@ -3519,6 +3537,7 @@ struct llama_moe_cache::impl {
                 l.lane_host = (uint8_t *) ggml_backend_buffer_get_base(hb) + r*chan_size;
                 l.lane_dev  = (uint8_t *) ggml_backend_buffer_get_base(mb) + r*chan_size;
                 row_node.emplace_back(dd.rows[r], node);
+                row_dev.push_back(id);
                 n_chan++;
             }
         }
@@ -3588,6 +3607,53 @@ struct llama_moe_cache::impl {
                 desc = format("one lane, %zu layers, %d threads on all CPUs, not placed by --numa", row_node.size(), nt);
             }
             desc += format(", LLAMA_MOE_CPU_LANE_NUMA=%s", env_numa);
+            nodes.clear();
+        }
+        if (lane_stage) {
+            std::vector<size_t> devs;
+            for (size_t id : row_dev) {
+                if (std::find(devs.begin(), devs.end(), id) == devs.end()) {
+                    devs.push_back(id);
+                }
+            }
+            for (size_t id : devs) {
+                int node = -1;
+                int devs_on_node = 0;
+                for (size_t k = 0; k < row_dev.size(); ++k) {
+                    if (row_dev[k] == id) {
+                        node = row_node[k].second;
+                    }
+                }
+                for (size_t od : devs) {
+                    for (size_t k = 0; k < row_dev.size(); ++k) {
+                        if (row_dev[k] == od) {
+                            devs_on_node += row_node[k].second == node;
+                            break;
+                        }
+                    }
+                }
+                std::vector<int> cpus;
+                if (node >= 0) {
+                    cpus.resize(4096);
+                    cpus.resize(ggml_numa_node_cpus(node, cpus.data(), (int) cpus.size()));
+                }
+                int nt = n_threads;
+                if (!env_threads) {
+                    const int cores = cpus.empty() ? (int) std::thread::hardware_concurrency()/2 : (int) cpus.size()/2;
+                    nt = std::max(1, (cores - 1)/std::max(1, cpus.empty() ? (int) devs.size() : devs_on_node));
+                }
+                size_t n_rows = 0;
+                for (size_t k = 0; k < row_node.size(); ++k) {
+                    if (row_dev[k] == id) {
+                        lane_of[row_node[k].first] = (int32_t) lanes.size();
+                        n_rows++;
+                    }
+                }
+                lanes.push_back(cpus.empty() ? std::make_unique<llama_moe_lane>(layers.size(), nt, poll, cpus)
+                                             : std::make_unique<llama_moe_lane>(layers.size(), nt, poll, std::vector<std::vector<int>>{ cpus }, false));
+                desc += format("%s%s: %zu layers, %d threads on node %d", desc.empty() ? "a lane per device, " : "; ",
+                    ggml_backend_name(devices[id].backend), n_rows, nt, node);
+            }
             nodes.clear();
         }
         for (const int node : nodes) {
@@ -5814,9 +5880,122 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // queue the read of the device logs of the last graph on each device's stream (pipelined)
+    void dh_log_queue() {
+        static constexpr size_t cap = 16;
+        if (dh_lr.empty()) {
+            dh_lr.resize(cap);
+            dh_clear_bufs.resize(dh_devs.size());
+            for (size_t id = 0; id < dh_devs.size(); ++id) {
+                dh_device & dd = dh_devs[id];
+                if (dd.rows.empty()) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+                ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
+                if (hbuft == nullptr) {
+                    hbuft = ggml_backend_cpu_buffer_type();
+                }
+                dh_clear_bufs[id].reset(ggml_backend_buft_alloc_buffer(hbuft, ggml_nbytes(dd.log)));
+                GGML_ASSERT(dh_clear_bufs[id]);
+                memcpy(ggml_backend_buffer_get_base(dh_clear_bufs[id].get()), dd.log_clear.data(), ggml_nbytes(dd.log));
+                for (dh_log_read & e : dh_lr) {
+                    e.bufs.resize(dh_devs.size());
+                    e.evs.resize(dh_devs.size());
+                    e.bufs[id].reset(ggml_backend_buft_alloc_buffer(hbuft, ggml_nbytes(dd.log)));
+                    e.evs[id].reset(ggml_backend_event_new(dev));
+                    GGML_ASSERT(e.bufs[id]);
+                }
+                if (dh_ev_query == nullptr) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    dh_ev_query = reg ? (event_query_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_query") : nullptr;
+                }
+            }
+        }
+        if (dh_lr_n == dh_lr.size()) {
+            // the oldest read is still unprocessed: drop it (only the fill policy reads the logs)
+            dh_lr_wait(dh_lr[dh_lr_head]);
+            dh_lr_head = (dh_lr_head + 1) % dh_lr.size();
+            dh_lr_n--;
+            dh_lr_dropped++;
+        }
+        dh_log_read & e = dh_lr[(dh_lr_head + dh_lr_n) % dh_lr.size()];
+        for (size_t id = 0; id < dh_devs.size(); ++id) {
+            dh_device & dd = dh_devs[id];
+            if (dd.rows.empty()) {
+                continue;
+            }
+            ggml_backend_t backend = devices[id].backend;
+            ggml_backend_tensor_get_async(backend, dd.log, ggml_backend_buffer_get_base(e.bufs[id].get()), 0, ggml_nbytes(dd.log));
+            ggml_backend_tensor_set_async(backend, dd.log, ggml_backend_buffer_get_base(dh_clear_bufs[id].get()), 0, ggml_nbytes(dd.log));
+            if (e.evs[id]) {
+                ggml_backend_event_record(e.evs[id].get(), backend);
+            } else {
+                ggml_backend_synchronize(backend);
+            }
+        }
+        dh_lr_n++;
+        dh_logged = false;
+    }
+
+    void dh_lr_wait(dh_log_read & e) {
+        for (auto & ev : e.evs) {
+            if (ev) {
+                ggml_backend_event_synchronize(ev.get());
+            }
+        }
+    }
+
+    // the oldest log read, if it landed (pipelined) / waited for (else), copied to the devices' log_host
+    bool dh_log_take(bool wait) {
+        if (dh_lr_n == 0) {
+            return false;
+        }
+        dh_log_read & e = dh_lr[dh_lr_head];
+        if (wait) {
+            dh_lr_wait(e);
+        } else {
+            for (auto & ev : e.evs) {
+                if (ev && !(dh_ev_query ? dh_ev_query(ev.get()) : (ggml_backend_event_synchronize(ev.get()), true))) {
+                    return false;
+                }
+            }
+        }
+        for (size_t id = 0; id < dh_devs.size(); ++id) {
+            if (!dh_devs[id].rows.empty()) {
+                memcpy(dh_devs[id].log_host.data(), ggml_backend_buffer_get_base(e.bufs[id].get()), ggml_nbytes(dh_devs[id].log));
+            }
+        }
+        dh_lr_head = (dh_lr_head + 1) % dh_lr.size();
+        dh_lr_n--;
+        return true;
+    }
+
+    void set_pipelined(bool on) {
+        dh_pipelined = on && !dh_devs.empty();
+    }
+
     void dh_begin(ggml_cgraph * gf) {
         if (dh_devs.empty()) {
             return;
+        }
+        // decode groups: the logs come from the ring, read without a synchronization; when the pipelining ends, the reads
+        // still in the ring are dropped (waited for, so their buffers are free) and the next logs are read as before
+        bool have_log = dh_logged;
+        bool sync_read = dh_logged;
+        if (dh_pipelined) {
+            if (dh_logged) {
+                dh_log_queue(); // the last graph ran without pipelining: its log is read like the others
+            }
+            have_log  = dh_log_take(false);
+            sync_read = false;
+        } else if (dh_lr_n > 0) {
+            while (dh_lr_n > 0) {
+                dh_lr_wait(dh_lr[dh_lr_head]);
+                dh_lr_head = (dh_lr_head + 1) % dh_lr.size();
+                dh_lr_n--;
+                dh_lr_dropped++;
+            }
         }
         // does this graph log selected experts? (a reused graph is not rebuilt, so look at the graph itself)
         bool logs = false;
@@ -5833,7 +6012,7 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_t backend = devices[id].backend;
             // read the log first: the synchronization waits for the last graph, not for the fills
-            if (dh_logged) {
+            if (sync_read) {
                 ggml_backend_tensor_get_async(backend, dd.log, dd.log_host.data(), 0, ggml_nbytes(dd.log));
                 ggml_backend_synchronize(backend);
                 ggml_backend_tensor_set_async(backend, dd.log, dd.log_clear.data(), 0, ggml_nbytes(dd.log));
@@ -5853,7 +6032,7 @@ struct llama_moe_cache::impl {
                 dh_rebuild_map(dd);
                 dd.resync = false;
             }
-            if (dh_logged && !ad_on) {
+            if (have_log && !ad_on) {
                 dh_process(id);
             }
             if (!ad_on) {
@@ -5863,7 +6042,7 @@ struct llama_moe_cache::impl {
         }
         if (ad_on) {
             // the policy ranks the candidates of all devices against one per-token cap
-            if (dh_logged) {
+            if (have_log) {
                 dh_process_adaptive();
             }
             for (size_t id = 0; id < dh_devs.size(); ++id) {
@@ -5873,7 +6052,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        if (dh_logged) {
+        if (have_log) {
             stats_dh.graphs++;
             if (fill_min_misses > 1 && stats_dh.graphs % 256 == 0) {
                 for (uint8_t & c : miss_cnt) {
@@ -5893,6 +6072,9 @@ struct llama_moe_cache::impl {
 
     void launched() {
         ring_end();
+        if (dh_pipelined && dh_logged) {
+            dh_log_queue(); // this graph's log, after it on each device
+        }
         if (dh_mode != 1) {
             return;
         }
@@ -7644,6 +7826,10 @@ void llama_moe_cache::set_prediction(const ggml_tensor * lookup, const ggml_tens
 
 void llama_moe_cache::begin(bool prev_in_flight, ggml_cgraph * graph) {
     pimpl->begin(prev_in_flight, graph);
+}
+
+void llama_moe_cache::set_pipelined(bool on) {
+    pimpl->set_pipelined(on);
 }
 
 void llama_moe_cache::launched() {

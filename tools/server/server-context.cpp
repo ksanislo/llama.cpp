@@ -3986,6 +3986,17 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // LLAMA_DECODE_GROUPS: a batch of generating slots only goes through the decode pump
+        try {
+            if (decode_pump()) {
+                return;
+            }
+        } catch (const std::exception & e) {
+            SRV_ERR("decode_pump() failed: %s\n", e.what());
+            abort_all_slots("decode_pump() failed: " + std::string(e.what()));
+            return;
+        }
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -4031,6 +4042,149 @@ private:
                 break; // stop any further processing
             }
         }
+    }
+
+    // LLAMA_DECODE_GROUPS (Strata's pipelined batch groups): the generating slots of the batch are split into groups, decoded
+    // with llama_decode_group so that up to G groups are in flight at once (with a layer split, each stage computes another
+    // group). A group is sampled when it leaves the last stage and goes straight back in with its next token, while the others
+    // are still running; the pump stops taking new rounds when a task needs the update loop (a new request, a cancel), when a
+    // slot stops being plain decode (context full, ...) or after LLAMA_DECODE_GROUPS_ROUNDS rounds, and the groups in flight
+    // are finished. Only batches of generating slots with one token each, without speculative decoding.
+    bool decode_pump() {
+        if (spec || batch.size() < 2 || batch.size() != batch_n_gen || batch.has_embd()) {
+            return false;
+        }
+        const int32_t n_groups_max = llama_decode_groups(ctx_tgt);
+        if (n_groups_max < 2) {
+            return false;
+        }
+
+        // the batch's slots, in batch order, one token each
+        std::vector<server_slot *> gen;
+        for (int32_t i = 0; i < batch.size(); ++i) {
+            const auto & t = batch.tokens[i];
+            if (t.id_slot < 0 || t.id_slot >= (int32_t) slots.size() || t.i_embd >= 0 || !t.output) {
+                return false;
+            }
+            server_slot & slot = slots[t.id_slot];
+            if (slot.state != SLOT_STATE_GENERATING || slot.i_batch != i || slot.audio_stream || !slot.spec_i_batch.empty() ||
+                    (!gen.empty() && gen.back() == &slot)) {
+                return false;
+            }
+            gen.push_back(&slot);
+        }
+
+        static const int64_t rounds_max = [] {
+            const char * env = getenv("LLAMA_DECODE_GROUPS_ROUNDS");
+            return env ? std::max<int64_t>(0, atoll(env)) : 0;
+        }();
+
+        // contiguous groups of near equal size (Strata: 8 slots, 4 groups of 2)
+        const int32_t n_groups = std::min<int32_t>(n_groups_max, (int32_t) gen.size());
+        struct pump_group {
+            std::vector<server_slot *> slots;
+            server_batch b;
+            int64_t rounds = 0;
+        };
+        std::vector<pump_group> groups(n_groups);
+        for (int32_t k = 0; k < n_groups; ++k) {
+            const size_t i0 = gen.size()*k/n_groups;
+            const size_t i1 = gen.size()*(k + 1)/n_groups;
+            pump_group & pg = groups[k];
+            pg.b.init(ctx_tgt, (int32_t) (i1 - i0), 0);
+            for (size_t i = i0; i < i1; ++i) {
+                server_slot & slot = *gen[i];
+                const auto & t = batch.tokens[slot.i_batch];
+                slot.i_batch = pg.b.size();
+                pg.b.tokens.push_back(t);
+                pg.slots.push_back(&slot);
+            }
+        }
+        batch.clear();
+
+        static uint64_t n_pumps = 0;
+        if (n_pumps++ < 8) {
+            SRV_INF("decode groups: %zu generating slots in %d groups\n", gen.size(), n_groups);
+        }
+
+        // queue a group; on a failure the group's slots end with an error
+        auto submit = [&](int32_t k) -> bool {
+            pump_group & pg = groups[k];
+            pg.b.render(0, pg.b.size());
+            int ret = llama_decode_group(ctx_tgt, pg.b.view.get(), k);
+            if (ret == 1 && try_clear_idle_slots()) {
+                ret = llama_decode_group(ctx_tgt, pg.b.view.get(), k);
+            }
+            if (ret != 0) {
+                const std::string err = ret == 1 ? "Context size has been exceeded." : ret == -1 ? "Invalid input batch." : "Compute error.";
+                SRV_ERR("decode group %d: %s ret = %d\n", k, err.c_str(), ret);
+                for (server_slot * slot : pg.slots) {
+                    if (slot->is_processing()) {
+                        send_error(*slot, err);
+                        slot->release();
+                        slot->prompt_clear();
+                    }
+                }
+                pg.slots.clear();
+                return false;
+            }
+            metrics.n_decode++;
+            pg.rounds++;
+            return true;
+        };
+
+        std::deque<int32_t> fifo;
+        for (int32_t k = 0; k < n_groups; ++k) {
+            if (submit(k)) {
+                fifo.push_back(k);
+            }
+        }
+
+        bool pumping = true;
+        int64_t n_steps = 0;
+        while (!fifo.empty()) {
+            const int32_t k = fifo.front();
+            fifo.pop_front();
+            pump_group & pg = groups[k];
+
+            queue_tasks.yield_to_queue([&]() {
+                llama_decode_group_wait(ctx_tgt, k);
+            });
+            n_steps++;
+
+            for (server_slot * slot : pg.slots) {
+                if (slot->state == SLOT_STATE_GENERATING && slot->i_batch >= 0) {
+                    sample_generated(*slot, slot->i_batch);
+                }
+            }
+
+            pumping = pumping && (rounds_max == 0 || pg.rounds < rounds_max) && !queue_tasks.has_work_waiting();
+            if (!pumping) {
+                continue; // its slots keep their sampled token for the next update
+            }
+
+            pg.b.clear();
+            std::vector<server_slot *> next;
+            for (server_slot * slot : pg.slots) {
+                if (slot->state != SLOT_STATE_GENERATING) {
+                    continue; // done
+                }
+                if (slot->prompt.n_tokens() + 1 >= slot->n_ctx) {
+                    pumping = false; // a context shift: the update loop does it
+                    continue;
+                }
+                slot->handle_last_sampled_token(pg.b);
+                next.push_back(slot);
+            }
+            pg.slots = std::move(next);
+            if (pg.b.size() > 0 && submit(k)) {
+                fifo.push_back(k);
+            }
+        }
+
+        // slots of groups that stopped early hold a sampled token: the next update decodes it
+        SRV_DBG("decode groups: %lld group steps\n", (long long) n_steps);
+        return true;
     }
 
     void process_tts_slots() {
@@ -5264,6 +5418,57 @@ private:
         return true;
     }
 
+    // sample the token of a generating slot at output tok_idx of the last decode (or decode group), and send it
+    void sample_generated(server_slot & slot, int tok_idx) {
+        auto accept_special_token = [&](server_slot & s, llama_token token) {
+            return params_base.special ||
+                s.task->params.sampling.preserved_tokens.find(token) != s.task->params.sampling.preserved_tokens.end();
+        };
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+        }
+
+        slot.i_batch = -1;
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+        result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+        }
+
+        if (!process_token(result, slot)) {
+            // release slot because of stop condition
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+
+            return;
+        }
+
+        slot.print_timings_tg();
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -5338,50 +5543,7 @@ private:
             }
 
             // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
-
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
-
-            slot.i_batch = -1;
-
-            common_sampler_accept(slot.smpl.get(), id, true);
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
-                return;
-            }
-
-            slot.print_timings_tg();
+            sample_generated(slot, slot.i_batch - off);
         });
 
         // speculative decoding - main model sample and accept
