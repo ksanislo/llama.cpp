@@ -1266,7 +1266,10 @@ void llama_context::out_switch(int32_t owner) {
 }
 
 int32_t llama_context::decode_groups() const {
-    if (n_decode_groups < 2 || !memory || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn ||
+    // LLAMA_DECODE_GROUPS_MTP=1: groups also with the unmasked nextn rows MTP reads (verify batches, see the server's pump)
+    static const bool groups_mtp = [] { const char * e = getenv("LLAMA_DECODE_GROUPS_MTP"); return e && atoi(e) != 0; }();
+    const bool nextn_ok = groups_mtp && !cparams.embeddings_nextn_masked;
+    if (n_decode_groups < 2 || !memory || cparams.embeddings || (cparams.embeddings_nextn && !nextn_ok) || !cparams.causal_attn ||
             !sampling.samplers.empty()) {
         return 0;
     }
@@ -1347,8 +1350,9 @@ int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
         probe_mark(gs.ev_start);
     }
 
-    group_cur   = g;
-    out_backend = nullptr;
+    group_cur     = g;
+    out_backend   = nullptr;
+    out_backend_h = nullptr;
     int ret;
     {
         sched_swap swap(sched, group_sched[g]);
@@ -1379,6 +1383,18 @@ int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
         gs.ev.reset();
         gs.ev_backend = nullptr;
     }
+    if (out_backend_h != nullptr && out_backend_h != out_backend) {
+        if (!gs.ev_h || gs.ev_h_backend != out_backend_h) {
+            gs.ev_h.reset(ggml_backend_event_new(ggml_backend_get_device(out_backend_h)));
+            gs.ev_h_backend = out_backend_h;
+        }
+        if (gs.ev_h) {
+            ggml_backend_event_record(gs.ev_h.get(), out_backend_h);
+        }
+    } else {
+        gs.ev_h.reset();
+        gs.ev_h_backend = nullptr;
+    }
     gs.in_flight = true;
 
     return 0;
@@ -1393,6 +1409,9 @@ int32_t llama_context::decode_group_wait(int32_t g) {
         const int64_t t0 = ggml_time_us();
         if (gs.ev) {
             ggml_backend_event_synchronize(gs.ev.get());
+            if (gs.ev_h) {
+                ggml_backend_event_synchronize(gs.ev_h.get());
+            }
             gs.in_flight = false;
         } else {
             synchronize(); // no events (CPU): everything
@@ -3312,6 +3331,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
+                out_backend_h = backend_h;
 
                 const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
@@ -3459,6 +3479,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
         embd_nextn.size = (size_t) n_embd_out * n_batch;
+        if (group_cur >= 0) {
+            // a group's verify batch outputs every token: its own buffer needs only those rows, not n_batch
+            embd_nextn.size = (size_t) n_embd_out * std::min<int64_t>(n_batch, n_outputs_max);
+        }
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
