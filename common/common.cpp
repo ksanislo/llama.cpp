@@ -1343,6 +1343,22 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             LOG_WRN("%s: could not measure the draft / MTP context for the MoE cache plan: %s\n", __func__, e.what());
         }
     }
+    // a --fit-target above the default (the server adds the mmproj's memory there) is left free by the MoE cache too:
+    // the mmproj is allocated after the main context
+    if (params.moe_cache_size > 0 && !model_only) {
+        const size_t def_target = 1024ull*1024*1024;
+        for (size_t i = 0; i < ggml_backend_dev_count() && i < params.fit_params_target.size(); ++i) {
+            if (params.fit_params_target[i] > def_target) {
+                moe_reserve.resize(ggml_backend_dev_count(), 0);
+                moe_reserve[i] += params.fit_params_target[i] - def_target;
+                LOG_INF("%s: %s: %.2f MiB left free by the MoE cache for --fit-target / mmproj\n", __func__,
+                    ggml_backend_dev_name(ggml_backend_dev_get(i)), (params.fit_params_target[i] - def_target)/1024.0/1024.0);
+            }
+        }
+        if (!moe_reserve.empty()) {
+            cparams.moe_cache_reserve = moe_reserve.data();
+        }
+    }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
