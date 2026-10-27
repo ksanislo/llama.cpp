@@ -86,6 +86,9 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // without SWA the attention cache writes nothing in a partial state
+    llama_memory_recurrent * partial_state_recurrent() const override;
+
     //
     // llama_memory_hybrid specific API
     //
@@ -129,6 +132,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool set_shapes_plan(bool plan) override;
 
     //
     // llama_memory_hybrid_context

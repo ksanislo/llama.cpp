@@ -12640,7 +12640,8 @@ void ggml_compute_forward_moe_doorbell(const ggml_compute_params * params, ggml_
     memcpy(&chan, dst->op_params, sizeof(chan));
     const int32_t n_expert   = ggml_get_op_params_i32(dst, 2);
     const int32_t max_tokens = ggml_get_op_params_i32(dst, 3);
-    const float   frac       = ggml_get_op_params_f32(dst, 4);
+    const uint32_t ov        = ggml_moe_lane_load(chan, GGML_MOE_LANE_FRAC);
+    const float   frac       = ov != 0 ? (ov - 1)*0.001f : ggml_get_op_params_f32(dst, 4);
 
     size_t off_ids, off_x;
     ggml_moe_lane_layout(x->ne[0], ids->ne[0], max_tokens, &off_ids, &off_x, nullptr);

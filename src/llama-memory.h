@@ -14,6 +14,7 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+class llama_memory_recurrent;
 
 struct llama_memory_params {
     // kv cache
@@ -65,6 +66,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // prompt pipe with stable batch shapes (LLAMA_PROMPT_PIPE_CAUSAL), after apply(): true gives the current ubatch the
+    // shapes of the batch's end (the layout the batch is planned in), false its own causal ones (n_kv / pools so far)
+    // returns false if the shapes do not depend on it
+    virtual bool set_shapes_plan(bool /*plan*/) { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -140,6 +146,10 @@ struct llama_memory_i {
 
     // move the cached keys of seq_id to level, done by the next init_update(); pass a whole seq_rope_group()
     virtual void seq_rope_level_set(llama_seq_id /*seq_id*/, int32_t /*level*/) {}
+
+    // the recurrent memory whose state is ALL that state_write(seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) writes
+    // (the other parts write nothing then), or nullptr: the partial state can then be checkpointed mid-batch
+    virtual llama_memory_recurrent * partial_state_recurrent() const { return nullptr; }
 
     //
     // state write/read

@@ -47,7 +47,18 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // a weight made of other weights (merge_gate_up_exps): its data is read from them
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {}
     };
+
+    // LLAMA_MERGE_GATE_UP: a layer's ffn_gate_exps and ffn_up_exps read as one ffn_gate_up_exps, per expert its gate rows then its up rows
+    struct merged_weight {
+        llama_tensor_weight gate;
+        llama_tensor_weight up;
+    };
+    std::map<std::string, merged_weight> merged;
+    ggml_context_ptr ctx_merged;
 
     // custom comparator to sort weights more nicely by layer
     struct weight_name_comparer {
@@ -249,6 +260,14 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // LLAMA_MERGE_GATE_UP=1: replace each layer's ffn_gate_exps + ffn_up_exps (same type and shape) by one ffn_gate_up_exps weight,
+    // concatenated per expert when it is loaded; before the tensors are created, for an arch that reads ffn_gate_up_exps.
+    // Needs the data read from the file (--load-mode none or direct-io), not a mapping. Returns the layers merged.
+    int merge_gate_up_exps();
+
+    // read a merged weight into cur (load_all_data)
+    void load_merged(ggml_tensor * cur, const merged_weight & m);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cinttypes>
@@ -601,26 +602,56 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    // LLAMA_MTP_POOLED_NORM=1: one RMS over all hc streams together (the vLLM reference and Strata's default), scaled by
+    // the [n_embd*hc] weight; default: one RMS per stream
+    static const bool pooled_norm = [] { const char * e = getenv("LLAMA_MTP_POOLED_NORM"); return e != nullptr && atoi(e) != 0; }();
+    ggml_tensor * h_norm;
+    if (pooled_norm) {
+        h_norm = build_norm(h, ggml_reshape_1d(ctx0, layer.nextn.hnorm, n_embd*hc), nullptr, LLM_NORM_RMS, il);
+        h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
+    } else {
+        h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    }
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
-    cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    ggml_tensor * res_hc;
+    if (const auto * eh = model.get_mtp_eh_halves(layer.nextn.eh_proj)) {
+        // LLAMA_MTP_EH_ONCE: W_e*e once per token, broadcast onto W_h*h of each stream
+        ggml_tensor * e_part = build_lora_mm(eh->e, e_norm);                                         // [n_embd, n_tokens]
+        cb(e_part, "mtp_eh_proj_e", il);
+        ggml_tensor * h_part = build_lora_mm(eh->h, ggml_reshape_2d(ctx0, h_norm, n_embd, hc*n_tokens));
+        cb(h_part, "mtp_eh_proj_h", il);
+        res_hc = ggml_add(ctx0, ggml_reshape_3d(ctx0, h_part, n_embd, hc, n_tokens),
+                ggml_reshape_3d(ctx0, e_part, n_embd, 1, n_tokens));                                  // [n_embd, hc, n_tokens]
+    } else {
+        e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+        cb(e_norm, "mtp_enorm", il);
+        res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0));           // [n_embd, hc, n_tokens]
+    }
     cb(res_hc, "mtp_eh_proj", il);
+
+    // LLAMA_MTP_KV_ONLY=1: rows without an output (the prompt, the catch-up over a verified batch) only need their K/V,
+    // which build_layer_attn has stored: the FFN (512 experts) and the head run on the output rows only.
+    // =2: as 1, and q, attention and the output projection run on the output rows only too (none for a prompt ubatch;
+    // with QSA only when the ubatch has no output, the selection is built over the whole ubatch)
+    static const int kv_only = [] { const char * e = getenv("LLAMA_MTP_KV_ONLY"); return e != nullptr ? atoi(e) : 0; }();
+    const bool cropped = kv_only > 0 && inp_out_ids != nullptr && cparams.embeddings_nextn_masked && n_outputs < n_tokens;
+    const bool qsa     = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    const bool rows    = cropped && kv_only >= 2 && (n_outputs == 0 || !qsa) &&
+        inp_hyb->get_attn()->get_kq_mask()->ne[2] == 1 && inp_hyb->get_attn()->get_kq_mask()->ne[3] == 1;
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
-    cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+    if (rows) {
+        cur = build_layer_attn_rows(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, inp_out_ids, sections, il);
+    } else {
+        cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+    }
 
-    // LLAMA_MTP_KV_ONLY=1: rows without an output (the prompt, the catch-up over a verified batch) only need their K/V,
-    // which build_layer_attn has stored: the FFN (512 experts) and the head run on the output rows only
-    static const bool kv_only = [] { const char * e = getenv("LLAMA_MTP_KV_ONLY"); return e != nullptr && atoi(e) != 0; }();
-    const bool cropped = kv_only && inp_out_ids != nullptr && cparams.embeddings_nextn_masked && n_outputs < n_tokens;
     if (cropped) {
-        cur    = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur    = rows ? cur : ggml_get_rows(ctx0, cur, inp_out_ids);
         inject = inject ? ggml_get_rows(ctx0, inject, inp_out_ids) : nullptr;
 
         res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
@@ -650,18 +681,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const auto * dv = model.get_draft_vocab_head();
     if (dv != nullptr && cur->ne[1] >= 1 && cur->ne[1] <= 8) {
         // LLAMA_MTP_DRAFT_VOCAB: logits over the subset (draft steps: 1..8 output rows), scattered into full rows of -inf so
-        // the ids and the samplers stay the vocabulary's; each output row is a contiguous column of 1-float rows
+        // the ids and the samplers stay the vocabulary's. One set_rows over [1, n, n_out] views (the ids broadcast over the
+        // rows), and its result is the logits, so every reader of the logits depends on the scatter, not on node order
         ggml_tensor * sub = ggml_mul_mat(ctx0, dv->head, cur);                               // [n_sub, n_out]
         cb(sub, "result_output_sub", -1);
         const int64_t n_vocab = model.output->ne[1];
+        const int64_t n_sub   = sub->ne[0];
         const int64_t n_out   = sub->ne[1];
         ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab, n_out), -INFINITY);
-        for (int64_t o = 0; o < n_out; ++o) {
-            ggml_tensor * dst = ggml_view_2d(ctx0, full, 1, n_vocab, sizeof(float), o*full->nb[1]);
-            ggml_tensor * src = ggml_view_2d(ctx0, sub,  1, sub->ne[0], sizeof(float), o*sub->nb[1]);
-            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, src, dv->ids));
-        }
-        cur = full;
+        ggml_tensor * dst  = ggml_reshape_3d(ctx0, full, 1, n_vocab, n_out);
+        ggml_tensor * src  = ggml_reshape_3d(ctx0, sub,  1, n_sub,   n_out);
+        cur = ggml_reshape_2d(ctx0, ggml_set_rows(ctx0, dst, src, dv->ids), n_vocab, n_out);
     } else {
         cur = build_lora_mm(model.output, cur, model.output_s);
     }
@@ -943,6 +973,178 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     return cur;
 }
 
+// the positions of the output rows only (out_ids order), for the queries of build_layer_attn_rows
+class llm_graph_input_qwen4exp_pos_out : public llm_graph_input_i {
+public:
+    llm_graph_input_qwen4exp_pos_out(uint32_t n_pos_per_embd, llama_rope_section_order order) :
+        n_pos_per_embd(n_pos_per_embd), order(order) {}
+    virtual ~llm_graph_input_qwen4exp_pos_out() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const int64_t n_tokens = ubatch->n_tokens;
+        const int64_t npe      = n_pos_per_embd;
+        const int64_t n_out    = pos->ne[0]/npe;
+        if (n_out == 0 || !ubatch->pos) {
+            return;
+        }
+        GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
+
+        // the rows of llm_graph_input_out_ids
+        std::vector<int64_t> rows;
+        rows.reserve(n_out);
+        for (int64_t i = 0; i < n_tokens && (int64_t) rows.size() < n_out; ++i) {
+            if (n_out == n_tokens || ubatch->output[i]) {
+                rows.push_back(i);
+            }
+        }
+        GGML_ASSERT((int64_t) rows.size() == n_out);
+
+        // as llm_graph_input_pos: sections are [s*n_tokens + i], embedding rows may reorder the slots
+        const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
+        std::array<int64_t, 4> slot_of_section = { 0, 1, 2, 3 };
+        if (order == LLAMA_ROPE_SECTION_ORDER_ZYXT) {
+            slot_of_section = { 3, 1, 2, 0 };
+        }
+        auto * data = (int32_t *) pos->data;
+        for (int64_t j = 0; j < n_out; ++j) {
+            const int64_t i = rows[j];
+            const bool is_embd = has_embd && npe == 4 && order != LLAMA_ROPE_SECTION_ORDER_TYXZ &&
+                (ubatch->is_mixed() ? ubatch->type[i] != 0 : true);
+            for (int64_t s = 0; s < npe; ++s) {
+                const int64_t slot = is_embd ? slot_of_section[s] : s;
+                data[s*n_out + j] = ubatch->pos[slot*n_tokens + i];
+            }
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return pos->ne[0] == (int64_t) params.n_outputs*n_pos_per_embd;
+    }
+
+    ggml_tensor * pos = nullptr; // I32 [n_outputs*n_pos_per_embd]
+
+    const uint32_t n_pos_per_embd;
+    const llama_rope_section_order order;
+};
+
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_rows(
+        llm_graph_input_attn_kv * inp,
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_kpool *   inp_kpool,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        ggml_tensor *             out_ids,
+        int *                     sections,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    const bool    qsa   = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    const int64_t n_out = out_ids->ne[0];
+    GGML_ASSERT(n_out == 0 || !qsa);
+
+    if (qsa) {
+        // stores and pools the indexer keys; its query and the selection are not built
+        ggml_tensor * k_pool = nullptr;
+        build_qsa_idx(mctx_hyb, inp_kpool, cur, inp_pos, sections, &k_pool, il);
+        // set on every ubatch, so they need a buffer even when nothing reads them
+        for (ggml_tensor * t : { inp_kpool->pool_cells, inp_kpool->pool_idxs, inp_kpool->pool_mask, inp_kpool->tail_idxs }) {
+            if (t) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+    }
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    cb(Vcur, "Vcur", il);
+
+    if (inp->self_k_rot) {
+        Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+    }
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, Vcur);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
+
+    // the output rows: one per output, none for a prompt ubatch
+    ggml_tensor * x = ggml_get_rows(ctx0, cur, out_ids);
+    if (n_out == 0) {
+        return x;
+    }
+
+    ggml_tensor * pos_out;
+    {
+        auto inp_po = std::make_unique<llm_graph_input_qwen4exp_pos_out>(hparams.n_pos_per_embd(), hparams.rope_section_order);
+        inp_po->pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out*hparams.n_pos_per_embd());
+        ggml_set_input(inp_po->pos);
+        cb(inp_po->pos, "inp_pos_out", il);
+        pos_out = inp_po->pos;
+        res->add_input(std::move(inp_po));
+    }
+
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, x, model.layers[il].wq_s);
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_out,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    Qcur = ggml_rope_multi(ctx0, Qcur, pos_out, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Qcur, "Qcur", il);
+
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_out,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_out);
+
+    if (inp->self_k_rot) {
+        Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp->self_k_rot);
+    }
+
+    // the mask rows of the outputs (get_rows reads f16 into f32; flash attention wants the f16 back)
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * mask = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1]), out_ids);
+    if (kq_mask->type != GGML_TYPE_F32) {
+        mask = ggml_cast(ctx0, mask, kq_mask->type);
+    }
+    mask = ggml_reshape_4d(ctx0, mask, kq_mask->ne[0], n_out, 1, 1);
+    cb(mask, "kq_mask_out", il);
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * out = build_attn_mha(Qcur, k, v, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+    cb(out, "kqv_out", il);
+
+    if (inp->self_v_rot) {
+        out = llama_mul_mat_hadamard(ctx0, out, inp->self_v_rot);
+    }
+
+    out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
+    cb(out, "attn_gated", il);
+
+    out = build_lora_mm(model.layers[il].wo, out, model.layers[il].wo_s);
+    cb(out, "attn_output", il);
+
+    return out;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
@@ -1071,6 +1273,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // the shared expert's mat-vecs; its gate (sigmoid, mul, add) stays after the routed sum for the shgate fusion
+    const bool has_shexp = model.layers[il].ffn_up_shexp != nullptr;
+    ggml_tensor * ffn_shexp   = nullptr;
+    ggml_tensor * shared_gate = nullptr;
+    auto build_shexp = [&]() {
+        ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+    };
+
+    // LLAMA_MOE_JOIN_LATE=1: the shared expert runs between the CPU lane's doorbell and its join (Strata's late shared-expert fork)
+    static const bool join_late = [] { const char * e = getenv("LLAMA_MOE_JOIN_LATE"); return e != nullptr && atoi(e) != 0; }();
+    if (has_shexp && join_late) {
+        moe_beside = [&]() {
+            build_shexp();
+            ggml_build_forward_expand(gf, ffn_shexp);
+            ggml_build_forward_expand(gf, shared_gate);
+        };
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1087,21 +1318,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
+    moe_beside = nullptr; // no CPU lane on this layer: built below as before
 
     // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
+    if (has_shexp) {
+        if (ffn_shexp == nullptr) {
+            build_shexp();
+        }
 
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);

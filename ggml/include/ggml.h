@@ -1566,6 +1566,7 @@ extern "C" {
 #define GGML_MOE_LANE_NLANE 2 // lane experts of the last doorbell
 #define GGML_MOE_LANE_DONE 16 // written by the host: the sequence word of the last request it completed
 #define GGML_MOE_LANE_ERR  32 // joins that timed out
+#define GGML_MOE_LANE_FRAC 48 // written by the host: 0 = frac of the op, else 1 + the share in 1/1000 for the next doorbells
 
     // size of a channel for up to max_tokens tokens, and the offsets of its ids, x and rows
     GGML_API size_t ggml_moe_lane_layout(int64_t n_embd, int64_t n_used, int64_t max_tokens, size_t * off_ids, size_t * off_x, size_t * off_rows);

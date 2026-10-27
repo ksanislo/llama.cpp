@@ -3371,7 +3371,17 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = std::max(kv->get_n_kv(sinfos[i_cur]), n_kv_batch);
+    n_kv_own = kv->get_n_kv(sinfos[i_cur]);
+    n_kv     = std::max(n_kv_own, n_kv_batch);
+
+    return true;
+}
+
+bool llama_kv_cache_context::set_shapes_plan(bool plan) {
+    if (n_kv_batch == 0 || ubatches.empty()) {
+        return false;
+    }
+    n_kv = plan ? std::max(n_kv_own, n_kv_batch) : n_kv_own;
 
     return true;
 }

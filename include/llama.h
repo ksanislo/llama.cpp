@@ -591,6 +591,18 @@ extern "C" {
     LLAMA_API uint32_t llama_prompt_chunk(const struct llama_context * ctx, uint32_t n_tokens);
     // true if the prompt pipe plans the ubatches of large batches (LLAMA_PROMPT_PIPE, pipeline parallelism on)
     LLAMA_API bool     llama_prompt_pipe (const struct llama_context * ctx);
+
+    // checkpoints between the ubatches of a batch, taken without synchronizing (a pipeline keeps running)
+    // true if the partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) of a sequence can be checkpointed inside a batch
+    LLAMA_API bool   llama_pipe_checkpoints_supported(const struct llama_context * ctx);
+    // in the next llama_decode calls, a ubatch ends before position pos of seq_id, and the partial state of seq_id after
+    // its positions < pos is copied out in stream order; false if not supported
+    LLAMA_API bool   llama_pipe_checkpoint_request(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+    // the size of the checkpoint (0: not taken); with dst, writes it as llama_state_seq_get_data_ext(PARTIAL_ONLY) would
+    // have at that point and forgets it. Synchronizes the context.
+    LLAMA_API size_t llama_pipe_checkpoint_get(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size);
+    // forget the requests and checkpoints of seq_id (-1: all)
+    LLAMA_API void   llama_pipe_checkpoints_clear(struct llama_context * ctx, llama_seq_id seq_id);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

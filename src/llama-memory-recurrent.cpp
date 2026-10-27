@@ -672,7 +672,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        // a memory without recurrent layers (an MTP draft context) only tracks positions: a gap there is not a lost state
+        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens && total_size() > 0) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
@@ -862,8 +863,71 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     io.write(&cell_count, sizeof(cell_count));
 
+    snap_on   = snap != nullptr && seq_id >= 0 && snap->seq_id == seq_id;
+    snap_next = 0;
+    GGML_ASSERT(!snap_on || cell_count == 1);
+
     state_write_meta(io, cell_ranges, seq_id);
     state_write_data(io, cell_ranges_data);
+
+    GGML_ASSERT(!snap_on || snap_next == snap->rows.size());
+    snap_on = false;
+}
+
+bool llama_memory_recurrent::snapshot_rows(llama_seq_id seq_id, llama_pos & pos, std::vector<snap_row> & rows) const {
+    rows.clear();
+
+    if (seq_id < 0) {
+        return false;
+    }
+
+    // the same cell and row choice as state_write
+    int32_t cell_idx = -1;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].has_seq_id(seq_id)) {
+            if (cell_idx >= 0) {
+                return false;
+            }
+            cell_idx = (int32_t) i;
+        }
+    }
+    if (cell_idx < 0) {
+        return false;
+    }
+
+    const auto & cell = cells[cell_idx];
+    const uint32_t rs_idx_cur = n_rs_seq != 0 ? rs_idx[seq_id] : 0;
+    const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : cell_idx);
+
+    pos = cell.pos;
+
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (r_l[il] != nullptr) {
+            const size_t row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            rows.push_back({ r_l[il], cell_id * row, row });
+        }
+        if (r_l[il] != nullptr && p_l[il] != nullptr) {
+            const size_t row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
+            rows.push_back({ p_l[il], cell_id * row, row });
+        }
+        if (s_l[il] != nullptr) {
+            const size_t row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            rows.push_back({ s_l[il], cell_id * row, row });
+        }
+    }
+
+    return true;
+}
+
+void llama_memory_recurrent::state_write_rows(llama_io_write_i & io, ggml_tensor * t, size_t offs, size_t size) const {
+    if (snap_on) {
+        GGML_ASSERT(snap_next < snap->rows.size() && snap->rows[snap_next].t == t && snap->rows[snap_next].size == size &&
+                "recurrent state row not in the checkpoint snapshot");
+        io.write(snap->data[snap_next++], size);
+        return;
+    }
+
+    io.write_tensor(t, offs, size);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -901,7 +965,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
             const auto & cell = cells[i];
-            const llama_pos pos      = cell.pos;
+            const llama_pos pos      = snap_on ? snap->pos : cell.pos;
             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
             io.write(&pos,      sizeof(pos));
@@ -942,7 +1006,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            state_write_rows(io, r_l[il], range.first * r_size_row, buf_size);
         }
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
@@ -952,7 +1016,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
-                io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
+                state_write_rows(io, p_l[il], range.first * p_size_row, range_size * p_size_row);
             }
         }
     }
@@ -975,11 +1039,12 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                state_write_rows(io, s_l[il], range.first * s_size_row, buf_size);
             }
         }
     } else {
         // When S tensor is transposed, we also need the element size and get the element ranges from each row
+        GGML_ASSERT(!snap_on && "a checkpoint snapshot holds untransposed rows");
         const uint32_t mem_size = size;
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)

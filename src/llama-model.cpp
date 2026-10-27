@@ -27,7 +27,9 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <cinttypes>
 #include <cfloat>
 #include <cstdint>
@@ -41,7 +43,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1270,6 +1278,16 @@ struct llama_model::impl {
     ggml_backend_buffer_ptr            dv_buf;
     llama_model::draft_vocab_head      dv;
 
+    // LLAMA_PLE_WARM
+    std::thread                        ple_warm;
+    std::atomic<bool>                  ple_warm_stop { false };
+
+    // LLAMA_MTP_EH_ONCE
+    std::once_flag                     eh_once;
+    ggml_context_ptr                   eh_ctx;
+    ggml_backend_buffer_ptr            eh_buf;
+    llama_model::eh_proj_halves        eh;
+
     uint64_t n_elements = 0;
 
     size_t n_bytes = 0;
@@ -1427,7 +1445,60 @@ const llama_model::draft_vocab_head * llama_model::get_draft_vocab_head() const 
     return pimpl->dv.head ? &pimpl->dv : nullptr;
 }
 
+const llama_model::eh_proj_halves * llama_model::get_mtp_eh_halves(const ggml_tensor * eh_proj) const {
+    static const bool on = [] { const char * e = getenv("LLAMA_MTP_EH_ONCE"); return e != nullptr && atoi(e) != 0; }();
+    if (!on || eh_proj == nullptr || eh_proj->data == nullptr || eh_proj->buffer == nullptr) {
+        return nullptr;
+    }
+    std::call_once(pimpl->eh_once, [&]() {
+        const int64_t n_in  = eh_proj->ne[0];
+        const int64_t n_out = eh_proj->ne[1];
+        const ggml_type type = eh_proj->type;
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(eh_proj->buffer);
+        const std::string buft_name = ggml_backend_buft_name(buft);
+        // a repacked or row-split buffer does not hand back plain rows
+        if (n_in % 2 != 0 || (n_in/2) % ggml_blck_size(type) != 0 || !ggml_is_contiguous(eh_proj) ||
+                buft_name.find("Split") != std::string::npos || buft_name.find("REPACK") != std::string::npos) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_EH_ONCE: eh_proj (%s, %s) cannot be split, off\n", __func__,
+                    ggml_type_name(type), buft_name.c_str());
+            return;
+        }
+        const int64_t n_half = n_in/2;
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        pimpl->eh_ctx.reset(ggml_init(ip));
+        ggml_tensor * e = ggml_new_tensor_2d(pimpl->eh_ctx.get(), type, n_half, n_out);
+        ggml_tensor * h = ggml_new_tensor_2d(pimpl->eh_ctx.get(), type, n_half, n_out);
+        ggml_set_name(e, "mtp_eh_proj_e");
+        ggml_set_name(h, "mtp_eh_proj_h");
+        pimpl->eh_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pimpl->eh_ctx.get(), buft));
+        if (!pimpl->eh_buf) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_EH_ONCE: cannot allocate the halves (%s), off\n", __func__, buft_name.c_str());
+            pimpl->eh_ctx.reset();
+            return;
+        }
+        const size_t row  = eh_proj->nb[1];
+        const size_t half = ggml_row_size(type, n_half);
+        std::vector<uint8_t> all(ggml_nbytes(eh_proj));
+        ggml_backend_tensor_get(eh_proj, all.data(), 0, all.size());
+        std::vector<uint8_t> de((size_t) n_out*half), dh((size_t) n_out*half);
+        for (int64_t r = 0; r < n_out; ++r) {
+            memcpy(de.data() + r*half, all.data() + r*row,        half);
+            memcpy(dh.data() + r*half, all.data() + r*row + half, half);
+        }
+        ggml_backend_tensor_set(e, de.data(), 0, de.size());
+        ggml_backend_tensor_set(h, dh.data(), 0, dh.size());
+        pimpl->eh = { e, h };
+        LLAMA_LOG_INFO("%s: MTP eh_proj split into its embedding / hidden halves (2 x %.1f MiB %s on %s, LLAMA_MTP_EH_ONCE)\n",
+                __func__, de.size()/1024.0/1024.0, ggml_type_name(type), buft_name.c_str());
+    });
+    return pimpl->eh.e ? &pimpl->eh : nullptr;
+}
+
 llama_model::~llama_model() {
+    if (pimpl->ple_warm.joinable()) {
+        pimpl->ple_warm_stop = true;
+        pimpl->ple_warm.join();
+    }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2248,6 +2319,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    // LLAMA_PLE_WARM=1: read the lazily mapped PLE table once in the background, so the rows a decode step gathers are in
+    // the page cache (no disk read inside the graph); =2 also mlocks it. Off by default: it costs the table's size in RAM.
+    if (per_layer_tok_embd && can_prefetch.count(per_layer_tok_embd) && per_layer_tok_embd->data &&
+            per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(per_layer_tok_embd->buffer)) {
+        const char * e = getenv("LLAMA_PLE_WARM");
+        const int mode = e ? atoi(e) : 0;
+        if (mode > 0) {
+            const char * base  = (const char *) per_layer_tok_embd->data;
+            const size_t bytes = ggml_nbytes(per_layer_tok_embd);
+            pimpl->ple_warm = std::thread([this, base, bytes, mode]() {
+#if defined(__linux__) || defined(__APPLE__)
+                const int64_t t0 = ggml_time_us();
+                const size_t page  = (size_t) sysconf(_SC_PAGESIZE);
+                const size_t chunk = (size_t) 256 << 20;
+                const uintptr_t b0 = (uintptr_t) base / page * page;
+                const uintptr_t b1 = (uintptr_t) base + bytes;
+                size_t done = 0;
+                bool locked = mode >= 2;
+                for (uintptr_t p = b0; p < b1 && !pimpl->ple_warm_stop.load(std::memory_order_relaxed); p += chunk) {
+                    const size_t n = std::min<size_t>(chunk, b1 - p);
+                    madvise((void *) p, n, MADV_WILLNEED);
+                    volatile char sink = 0;
+                    for (size_t o = 0; o < n; o += page) {
+                        sink = sink + ((const volatile char *) p)[o];
+                    }
+                    if (locked && mlock((const void *) p, n) != 0) {
+                        LLAMA_LOG_WARN("%s: LLAMA_PLE_WARM=2: mlock failed after %.1f GiB (%s), the rest stays unlocked\n",
+                                __func__, done/1024.0/1024.0/1024.0, strerror(errno));
+                        locked = false;
+                    }
+                    done += n;
+                }
+                LLAMA_LOG_INFO("%s: LLAMA_PLE_WARM: PLE table %.1f of %.1f GiB read%s in %.1f s\n", __func__,
+                        done/1024.0/1024.0/1024.0, bytes/1024.0/1024.0/1024.0, locked ? " and locked" : "",
+                        (ggml_time_us() - t0)/1e6);
+#else
+                GGML_UNUSED(base); GGML_UNUSED(bytes); GGML_UNUSED(mode);
+#endif
+            });
+        }
+    }
 
     return true;
 }

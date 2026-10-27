@@ -1412,6 +1412,88 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+int llama_model_loader::merge_gate_up_exps() {
+    const char * env = getenv("LLAMA_MERGE_GATE_UP");
+    if (env == nullptr || atoi(env) == 0 || files.empty() || !merged.empty()) {
+        return 0;
+    }
+    if (use_mmap && !no_alloc) {
+        LLAMA_LOG_WARN("%s: LLAMA_MERGE_GATE_UP needs the weights read from the file (--load-mode none), not mapped: off\n", __func__);
+        return 0;
+    }
+    std::vector<int> layers;
+    for (const auto & it : weights_map) {
+        int il = -1;
+        int n  = 0;
+        if (sscanf(it.first.c_str(), "blk.%d.ffn_gate_exps.weight%n", &il, &n) == 1 && n == (int) it.first.size()) {
+            layers.push_back(il);
+        }
+    }
+    int n_merged = 0;
+    size_t bytes = 0;
+    for (int il : layers) {
+        const std::string g_name = format("blk.%d.ffn_gate_exps.weight", il);
+        const std::string u_name = format("blk.%d.ffn_up_exps.weight", il);
+        const std::string m_name = format("blk.%d.ffn_gate_up_exps.weight", il);
+        const auto it_g = weights_map.find(g_name);
+        const auto it_u = weights_map.find(u_name);
+        if (it_g == weights_map.end() || it_u == weights_map.end() || weights_map.count(m_name) > 0) {
+            continue;
+        }
+        const ggml_tensor * g = it_g->second.tensor;
+        const ggml_tensor * u = it_u->second.tensor;
+        if (g->type != u->type || !ggml_are_same_shape(g, u) || ggml_n_dims(g) != 3 || !ggml_is_contiguous(g) || !ggml_is_contiguous(u)) {
+            LLAMA_LOG_WARN("%s: layer %d: gate %s %s and up %s %s experts differ, kept apart\n", __func__, il, ggml_type_name(g->type),
+                llama_format_tensor_shape(g).c_str(), ggml_type_name(u->type), llama_format_tensor_shape(u).c_str());
+            continue;
+        }
+        if (!ctx_merged) {
+            ggml_init_params params = { ggml_tensor_overhead()*layers.size(), nullptr, true };
+            ctx_merged.reset(ggml_init(params));
+        }
+        ggml_tensor * t = ggml_new_tensor_3d(ctx_merged.get(), g->type, g->ne[0], 2*g->ne[1], g->ne[2]);
+        ggml_set_name(t, m_name.c_str());
+        GGML_ASSERT(ggml_nbytes(t) == ggml_nbytes(g) + ggml_nbytes(u));
+        merged.emplace(m_name, merged_weight{ it_g->second, it_u->second });
+        const llama_tensor_weight w(it_g->second.idx, it_g->second.offs, t);
+        weights_map.erase(it_g);
+        weights_map.erase(it_u);
+        weights_map.emplace(m_name, w);
+        n_merged++;
+        bytes += ggml_nbytes(t);
+    }
+    n_tensors = (int) weights_map.size();
+    if (n_merged > 0) {
+        LLAMA_LOG_INFO("%s: LLAMA_MERGE_GATE_UP: ffn_gate_exps + ffn_up_exps read as one ffn_gate_up_exps in %d layers (%.2f GiB)\n",
+            __func__, n_merged, bytes/1024.0/1024.0/1024.0);
+    }
+    return n_merged;
+}
+
+void llama_model_loader::load_merged(ggml_tensor * cur, const merged_weight & m) {
+    const ggml_tensor * g = m.gate.tensor;
+    const int64_t n_expert = g->ne[2];
+    const size_t  es       = g->nb[2]; // bytes of one expert of gate (and of up)
+    GGML_ASSERT(ggml_nbytes(cur) == 2*es*n_expert && cur->nb[2] == 2*es);
+    const bool host = cur->buffer != nullptr && ggml_backend_buffer_is_host(cur->buffer);
+    std::vector<no_init<uint8_t>> tmp(host ? 0 : 2*es);
+    for (int64_t e = 0; e < n_expert; ++e) {
+        uint8_t * dst = host ? (uint8_t *) cur->data + e*2*es : (uint8_t *) tmp.data();
+        const llama_tensor_weight * parts[2] = { &m.gate, &m.up };
+        for (int k = 0; k < 2; ++k) {
+            const auto & file = files.at(parts[k]->idx);
+            file->seek(parts[k]->offs + e*es, SEEK_SET);
+            file->read_raw(dst + k*es, es);
+        }
+        if (check_tensors && !ggml_validate_row_data(cur->type, dst, 2*es)) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+        }
+        if (!host) {
+            ggml_backend_tensor_set(cur, dst, e*2*es, 2*es);
+        }
+    }
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1732,6 +1814,17 @@ bool llama_model_loader::load_all_data(
     }
 
     for (struct ggml_tensor * cur : tensors) {
+        if (!merged.empty()) {
+            const auto it_m = merged.find(ggml_get_name(cur));
+            if (it_m != merged.end()) {
+                if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+                load_merged(cur, it_m->second);
+                size_done += ggml_nbytes(cur);
+                continue;
+            }
+        }
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models

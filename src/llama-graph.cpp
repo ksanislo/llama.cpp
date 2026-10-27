@@ -1753,6 +1753,18 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // with LLAMA_MOE_RING_INPLACE a staged layer reads the cached experts in place, by its map (see build_moe_cache_slots)
     const bool in_place = slots != nullptr && cached && slots->view_src != nullptr && slots->view_src->op == GGML_OP_GET_ROWS &&
         moe_cache->stage_in_place(w, slots->ne[1], slots->ne[0]);
+    // with LLAMA_MOE_RING_TENSORS each expert tensor of a staged layer has a lookup of its own; placed by the graph right before
+    // its matmul, it starts a split there, so the ring is called back between the matmuls (see build_moe_cache_slots)
+    ggml_tensor * slots_mm = slots;
+    if (slots != nullptr && cached && !in_place && mapped == nullptr && slots->view_src != nullptr && slots->view_src->op == GGML_OP_GET_ROWS) {
+        ggml_backend_t backend = nullptr;
+        if (ggml_tensor * map = moe_cache->get_stage_map(w, slots->ne[1], slots->ne[0], &backend)) {
+            ggml_tensor * lookup = ggml_get_rows(ctx0, map, slots->view_src->src[1]);
+            ggml_format_name(lookup, "ffn_moe_slots_%s", w->name);
+            ggml_backend_sched_set_tensor_backend(sched, lookup, backend);
+            slots_mm = ggml_reshape_2d(ctx0, lookup, slots->ne[0], slots->ne[1]);
+        }
+    }
     ggml_tensor * res = in_place ?
         ggml_mul_mat_id_slots(ctx0, moe_cache->get_experts(w), moe_cache->get_staged_experts(w), moe_cache->get_inplace_host(w), cur_mm,
             ggml_reshape_2d(ctx0, slots->view_src->src[1], slots->ne[0], slots->ne[1]), slots->view_src->src[0]) :
@@ -1760,7 +1772,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         mapped != nullptr ?
         ggml_mul_mat_id_mapped(ctx0, moe_cache->get_experts(w, slots->ne[1], slots->ne[0]), mapped, cur_mm, slots) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w, slots->ne[1], slots->ne[0]) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w, slots->ne[1], slots->ne[0]) : w, cur_mm, slots_mm);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2632,6 +2644,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
     if (cpu_ids == nullptr) {
         experts = build_experts(cur, selected_experts, slots, true);
+        if (lane != nullptr && moe_beside) {
+            // order: doorbell, the device's experts, the side work, then the join (ggml runs a split in node order)
+            ggml_build_forward_expand(gf, experts);
+            auto beside = std::move(moe_beside);
+            moe_beside = nullptr;
+            beside();
+        }
         if (lane != nullptr) {
             experts = ggml_moe_join(ctx0, experts, slots, lane, lane_n_expert, moe_cache->cpu_lane_max_tokens(), moe_cache->cpu_lane_timeout_ms());
             ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
@@ -2786,7 +2805,10 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     cb(slots, "ffn_moe_slots", il);
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
-    ggml_build_forward_expand(gf, slots);
+    // (LLAMA_MOE_RING_TENSORS: the matmuls read lookups of their own, build_lora_mm_id, and this one stays out of the graph)
+    if (!moe_cache->stage_per_tensor(il, selected_experts->ne[1], selected_experts->ne[0])) {
+        ggml_build_forward_expand(gf, slots);
+    }
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }

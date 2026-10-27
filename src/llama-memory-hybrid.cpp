@@ -225,6 +225,10 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 }
 
+llama_memory_recurrent * llama_memory_hybrid::partial_state_recurrent() const {
+    return mem_attn->get_swa_type() == LLAMA_SWA_TYPE_NONE ? mem_recr.get() : nullptr;
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }
@@ -292,6 +296,10 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+bool llama_memory_hybrid_context::set_shapes_plan(bool plan) {
+    return ctx_attn->set_shapes_plan(plan);
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

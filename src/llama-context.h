@@ -78,6 +78,22 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
 
+    // [TAG_PIPE_CHECKPOINTS] partial states taken between the ubatches of a batch, see llama_pipe_checkpoint_request
+    bool   pipe_checkpoints_supported() const;
+    bool   pipe_checkpoint_request(llama_seq_id seq_id, llama_pos pos);
+    size_t pipe_checkpoint_get(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size);
+    void   pipe_checkpoints_clear(llama_seq_id seq_id);
+    struct pipe_ckpt_row {
+        ggml_tensor * t;
+        size_t        offs;
+        size_t        size;
+        uint8_t     * dst;
+    };
+    struct pipe_ckpt_job { // the rows one backend copies
+        std::vector<pipe_ckpt_row> rows;
+        bool async = false;
+    };
+
     // the ubatch size LLAMA_PROMPT_PIPE gives a batch of n_tokens (n_ubatch when it does not apply)
     uint32_t prompt_chunk(uint32_t n_tokens) const;
     bool     prompt_pipe_on() const;
@@ -486,6 +502,33 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // LLAMA_GRAPH_CACHE_SIZES: one built graph per small ubatch size (and with/without outputs), so a varying speculative
+    // verify size returns to a graph of its size: no rebuild, the same allocation and CUDA graph keys as its first run
+    struct graph_cache_entry {
+        llm_graph_result_ptr res;
+        bool built = false;
+        // the graph as built, before the scheduler rewrote it (node order, input copies as srcs, allocations)
+        std::vector<ggml_tensor *> nodes;
+        struct tensor_state {
+            ggml_tensor *         t;
+            void *                data;
+            ggml_backend_buffer * buffer;
+            void *                extra;
+            ggml_tensor *         src[GGML_MAX_SRC];
+        };
+        std::vector<tensor_state> tensors;
+        std::vector<std::pair<ggml_tensor *, ggml_backend_t>> backends; // ggml_backend_sched_set_tensor_backend of the build
+    };
+    std::map<uint32_t, graph_cache_entry> gf_res_sizes;
+    uint32_t graph_cache_max = 0; // 0 = off, else the largest ubatch kept
+    struct {
+        int64_t n_build = 0, n_hit = 0, n_reuse = 0;
+        int64_t t_build_us = 0, t_hit_us = 0;
+    } graph_cache_stats;
+    void graph_cache_clear();
+    void graph_cache_snapshot(graph_cache_entry & e, ggml_cgraph * gf);
+    void graph_cache_restore(const graph_cache_entry & e, ggml_cgraph * gf);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -558,9 +601,31 @@ private:
     // LLAMA_PROMPT_PIPE_STABLE (default 1): the chunks of a piped batch keep one graph shape (n_kv and the k-pool sizes of the
     // batch's end) and allocate in the layout of the first, instead of re-reserving the worst case before each chunk
     bool     prompt_pipe_stable = true;
+    // LLAMA_PROMPT_PIPE_CAUSAL (default 0, needs stable shapes): the chunks after the first take their own n_kv and pool
+    // counts (attention, indexer, top-k and selection mask over the cells so far, not the batch's end); they fit the
+    // layout of the first chunk, so they do not reallocate. 1: the first chunk keeps the end shapes; 2: the end-shaped
+    // graph only plans the layout and the first chunk runs causal too
+    int32_t  prompt_pipe_causal = 0;
+    int32_t  prompt_pipe_causal_ub = -1; // ubatch index in the piped decode while causal shapes apply, else -1
     // LLAMA_MOE_GATHER (default 1): the experts of a large batch are copied with one gather kernel per weight (cached ones
     // from the MoE cache, the others read from pinned host memory), instead of one copy per run of experts
     bool     moe_gather         = true;
+    // [TAG_PIPE_CHECKPOINTS] a requested checkpoint: the ubatch before pos ends there, then each device holding
+    // recurrent rows of seq_id copies them to host memory in its stream order (a post callback), nothing waits
+    struct pipe_ckpt {
+        llama_seq_id seq_id;
+        llama_pos    pos;
+        bool         taken    = false;
+        llama_pos    cell_pos = -1;
+        std::vector<pipe_ckpt_row>                  rows;
+        std::vector<std::unique_ptr<pipe_ckpt_job>> jobs;
+        ggml_backend_buffer_ptr buf;  // pinned host memory, or
+        std::vector<uint8_t>    host;
+    };
+    std::vector<std::unique_ptr<pipe_ckpt>> pipe_ckpts;
+    std::vector<ggml_backend_buffer_ptr>    pipe_ckpt_free; // pinned buffers of forgotten checkpoints, reused
+    void pipe_ckpt_ubatch(const llama_ubatch & ubatch);
+
     // LLAMA_PROMPT_PIPE_GRAPHS (default 0): the device splits of a piped chunk are captured and launched as CUDA graphs, so
     // one host thread queues ~1500 kernels per device per chunk without blocking on a full launch queue
     bool     prompt_pipe_graphs = false;
