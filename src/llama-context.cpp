@@ -769,6 +769,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // the compute buffers may come from the MoE cache's buffer type, and the cache logs through the backends:
+    // free the scheduler, then the cache, while the backends (destroyed before both as members) still exist
+    sched.reset();
+    moe_cache.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
