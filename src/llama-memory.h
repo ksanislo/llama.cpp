@@ -66,6 +66,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // prompt pipe with stable batch shapes (LLAMA_PROMPT_PIPE_CAUSAL), after apply(): true gives the current ubatch the
+    // shapes of the batch's end (the layout the batch is planned in), false its own causal ones (n_kv / pools so far)
+    // returns false if the shapes do not depend on it
+    virtual bool set_shapes_plan(bool /*plan*/) { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

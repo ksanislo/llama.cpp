@@ -385,6 +385,10 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_pool_g    = 64; // graph size of the pool list (kpool_pad), the last pool always unused
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
+
+    // the two sizes set_shapes_plan picks from: the batch's end (n_pool_batch) and the pools so far
+    uint32_t n_pool_g_plan = 64, n_new_g_plan = 1;
+    uint32_t n_pool_g_own  = 64, n_new_g_own  = 1;
 };
 
 namespace {
@@ -689,6 +693,8 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
 
     st.n_pool_real = lay.n_pool_real;
     st.n_pool_g    = kpool_pad(std::max(st.n_pool_real, n_pool_batch));
+    st.n_pool_g_plan = st.n_pool_g;
+    st.n_pool_g_own  = kpool_pad(st.n_pool_real);
     st.n_new       = 0;
     if (++st.generation == 0) {
         std::fill(st.is_new.begin(),  st.is_new.end(),  0);
@@ -777,6 +783,23 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, st.n_pool_g - 1, n_pool_max})});
+    st.n_new_g_plan = st.n_new_g;
+    st.n_new_g_own  = std::max({st.n_new, 1u, std::min({bound, st.n_pool_g_own - 1, n_pool_max})});
+}
+
+bool llama_memory_hybrid_idx_context::set_shapes_plan(bool plan) {
+    bool res = llama_memory_hybrid_context::set_shapes_plan(plan);
+    if (ctx_idx) {
+        res = ctx_idx->set_shapes_plan(plan) || res;
+    }
+    if (kpool_st && kpool_track() && i_kpool == i_cur && n_pool_batch > 0) {
+        auto & st = *kpool_st;
+        st.n_pool_g = plan ? st.n_pool_g_plan : st.n_pool_g_own;
+        st.n_new_g  = plan ? st.n_new_g_plan  : st.n_new_g_own;
+        res = true;
+    }
+
+    return res;
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {

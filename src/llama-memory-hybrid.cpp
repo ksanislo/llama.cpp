@@ -298,6 +298,10 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+bool llama_memory_hybrid_context::set_shapes_plan(bool plan) {
+    return ctx_attn->set_shapes_plan(plan);
+}
+
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
 }

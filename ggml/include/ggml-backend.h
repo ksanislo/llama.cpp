@@ -362,6 +362,10 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // Plan the compute buffers for graph as the next ggml_backend_sched_alloc_graph would (reallocating them, and synchronizing,
+    // only if it does not fit the current layout), without keeping it allocated or advancing the pipeline copy: a following
+    // graph of the same topology and no larger tensors then allocates in this layout without a reallocation
+    GGML_API bool                 ggml_backend_sched_plan_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
