@@ -3472,14 +3472,18 @@ struct llama_moe_cache::impl {
         // LLAMA_MOE_CPU_LANE_NUMA under NUMA device-local: 1 (default) a lane per node, 0 one lane (threads placed by --numa),
         // spread: one lane whose threads float over all CPUs as without --numa, active: one lane (one OpenMP team) with a
         // pool per node, each layer computed by its node's pool with that node's CPUs (all of them, one stage runs at a time),
-        // local: a lane per node whose threads stay on its CPUs (by default --numa places them node-round-robin every graph)
+        // local: a lane per node whose threads stay on its CPUs (by default --numa places them node-round-robin every graph),
+        // stage: a lane (polling thread + pool) per device on its node's CPUs, so concurrent decode groups (one per stage) are
+        // served at once (Strata's per-stage pools); a lane's threads: LLAMA_MOE_CPU_LANE_THREADS or the node's cores / its devices
         const char * env_numa = moe_env("LLAMA_MOE_CPU_LANE_NUMA");
+        const bool lane_stage  = env_numa && strcmp(env_numa, "stage") == 0;
         const bool numa_local  = ggml_numa_device_local_enabled();
         const bool lane_spread = numa_local && env_numa && strcmp(env_numa, "spread") == 0;
         const bool lane_active = numa_local && env_numa && strcmp(env_numa, "active") == 0;
         const bool lane_local  = numa_local && env_numa && strcmp(env_numa, "local") == 0;
-        const bool numa_lanes  = numa_local && !(env_numa && atoi(env_numa) == 0 && !lane_local) && !lane_spread && !lane_active;
+        const bool numa_lanes  = numa_local && !(env_numa && atoi(env_numa) == 0 && !lane_local) && !lane_spread && !lane_active && !lane_stage;
         std::vector<std::pair<int32_t, int>> row_node; // (layer, node of its device)
+        std::vector<size_t> row_dev;                   // device of each row_node entry
         int64_t n_embd = 0; // an upper bound of the rows of the experts' input and output
         for (const layer & l : layers) {
             for (const ggml_tensor * w : l.experts) {
@@ -3533,6 +3537,7 @@ struct llama_moe_cache::impl {
                 l.lane_host = (uint8_t *) ggml_backend_buffer_get_base(hb) + r*chan_size;
                 l.lane_dev  = (uint8_t *) ggml_backend_buffer_get_base(mb) + r*chan_size;
                 row_node.emplace_back(dd.rows[r], node);
+                row_dev.push_back(id);
                 n_chan++;
             }
         }
@@ -3602,6 +3607,53 @@ struct llama_moe_cache::impl {
                 desc = format("one lane, %zu layers, %d threads on all CPUs, not placed by --numa", row_node.size(), nt);
             }
             desc += format(", LLAMA_MOE_CPU_LANE_NUMA=%s", env_numa);
+            nodes.clear();
+        }
+        if (lane_stage) {
+            std::vector<size_t> devs;
+            for (size_t id : row_dev) {
+                if (std::find(devs.begin(), devs.end(), id) == devs.end()) {
+                    devs.push_back(id);
+                }
+            }
+            for (size_t id : devs) {
+                int node = -1;
+                int devs_on_node = 0;
+                for (size_t k = 0; k < row_dev.size(); ++k) {
+                    if (row_dev[k] == id) {
+                        node = row_node[k].second;
+                    }
+                }
+                for (size_t od : devs) {
+                    for (size_t k = 0; k < row_dev.size(); ++k) {
+                        if (row_dev[k] == od) {
+                            devs_on_node += row_node[k].second == node;
+                            break;
+                        }
+                    }
+                }
+                std::vector<int> cpus;
+                if (node >= 0) {
+                    cpus.resize(4096);
+                    cpus.resize(ggml_numa_node_cpus(node, cpus.data(), (int) cpus.size()));
+                }
+                int nt = n_threads;
+                if (!env_threads) {
+                    const int cores = cpus.empty() ? (int) std::thread::hardware_concurrency()/2 : (int) cpus.size()/2;
+                    nt = std::max(1, (cores - 1)/std::max(1, cpus.empty() ? (int) devs.size() : devs_on_node));
+                }
+                size_t n_rows = 0;
+                for (size_t k = 0; k < row_node.size(); ++k) {
+                    if (row_dev[k] == id) {
+                        lane_of[row_node[k].first] = (int32_t) lanes.size();
+                        n_rows++;
+                    }
+                }
+                lanes.push_back(cpus.empty() ? std::make_unique<llama_moe_lane>(layers.size(), nt, poll, cpus)
+                                             : std::make_unique<llama_moe_lane>(layers.size(), nt, poll, std::vector<std::vector<int>>{ cpus }, false));
+                desc += format("%s%s: %zu layers, %d threads on node %d", desc.empty() ? "a lane per device, " : "; ",
+                    ggml_backend_name(devices[id].backend), n_rows, nt, node);
+            }
             nodes.clear();
         }
         for (const int node : nodes) {
