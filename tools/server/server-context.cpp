@@ -1941,6 +1941,50 @@ private:
             }
         }
 
+        // keep the busy slots contiguous: with per-slot KV streams a batch is split at every gap in the sequence ids (the views
+        // need consecutive streams), so slots 3 + 7 decode as two graphs, never reused (round 2 of groups-check: 14 vs 41 t/s
+        // at 2 conversations). A slot whose prefix saves >= LLAMA_SLOT_CONTIG_MIN tokens (default 1024, 0 = off) is kept.
+        if (ret && task.id_slot == -1 && slots.size() > 1) {
+            static const int64_t contig_min = [] {
+                const char * env = getenv("LLAMA_SLOT_CONTIG_MIN");
+                return env ? std::max<int64_t>(0, atoll(env)) : 1024;
+            }();
+            const auto runs_with = [&](const server_slot & c) {
+                int n = 0;
+                bool prev = false;
+                for (const server_slot & s : slots) {
+                    const bool busy = &s == &c || s.is_processing();
+                    n += busy && !prev;
+                    prev = busy;
+                }
+                return n;
+            };
+            const int64_t lcp_ret = ret->prompt.tokens.empty() ? 0 : (int64_t) ret->prompt.tokens.get_common_prefix(task.tokens);
+            if (contig_min > 0 && lcp_ret < contig_min) {
+                server_slot * best = ret;
+                int runs_best = runs_with(*ret);
+                int64_t lcp_best = lcp_ret;
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing() || &slot == ret) {
+                        continue;
+                    }
+                    const int runs = runs_with(slot);
+                    const int64_t lcp = slot.prompt.tokens.empty() ? 0 : (int64_t) slot.prompt.tokens.get_common_prefix(task.tokens);
+                    if (runs < runs_best || (runs == runs_best && lcp > lcp_best)) {
+                        best = &slot;
+                        runs_best = runs;
+                        lcp_best = lcp;
+                    }
+                }
+                if (best != ret) {
+                    SLT_INF(*best, "selected slot to keep the busy slots contiguous (%d runs, %lld cached tokens; slot %d had %lld)\n",
+                            runs_best, (long long) lcp_best, ret->id, (long long) lcp_ret);
+                    ret = best;
+                    update_cache = true;
+                }
+            }
+        }
+
         // the slot's conversation is about to leave the device: to disk once it has been away for the delay
         if (ret && session_dir && !task.is_stateless() && !ret->prompt.tokens.empty() &&
             ret->prompt.tokens.get_common_prefix(task.tokens) < ret->prompt.tokens.size() / 2) {

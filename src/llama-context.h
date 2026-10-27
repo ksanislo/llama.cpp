@@ -513,7 +513,16 @@ private:
         ggml_backend_event_ptr ev;
         ggml_backend_t ev_backend = nullptr;
         bool in_flight = false;
+        // LLAMA_DECODE_GROUPS_PROBE: markers on each device's stream before / after the group's work, the submit time
+        std::vector<ggml_backend_event_ptr> ev_start, ev_end;
+        int64_t t_submit_us = 0;
     };
+    // probe stats: per device, how often the next group had started / finished there when a group's outputs were ready
+    struct group_probe {
+        bool (*query)(ggml_backend_event_t) = nullptr;
+        int64_t n = 0, lat_us = 0, wait_us = 0;
+        std::vector<int64_t> started, done;
+    } gprobe;
     int32_t n_decode_groups = 0;  // G from the env (0 off)
     int32_t out_owner       = -1; // whose outputs the members hold: a group, or -1 = plain decodes
     int32_t group_cur       = -1; // the group being decoded (decode() of decode_group)

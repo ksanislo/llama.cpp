@@ -1283,6 +1283,32 @@ int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
         ~sched_swap() { std::swap(a, b); }
     };
 
+    // LLAMA_DECODE_GROUPS_PROBE=1: where the pipelining stops - see decode_group_wait
+    static const bool probe = [] { const char * e = getenv("LLAMA_DECODE_GROUPS_PROBE"); return e && atoi(e) != 0; }();
+    const auto probe_mark = [&](std::vector<ggml_backend_event_ptr> & evs) {
+        evs.resize(backend_ptrs.size());
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            if (!evs[i]) {
+                evs[i].reset(ggml_backend_event_new(dev));
+            }
+            if (!gprobe.query) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                gprobe.query = reg ? (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_query") : nullptr;
+            }
+            if (evs[i]) {
+                ggml_backend_event_record(evs[i].get(), backend_ptrs[i]);
+            }
+        }
+    };
+    if (probe) {
+        gs.t_submit_us = ggml_time_us();
+        probe_mark(gs.ev_start);
+    }
+
     group_cur   = g;
     out_backend = nullptr;
     int ret;
@@ -1291,6 +1317,9 @@ int32_t llama_context::decode_group(const llama_batch_ext & batch, int32_t g) {
         ret = decode(batch);
     }
     group_cur = -1;
+    if (probe && ret == 0) {
+        probe_mark(gs.ev_end);
+    }
     if ((n_group_built + n_group_reused) % 1024 == 1023) {
         LLAMA_LOG_INFO("%s: decode groups: %d group graphs built, %d reused\n", __func__, n_group_built, n_group_reused);
     }
@@ -1323,11 +1352,40 @@ int32_t llama_context::decode_group_wait(int32_t g) {
     }
     group_state & gs = groups[g];
     if (gs.in_flight) {
+        const int64_t t0 = ggml_time_us();
         if (gs.ev) {
             ggml_backend_event_synchronize(gs.ev.get());
             gs.in_flight = false;
         } else {
             synchronize(); // no events (CPU): everything
+        }
+        // probe: when this group's outputs are ready, has the next group in flight started / finished on each device?
+        // pipelined: the next group is done on the early stages; serialized: it has not even started on device 0
+        const group_state & nx = groups[(g + 1) % groups.size()];
+        if (gprobe.query && gs.t_submit_us > 0 && nx.in_flight && nx.ev_end.size() == backend_ptrs.size()) {
+            const int64_t t1 = ggml_time_us();
+            gprobe.started.resize(backend_ptrs.size());
+            gprobe.done.resize(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                gprobe.started[i] += nx.ev_start[i] && gprobe.query(nx.ev_start[i].get());
+                gprobe.done[i]    += nx.ev_end[i]   && gprobe.query(nx.ev_end[i].get());
+            }
+            gprobe.n++;
+            gprobe.lat_us  += t1 - gs.t_submit_us;
+            gprobe.wait_us += t1 - t0;
+            if (gprobe.n % 512 == 0) {
+                std::string per_dev;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (nx.ev_end[i]) {
+                        per_dev += format(" %s %.0f/%.0f%%", ggml_backend_name(backend_ptrs[i]),
+                                100.0*gprobe.started[i]/gprobe.n, 100.0*gprobe.done[i]/gprobe.n);
+                    }
+                }
+                LLAMA_LOG_INFO("decode groups probe: last %lld steps: %.2f ms submit -> outputs, host waited %.2f ms; next group "
+                        "started/done when one is ready:%s\n", (long long) gprobe.n, gprobe.lat_us/1e3/gprobe.n,
+                        gprobe.wait_us/1e3/gprobe.n, per_dev.c_str());
+                gprobe = { gprobe.query, 0, 0, 0, {}, {} };
+            }
         }
     }
     out_switch(g);
