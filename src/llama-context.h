@@ -555,6 +555,8 @@ private:
     struct group_state {
         ggml_backend_event_ptr ev;
         ggml_backend_t ev_backend = nullptr;
+        ggml_backend_event_ptr ev_h; // nextn rows read on another backend than the logits (MTP)
+        ggml_backend_t ev_h_backend = nullptr;
         bool in_flight = false;
         // LLAMA_DECODE_GROUPS_PROBE: markers on each device's stream before / after the group's work, the submit time
         std::vector<ggml_backend_event_ptr> ev_start, ev_end;
@@ -570,6 +572,7 @@ private:
     int32_t out_owner       = -1; // whose outputs the members hold: a group, or -1 = plain decodes
     int32_t group_cur       = -1; // the group being decoded (decode() of decode_group)
     ggml_backend_t out_backend = nullptr; // where the last decode's outputs were read from
+    ggml_backend_t out_backend_h = nullptr; // where its nextn rows were read from
     std::vector<out_state>   group_out; // [G + 1], the entry of the active owner is stale
     std::vector<group_state> groups;
     void out_switch(int32_t owner);
