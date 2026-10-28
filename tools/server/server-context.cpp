@@ -350,6 +350,7 @@ struct server_batch {
 };
 
 struct server_slot {
+    static inline int n_generating_all = 0; // slots generating in this update (LLAMA_SPEC_MAX_GEN)
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -666,6 +667,11 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
+    static int spec_max_gen() {
+        static const int n = [] { const char * e = getenv("LLAMA_SPEC_MAX_GEN"); return e ? std::max(0, atoi(e)) : 0; }();
+        return n;
+    }
+
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
@@ -678,6 +684,12 @@ struct server_slot {
         // there, so single-token steps are cheaper until the cache is warm.
         static const int spec_delay = [] { const char * e = getenv("LLAMA_SPEC_DELAY"); return e ? std::max(0, atoi(e)) : 0; }();
         if (spec_delay > 0 && stats.n_gen < (uint64_t) spec_delay) {
+            return 0;
+        }
+
+        // LLAMA_SPEC_MAX_GEN=N: no drafts while more than N slots generate - beside other sessions an MTP verify costs more than
+        // it gains and the decode groups run without it (Strata drafts only with <= 2 live conversations)
+        if (spec_max_gen() > 0 && n_generating_all > spec_max_gen()) {
             return 0;
         }
 
@@ -3905,6 +3917,10 @@ private:
     }
 
     void update_slots() {
+        server_slot::n_generating_all = 0;
+        for (const auto & s : slots) {
+            server_slot::n_generating_all += s.state == SLOT_STATE_GENERATING;
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4058,8 +4074,10 @@ private:
             const char * env = getenv("LLAMA_DECODE_GROUPS_MTP");
             return env && atoi(env) != 0;
         }();
-        const bool mtp = spec && groups_mtp;
-        if ((spec && !mtp) || batch.size() < 2 || batch.size() != batch_n_gen || batch.has_embd()) {
+        // above LLAMA_SPEC_MAX_GEN generating slots nothing is drafted: the pump runs plain groups
+        const bool spec_off = spec && server_slot::spec_max_gen() > 0 && server_slot::n_generating_all > server_slot::spec_max_gen();
+        const bool mtp = spec && groups_mtp && !spec_off;
+        if ((spec && !mtp && !spec_off) || batch.size() < 2 || batch.size() != batch_n_gen || batch.has_embd()) {
             return false;
         }
         const int32_t n_groups_max = llama_decode_groups(ctx_tgt);
